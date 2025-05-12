@@ -90,7 +90,7 @@ class Material(TreeNode):
     def measure_observables(
         self, rho: torch.Tensor, t: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Retrun density and flux of observables, (Nx x Ny x No) for density and
+        """Return density and flux of observables, (Nx x Ny x No) for density and
         (Nx x Ny x No x 2) for flux."""
         obs = self.get_observables(t)
         density = self.wk * torch.einsum("xya, oa -> xyo", rho, obs)
