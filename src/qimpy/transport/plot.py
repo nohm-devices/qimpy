@@ -78,7 +78,7 @@ def run(
             pg.title.set_text(f"$t$ = {t:.4g}")
             rho, rho_flat = pg.interpolate(rho_list, i_frame_mine)
             rho_max_abs = np.max(np.abs(rho))
-            pg.img.set_data(rho / rho_max_abs)
+            pg.img.set_data((rho - np.mean(rho)) / rho_max_abs)
             rho_max_str = r"$\times|\rho|_{\mathrm{max}}$"
             pg.cbar.set_label(f"Density ({rho_max_str} = {rho_max_abs:6.2e})")
 
