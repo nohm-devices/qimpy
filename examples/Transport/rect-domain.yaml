@@ -1,23 +1,36 @@
-fermi_circle:
+#fermi_circle:
+#  kF: 1.0
+#  vF: 1.
+#  tau-p: .inf
+#  tau-ee: .inf
+#  N-theta: 64
+
+single_band_model:
   kF: 1.0
-  vF: 1.5
+  vF: 1.
+  mass: 1
   tau-p: .inf
   tau-ee: .inf
-  N-theta: 256
+  N-theta: 12
+  N-r: 1
+  delta-k: 0.01
+  T: 0.01
+
 
 patch_set:
   svg_file: rect-domain.svg
-  grid_spacing: 1.0
+  grid_spacing: 1.
 
   contacts:
     source:
-      dmu: +0.1
+      dmu: 1
     drain:
-      dmu: -0.1
+      dmu: -1
 
 time_evolution:
-  t_max: 1000.0
-  dt_save: 5.0
+  t_max: 10000
+  dt_save: 100
   n_collate: 32
+#  dt: 0.1
 
 checkpoint_out: animation/advect_{:04d}.h5
