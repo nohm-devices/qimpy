@@ -61,17 +61,31 @@ class FermiCircle(Material):
 
         # Create theta grid on Fermi circle:
         dtheta = 2 * np.pi / N_theta
-        theta = theta0 + torch.arange(N_theta, device=rc.device) * dtheta
+        theta = theta0 + (0.5 + torch.arange(N_theta, device=rc.device)) * dtheta
         k_hat = torch.stack([theta.cos(), theta.sin()], dim=-1)
         self.v_all = k_hat[:, None] * vF
         self.k[:] = k_hat[self.k_mine] * kF
         self.v[:] = self.v_all[self.k_mine]
+        self.theta = theta
+        self.dtheta = dtheta
 
         # Cached normalizations for collision intergal
         self.nk_inv = 1.0 / N_theta
         self.vv_inv = torch.linalg.inv(
             torch.einsum("...i, ...j -> ij", self.v_all, self.v_all)
         )
+
+        # Matrix element for e-e scattering
+#        it0 = torch.arange(N_theta, device=rc.device)[:, None]
+#        it1 = torch.arange(N_theta, device=rc.device)[None, :]
+#        q1 = 2 * torch.sin(0.5 * (theta[it1] - theta[it0]) )
+#        q2 = 2 * torch.sin(0.5 * (theta[it1] + np.pi - theta[it0]))
+#        kappa = 1
+#        k1_k0 = 1/(q1 + kappa + 1e-15)
+#        k2_k0 = 1/(q2 + kappa + 1e-15)
+#        denom = torch.abs(torch.sin(theta[it1] - theta[it0]) ) + 1e-15
+#        self.M_ee_sqr = (k1_k0**2 + k2_k0**2 + (k1_k0 - k2_k0)**2)/denom
+#        self.M_ee_sqr_sum = torch.sum(self.M_ee_sqr, dim=-1)
 
     def get_contactor(
         self, n: torch.Tensor, *, dmu: float = 0.0, vD: float = 0.0
@@ -80,7 +94,7 @@ class FermiCircle(Material):
         shift and drift velocity. Note that positive vD corresponds to current
         flowing into the device (along -n), while negative vD flows out (along +n)."""
         v_hat = self.transport_velocity / self.vF
-        rho_contact = dmu - (n @ v_hat.T) * (vD / self.vF)  # TODO: check
+        rho_contact = dmu - (n @ v_hat.T) * (vD / self.vF) # TODO: check
         return lambda t: rho_contact  # TODO: add time-dependence options
 
     def get_reflector(self, n: torch.Tensor) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -90,14 +104,14 @@ class FermiCircle(Material):
     def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         if not (self.tau_inv_p or self.tau_inv_ee):
             return torch.zeros_like(rho)  # no scattering
-
+        
         # Compute stationary carrier density:
         rho_sum = rho.sum(dim=-1)
         if self.comm.size > 1:
             self.comm.Allreduce(MPI.IN_PLACE, BufferView(rho_sum))
         rho_0 = self.nk_inv * rho_sum[..., None]
         result = (rho_0 - rho) * (self.tau_inv_p + self.tau_inv_ee)
-
+        
         # Compute moving equlibrium carrier density if needed:
         if self.tau_inv_ee:
             v = self.transport_velocity
@@ -106,8 +120,38 @@ class FermiCircle(Material):
                 self.comm.Allreduce(MPI.IN_PLACE, BufferView(rho_v_sum))
             rho_v = torch.einsum("...i, ij, kj -> ...k", rho_v_sum, self.vv_inv, v)
             result += rho_v * self.tau_inv_ee  # combines with rho_0 - rho above
-
+        
         return result
+
+#        N_theta = rho.shape[-1]
+#        rho_plus_pi = torch.roll(rho, shifts=N_theta//2, dims=-1)
+#
+#        # t: theta_0 index, a: theta_1 index
+#
+#        # linear_term1 = M_ee_sqr_sum[theta0] * (rho[...,theta0] + rho[...,theta0 + pi])
+#        linear_term1 = torch.einsum("t, ...t -> ...t", self.M_ee_sqr_sum, rho + rho_plus_pi)
+#
+#        # linear_term2 = \int dtheta1 M_ee_sqr[theta0, theta1] * (rho[...,theta1] + rho[...,theta1+pi])
+#        linear_term2 = torch.einsum("ta, ...a -> ...t", self.M_ee_sqr, rho + rho_plus_pi)
+#
+#        linear_terms = -(linear_term1 - linear_term2)*self.dtheta
+#
+#        # nonlinear_term1 = \int dtheta1 M_ee_sqr[theta0, theta1] * (rho[...,theta0] * rho[...,theta1] * rho[...,theta1+pi])
+#        nonlinear_term1 = torch.einsum("ta, ...t, ...a, ...a -> ...t", self.M_ee_sqr, rho, rho, rho_plus_pi)
+#
+#        # nonlinear_term2 = \int dtheta1 M_ee_sqr[theta0, theta1] * (rho[...,theta0] * rho[...,theta1] * rho[...,theta0+pi])
+#        nonlinear_term2 = torch.einsum("ta, ...t, ...a, ...t -> ...t", self.M_ee_sqr, rho, rho, rho_plus_pi)
+#
+#        # nonlinear_term3 = \int dtheta1 M_ee_sqr[theta0, theta1] * (rho[...,theta0+pi] * rho[...,theta1+pi] * rho[...,theta1])
+#        nonlinear_term3 = torch.einsum("ta, ...t, ...a, ...a -> ...t", self.M_ee_sqr, rho_plus_pi, rho_plus_pi, rho)
+#
+#        # nonlinear_term4 = \int dtheta1 M_ee_sqr[theta0, theta1] * (rho[...,theta0+pi] * rho[...,theta1+pi] * rho[...,theta0])
+#        nonlinear_term4 = torch.einsum("ta, ...t, ...a, ...t -> ...t", self.M_ee_sqr, rho_plus_pi, rho_plus_pi, rho)
+#
+#        nonlinear_terms = -(nonlinear_term1 - nonlinear_term2 + nonlinear_term3 - nonlinear_term4)*self.dtheta
+#
+#        result = linear_terms + nonlinear_terms
+#        return 1e-5*result
 
     def get_observable_names(self) -> list[str]:
         return ["q"]  # charge
