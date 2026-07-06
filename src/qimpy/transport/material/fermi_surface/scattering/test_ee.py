@@ -216,7 +216,7 @@ def test_cubic_vertex_energy_structured_vs_reference():
     xi_c = rb.xi.to(torch.float64)
     Tfm = rb.T_from_modes.to(torch.float64)
     psi_coeff = torch.linalg.solve(
-        torch.vander(xi_c, Nr, increasing=True), Tfm
+        xi_c[:, None] ** torch.arange(Nr, device=xi_c.device, dtype=xi_c.dtype), Tfm
     )
     nh = 2 * M + 1
     common = dict(kF=KF, m_star=M_STAR, T=T0, epsilon_bg=EPS_B, kappa=KAPPA)
@@ -309,7 +309,7 @@ def test_quadratic_vertex_vs_reference():
     xi_c = rb.xi.to(torch.float64)
     Tfm = rb.T_from_modes.to(torch.float64)
     psi_coeff = torch.linalg.solve(
-        torch.vander(xi_c, Nr, increasing=True), Tfm
+        xi_c[:, None] ** torch.arange(Nr, device=xi_c.device, dtype=xi_c.dtype), Tfm
     )
     nh = 2 * M + 1
     common = dict(kF=KF, m_star=M_STAR, T=T0, epsilon_bg=EPS_B, kappa=KAPPA)

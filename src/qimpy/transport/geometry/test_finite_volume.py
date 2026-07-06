@@ -260,13 +260,22 @@ def test_floating_contact_carries_no_current() -> None:
 
 
 def test_floating_contact_reads_uniform_potential() -> None:
-    """In a device at a uniform isotropic level V0, a floating probe reads V0."""
+    """A floating probe in a device held at a uniform genuine Fermi-Dirac level
+    mu0 (isotropic f_r = sigmoid(mu0 - xi_r)) reads back mu0.  An isotropic state
+    carries zero net current per radial node (sum_q v.n = 0 over the angular
+    ordinates), so the floating Newton -- which solves sum_r sigmoid(mu-xi_r) B_r
+    = -C_out -- returns exactly the seed's chemical potential.  (Under full f a
+    uniform occupancy f = V0 would instead read logit(V0), not V0: 'level' is a
+    genuine chemical potential, not a delta-f amplitude.)"""
     torch.set_default_dtype(torch.float64)
-    geom, _ = _build_fv({"source": {"dmu": 0.1}, "drain": {"floating": True}})
-    for V0 in (0.05, -0.1, 0.2):
-        geom._u = torch.full((geom.K, geom.Nk), float(V0), device=rc.device)
+    geom, mat = _build_fv({"source": {"dmu": 0.1}, "drain": {"floating": True}})
+    xi_r = mat.radial.xi.to(rc.device)                   # (Nr,)
+    N_theta = mat.angular.N_theta
+    for mu0 in (0.05, -0.1, 0.2):
+        f_iso = torch.sigmoid(mu0 - xi_r).repeat_interleave(N_theta)   # (Nk,)
+        geom._u = f_iso[None, :].repeat(geom.K, 1)
         geom.contact_currents(0.0)                       # solves the feedback level
-        assert abs(geom.contact_potentials()["drain"] - V0) < 1e-12
+        assert abs(geom.contact_potentials()["drain"] - mu0) < 1e-9
 
 
 def test_current_source_zero_equals_floating() -> None:
@@ -361,14 +370,18 @@ def test_oblique_wall_conserves_tangential_momentum() -> None:
 #  contact-driven steady state
 # --------------------------------------------------------------------------- #
 def test_contact_driven_state_is_bounded() -> None:
-    """Source/drain contacts (dmu = +/-0.1) drive a finite, bounded solution
-    (no blow-up; interior density stays within the contact range)."""
+    """Source/drain contacts (dmu = +/-0.1 about the half-filled f0 = 0.5) drive a
+    finite, Pauli-admissible full-f solution: f neither blows up nor leaves [0, 1]
+    (the genuine-FD contact ghosts stay in range and the streaming is monotone),
+    up to tiny MUSCL overshoots.  The delta-f 'interior density < contact range'
+    bound no longer applies -- the full-f density carries the ~0.5 background."""
     torch.set_default_dtype(torch.float64)
     geom, mat = _build_fv({"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}})
     _step(geom, _steps_for(geom, 50.0))
-    n = torch.einsum("oc,kc->ko", mat.get_observables(0.0), geom._u)[:, 0]
-    assert torch.isfinite(n).all(), "contact-driven solution diverged"
-    assert float(n.abs().max()) < 0.15, "interior density exceeds contact range"
+    f = geom._u
+    assert torch.isfinite(f).all(), "contact-driven solution diverged"
+    assert float(f.min()) > -1e-2, float(f.min())
+    assert float(f.max()) < 1.0 + 1e-2, float(f.max())
 
 
 def test_biased_contacts_balance_at_steady_state() -> None:
@@ -405,6 +418,243 @@ def test_curved_mass_conservation() -> None:
     m0 = _integral(geom, mat, 0)
     _step(geom, _steps_for(geom, 30.0))
     assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
+
+
+# --------------------------------------------------------------------------- #
+#  full-f streaming (evolve the FULL distribution f in [0,1], NOT delta-f).
+#
+#  The interior FV upwind is LINEAR in f, so the committed interior scheme
+#  streams full f exactly; these tests exercise the NONLINEAR full-f boundary
+#  conditions (genuine Fermi-Dirac walls / reservoirs) and the (D,T) specular
+#  correction applied on top of the isotropic equilibrium f0.  The current-
+#  source test is the direct answer to "inject a known current with vD = 0".
+# --------------------------------------------------------------------------- #
+def _f0_full(mat):
+    """Isotropic equilibrium f0(xi_r) the full-f runs seed to (nodal, (Nk,))."""
+    return mat.rho0.to(rc.device)
+
+
+def _drift_ang(mat, amp, phase=0.0):
+    """``amp cos(theta_q - phase)`` replicated across all radial nodes -> (Nk,).
+
+    Channel layout is c = r*N_theta + q (radial outer, angular inner), so the
+    per-ordinate angular pattern tiles Nr times."""
+    ang = amp * torch.cos(mat.angular.theta - phase)          # (N_theta,)
+    return ang.repeat(mat.Nr).to(rc.device)                   # (Nr*N_theta,)
+
+
+def test_full_f_equilibrium_is_stationary() -> None:
+    """The isotropic Fermi-Dirac equilibrium f0 is an EXACT stationary state of
+    full-f streaming in a closed cavity: div(v f0) = 0 cell-by-cell (a closed
+    polygon has sum (v.n) len = 0), the specular reflector returns f0 (isotropic
+    -> zero (D,T) correction), and the collisionless m=0 mode does not decay.
+    So rho_dot(f0) vanishes to round-off -- nothing spurious drives the vacuum."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"), all_walls=True)
+    geom, mat = _build_fv({}, mesh_path=path)
+    geom._u = _f0_full(mat)[None, :].repeat(geom.K, 1)
+    rate = geom.rho_dot(geom.rho, 0.0)[0]
+    assert float(rate.abs().max()) < 1e-10, float(rate.abs().max())
+
+
+def test_full_f_closed_box_conserves_mass() -> None:
+    """A closed (all-wall) cavity conserves total particle number as a full-f
+    state (f0 + density blob + angular drift) streams and specularly reflects:
+    the (D,T)-corrected reflector zeroes net normal mass flux on every edge."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_rect_mesh(11.0, os.path.join(tmp, "rect.npz"), all_walls=True)
+    geom, mat = _build_fv({}, mesh_path=path)
+    cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
+    q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
+    blob = 0.05 * torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 8.0 ** 2))   # (K,)
+    geom._u = (_f0_full(mat)[None, :] + blob[:, None]
+               + _drift_ang(mat, 0.03)[None, :])
+    m0 = _integral(geom, mat, 0)
+    _step(geom, _steps_for(geom, 25.0))
+    assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
+
+
+def test_full_f_closed_box_conserves_mass_multiradial() -> None:
+    """Nr=4 (four energy nodes) full-f state conserves mass in a closed
+    AXIS-ALIGNED box.  At axis-aligned walls the specular reflection theta ->
+    pi-theta is an exact angular-node permutation for every radial node, so mass
+    is conserved per radial mode regardless of the vF-weighted (D,T) correction
+    (which is only vF-exact, not v_speed-exact, at oblique walls for Nr>1)."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_rect_mesh(13.0, os.path.join(tmp, "rect.npz"), all_walls=True)
+    geom, mat = _build_fv({}, mesh_path=path, Nr=4)
+    cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
+    q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
+    blob = 0.05 * torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 8.0 ** 2))
+    geom._u = (_f0_full(mat)[None, :] + blob[:, None]
+               + _drift_ang(mat, 0.03)[None, :])
+    m0 = _integral(geom, mat, 0)
+    _step(geom, _steps_for(geom, 20.0))
+    assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
+
+
+def test_full_f_specular_oblique_conserves_tangential_momentum() -> None:
+    """Full-f specular reflection at an OBLIQUE wall conserves both mass and the
+    wall-tangent momentum J_tang = cos(a) jx + sin(a) jy to round-off.  f0 is
+    isotropic (carries zero net normal and tangential flux), so the (D,T)
+    correction computed on full f equals that on delta-f; this is the
+    discriminating oblique test for the full-f reflector (Nr=1: vF = v_speed)."""
+    torch.set_default_dtype(torch.float64)
+    alpha = 23.7                                       # oblique: not 0/45/90 deg
+    a = np.deg2rad(alpha); ca, sa = float(np.cos(a)), float(np.sin(a))
+    Lx, Ly = 40.0, 20.0
+    tmp = tempfile.mkdtemp()
+    mesh = _make_strip_mesh(8, 4, Lx, Ly, alpha, os.path.join(tmp, "strip.npz"))
+    geom, mat = _build_fv({}, mesh_path=mesh)
+    cen = geom.geom.centroid_np
+    d_perp = -sa * cen[:, 0] + ca * cen[:, 1] - 0.5 * Ly
+    blob = np.exp(-(d_perp ** 2) / (2 * 2.0 ** 2))                  # (K,)
+    theta = mat.angular.theta.detach().cpu().numpy()               # (Nk,) at Nr=1
+    f0 = _f0_full(mat).detach().cpu().numpy()                      # (Nk,)
+    u0 = f0[None, :] + 0.05 * blob[:, None] + 0.3 * np.cos(theta - a)[None, :]
+    geom._u = torch.as_tensor(u0, device=rc.device, dtype=torch.float64)
+    n0 = _integral(geom, mat, 0)
+    J0 = ca * _integral(geom, mat, 1) + sa * _integral(geom, mat, 2)
+    _step(geom, _steps_for(geom, 20.0))
+    n1 = _integral(geom, mat, 0)
+    J1 = ca * _integral(geom, mat, 1) + sa * _integral(geom, mat, 2)
+    assert abs(n1 - n0) / abs(n0) < 1e-10, f"mass drift {(n1 - n0) / n0:.2e}"
+    assert abs(J1 - J0) / abs(J0) < 1e-9, f"J_tang drift {(J1 - J0) / J0:.2e}"
+
+
+def test_full_f_specular_curved_conserves_mass() -> None:
+    """Full-f specular reflection conserves mass on a closed disk (curved wall,
+    normals spanning all angles): the (D,T) correction zeroes net normal mass
+    flux on every straight wall edge regardless of its orientation (Nr=1)."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_disk_mesh(20.0, 64, 4.0, os.path.join(tmp, "disk.npz"))
+    geom, mat = _build_fv({}, mesh_path=path)
+    cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
+    q0 = torch.tensor([50.0, 30.0], dtype=torch.float64, device=rc.device)
+    blob = 0.05 * torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 5.0 ** 2))
+    geom._u = _f0_full(mat)[None, :] + blob[:, None]               # isotropic bump
+    m0 = _integral(geom, mat, 0)
+    _step(geom, _steps_for(geom, 25.0))
+    assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
+
+
+def test_full_f_diffuse_closed_box_conserves_mass() -> None:
+    """A fully diffuse (specularity=0) closed box conserves mass: each wall face
+    re-emits an isotropic genuine Fermi-Dirac at a single chemical potential,
+    solved by a 1-D Newton for zero net normal mass flux (exact to Newton
+    tolerance; the diffuse mass carrier is v_speed-weighted at any Nr)."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"), all_walls=True)
+    geom, mat = _build_fv({}, mesh_path=path, specularity=0.0)
+    cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
+    q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
+    blob = 0.05 * torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 8.0 ** 2))
+    geom._u = (_f0_full(mat)[None, :] + blob[:, None]
+               + _drift_ang(mat, 0.03)[None, :])
+    m0 = _integral(geom, mat, 0)
+    _step(geom, _steps_for(geom, 20.0))
+    assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-9
+
+
+def test_full_f_diffuse_drains_tangential_momentum() -> None:
+    """Contrast on the oblique strip: full-f SPECULAR walls conserve the tangent
+    momentum J_tang, while full-f DIFFUSE walls (isotropic FD re-emit carries
+    zero tangential momentum) drain it.  Both conserve mass.  Confirms the
+    diffuse wall is a genuine tangential-momentum sink for full f, not delta-f
+    only -- the physics the {specular, diffuse} split is supposed to capture."""
+    torch.set_default_dtype(torch.float64)
+    alpha = 23.7
+    a = np.deg2rad(alpha); ca, sa = float(np.cos(a)), float(np.sin(a))
+    Lx, Ly = 40.0, 20.0
+    tmp = tempfile.mkdtemp()
+    mesh = _make_strip_mesh(8, 4, Lx, Ly, alpha, os.path.join(tmp, "strip.npz"))
+
+    def run(spec):
+        geom, mat = _build_fv({}, mesh_path=mesh, specularity=spec)
+        cen = geom.geom.centroid_np
+        d_perp = -sa * cen[:, 0] + ca * cen[:, 1] - 0.5 * Ly
+        blob = np.exp(-(d_perp ** 2) / (2 * 2.0 ** 2))
+        theta = mat.angular.theta.detach().cpu().numpy()
+        f0 = _f0_full(mat).detach().cpu().numpy()
+        u0 = f0[None, :] + 0.05 * blob[:, None] + 0.3 * np.cos(theta - a)[None, :]
+        geom._u = torch.as_tensor(u0, device=rc.device, dtype=torch.float64)
+        n0 = _integral(geom, mat, 0)
+        J0 = ca * _integral(geom, mat, 1) + sa * _integral(geom, mat, 2)
+        _step(geom, _steps_for(geom, 40.0))
+        n1 = _integral(geom, mat, 0)
+        J1 = ca * _integral(geom, mat, 1) + sa * _integral(geom, mat, 2)
+        return n0, n1, J0, J1
+
+    n0s, n1s, J0s, J1s = run(1.0)                      # specular
+    n0d, n1d, J0d, J1d = run(0.0)                      # diffuse
+    assert abs(n1s - n0s) / abs(n0s) < 1e-9, "specular mass"
+    assert abs(n1d - n0d) / abs(n0d) < 1e-9, "diffuse mass"
+    assert abs(J1s - J0s) / abs(J0s) < 1e-9, \
+        f"specular should conserve J_tang: {(J1s - J0s) / J0s:.2e}"
+    assert abs(J1d) < 0.9 * abs(J0d), \
+        f"diffuse should drain J_tang: {J1d:.3e} vs {J0d:.3e}"
+
+
+def test_full_f_diffuse_curved_multiradial_conserves_mass() -> None:
+    """Nr=4 fully-diffuse disk conserves mass: the diffuse re-emit balances the
+    v_speed-weighted normal mass flux at every radial node and every wall angle,
+    so curved + multiradial mass is machine-precise (the diffuse mass carrier is
+    exact for any Nr, unlike the vF-weighted specular (D,T) correction)."""
+    torch.set_default_dtype(torch.float64)
+    tmp = tempfile.mkdtemp()
+    path = _make_disk_mesh(20.0, 64, 5.0, os.path.join(tmp, "disk.npz"))
+    geom, mat = _build_fv({}, mesh_path=path, specularity=0.0, Nr=4)
+    cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
+    q0 = torch.tensor([50.0, 30.0], dtype=torch.float64, device=rc.device)
+    blob = 0.05 * torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 5.0 ** 2))
+    geom._u = _f0_full(mat)[None, :] + blob[:, None]
+    m0 = _integral(geom, mat, 0)
+    _step(geom, _steps_for(geom, 20.0))
+    assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-9
+
+
+def test_full_f_current_source_injects_known_current() -> None:
+    """Inject a KNOWN current with a genuine-FD reservoir at vD = 0 -- the direct
+    answer to "inject a known current by setting a dmu and vD = 0".  A {I_set,
+    vD=0} current source samples an ISOTROPIC Fermi-Dirac whose level (its
+    chemical potential dmu) the geometry solves each step (1-D Newton) so the net
+    emitted current equals I_set.  The same-measure readout then reproduces I_set
+    to round-off, and the injector floats to the higher potential.  Stepped with
+    collisions (resistive device) so a real current develops in the bulk."""
+    torch.set_default_dtype(torch.float64)
+    I = 0.03
+    geom, mat = _build_fv(
+        {"source": {"I_set": -I}, "drain": {"I_set": +I}},
+        tau_p=15.0, tau_ee=8.0)
+    _step(geom, 40)
+    Ic = geom.contact_currents(0.0)
+    assert abs(Ic["source"] + I) < 1e-9, Ic["source"]
+    assert abs(Ic["drain"] - I) < 1e-9, Ic["drain"]
+    V = geom.contact_potentials()
+    assert V["source"] > V["drain"]                    # injector sits at higher mu
+    obs = torch.einsum("oc,kc->ko", mat.get_observables(0.0), geom._u)
+    jmag = torch.sqrt(obs[:, 1] ** 2 + obs[:, 2] ** 2)
+    assert float(jmag.max()) > 1e-4, "no real current flowing in the bulk"
+
+
+def test_full_f_pauli_bounds_preserved() -> None:
+    """Full-f streaming keeps the distribution Pauli-admissible: genuine-FD
+    contact ghosts (dmu = +/-3 -> f in ~[0.047, 0.953]) are in [0,1] and the
+    isotropic f0 background never leaves [0,1], so after driving to a bounded
+    state f stays within [0,1] up to tiny MUSCL overshoots (no hard positivity
+    clamp is applied on the FV path -- the genuine-FD BCs keep it in range)."""
+    torch.set_default_dtype(torch.float64)
+    geom, mat = _build_fv({"source": {"dmu": 3.0}, "drain": {"dmu": -3.0}})
+    _step(geom, _steps_for(geom, 50.0))
+    f = geom._u
+    assert torch.isfinite(f).all(), "full-f solution diverged"
+    assert float(f.min()) > -1e-2, float(f.min())
+    assert float(f.max()) < 1.0 + 1e-2, float(f.max())
 
 
 # --------------------------------------------------------------------------- #
@@ -447,9 +697,13 @@ def _decomp_worker() -> None:
 
 def test_1d_line_mesh_ballistic_is_antisymmetric() -> None:
     """A 1D wire (interval cells, 2 faces/cell) with source/drain dmu=+/-0.1 runs
-    stably through the FiniteVolume 1D geometry path.  Its ballistic steady state is
-    antisymmetric, n(L-x) = -n(x), with a spatially uniform current: the +/-x
-    populations cancel in the density and carry the current straight through."""
+    stably through the FiniteVolume 1D geometry path.  Under full f the ballistic
+    steady state obeys the particle-hole + parity symmetry S: x->L-x, v->-v,
+    f->1-f -- at Nr=1 this maps the source FD ghost sigmoid(0.1-xi) exactly onto
+    the drain's (1 - sigmoid(-0.1-xi) = sigmoid(0.1-xi)).  So the density
+    DEVIATION from half-filling is antisymmetric, n(x)+n(L-x) = 2 n_eq, while the
+    current is spatially uniform (the +/-x populations carry it straight through
+    and the isotropic f0 background carries none)."""
     torch.set_default_dtype(torch.float64)
     tmp = tempfile.mkdtemp()
     mesh = _make_line_mesh(40, os.path.join(tmp, "line.npz"))
@@ -462,8 +716,10 @@ def test_1d_line_mesh_ballistic_is_antisymmetric() -> None:
     n = obs[:, 0].cpu().numpy()
     jx = obs[:, 1].cpu().numpy()
     assert np.isfinite(n).all(), "1D solution diverged"
+    n_eq = float((mat.get_observables(0.0)[0] * _f0_full(mat)).sum())   # half-filled
+    dev = n - n_eq
     mirror = np.array([int(np.argmin(np.abs(x - (1.0 - xi)))) for xi in x])
-    assert np.linalg.norm(n + n[mirror]) / (np.linalg.norm(n) + 1e-30) < 1e-9
+    assert np.linalg.norm(dev + dev[mirror]) / (np.linalg.norm(dev) + 1e-30) < 1e-9
     assert abs(jx.mean()) > 1e-3, "no ballistic current"
     assert jx.std() / abs(jx.mean()) < 1e-2, "ballistic current not uniform"
 
@@ -506,5 +762,15 @@ if __name__ == "__main__":
     test_contact_driven_state_is_bounded(); print("contact_driven_bounded: PASS")
     test_biased_contacts_balance_at_steady_state(); print("biased_balance: PASS")
     test_curved_mass_conservation(); print("curved_mass_conservation: PASS")
+    test_full_f_equilibrium_is_stationary(); print("full_f_equilibrium_stationary: PASS")
+    test_full_f_closed_box_conserves_mass(); print("full_f_closed_box_mass: PASS")
+    test_full_f_closed_box_conserves_mass_multiradial(); print("full_f_closed_box_mass_Nr4: PASS")
+    test_full_f_specular_oblique_conserves_tangential_momentum(); print("full_f_specular_oblique_tang: PASS")
+    test_full_f_specular_curved_conserves_mass(); print("full_f_specular_curved_mass: PASS")
+    test_full_f_diffuse_closed_box_conserves_mass(); print("full_f_diffuse_closed_box_mass: PASS")
+    test_full_f_diffuse_drains_tangential_momentum(); print("full_f_diffuse_drains_tang: PASS")
+    test_full_f_diffuse_curved_multiradial_conserves_mass(); print("full_f_diffuse_curved_mass_Nr4: PASS")
+    test_full_f_current_source_injects_known_current(); print("full_f_current_source: PASS")
+    test_full_f_pauli_bounds_preserved(); print("full_f_pauli_bounds: PASS")
     test_decomp_matches_serial(); print("decomp_matches_serial: PASS")
     print("ALL PASS")

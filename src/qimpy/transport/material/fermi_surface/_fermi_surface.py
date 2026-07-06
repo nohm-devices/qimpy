@@ -202,6 +202,12 @@ class FermiSurface(Material):
         self.tau_inv_p  = 1.0 / tau_p
         self.tau_inv_ee = 1.0 / tau_ee
         self.specularity = specularity
+        # The nodal state is the FULL distribution f in [0,1]: initialized to the
+        # equilibrium Fermi-Dirac f0, with contacts/diffuse walls re-emitting a
+        # genuine Fermi-Dirac occupation.
+        # Fermi energy for the band group-velocity speed factor (parabolic band:
+        # E_F = kF^2/(2 m*) = kF * vF / 2, since vF = kF/m*).
+        self.E_F = 0.5 * kF * vF
         # Even angular-node count (rounded up to a multiple of 4, >= 2M+1): with
         # the midpoint quadrature this is symmetric under both v_x->-v_x and
         # v_y->-v_y and places no node tangent to an axis-aligned wall (avoids a
@@ -220,16 +226,32 @@ class FermiSurface(Material):
         dtype = self.v.dtype
         self.angular = AngularBasis(M_theta, n_quad=N_theta, dtype=dtype)
         self.radial  = RadialBasis(Nr, T_temp=T, xi_max=xi_max, dtype=dtype)
-        # Per-collocation transport velocity: same for every radial point
-        # (Fermi-surface linearization holds |v| = vF independent of energy).
+        # Per-collocation transport velocity = band GROUP velocity.  The speed
+        # depends on the energy (radial) node through the parabolic-band factor
+        #     |v(xi)| = vF * sqrt(1 + T*xi / E_F),   E_F = kF*vF/2,
+        # while the direction is the angular node k_hat = (cos, sin).  At Nr=1
+        # (xi=0) this collapses to the flat |v|=vF Fermi-circle limit.  The clamp
+        # guards the (unphysical) case xi <= -E_F/T where a node would sit at or
+        # below the band bottom (|v|->0), keeping the sqrt real.
         theta_q = self.angular.theta
-        v_per_theta = vF * torch.stack(
+        v_dir = torch.stack(
             [torch.cos(theta_q), torch.sin(theta_q)], dim=-1
         )                                                       # (N_theta, 2)
-        self.v = v_per_theta.repeat(Nr, 1)                      # (Nr*N_theta, 2)
+        xi_r = self.radial.xi                                   # (Nr,)
+        speed_r = vF * torch.sqrt(torch.clamp(
+            1.0 + (self.T_temp * xi_r) / self.E_F, min=0.0))    # (Nr,)
+        self.v_speed = speed_r                                  # band |v| per node
+        self.v = (speed_r[:, None, None] * v_dir[None, :, :]
+                  ).reshape(N_k, 2)                             # (Nr*N_theta, 2)
         # Scalar advection -> no coupling object exposed to the DG layer
         self.coupling = None
         self.k_speed = (vF / r_c) if np.isfinite(r_c) else 0.0
+        # Full-f initial / reference state: the equilibrium Fermi-Dirac occupation
+        # f0(xi_r) = 1/(exp(xi_r)+1), isotropic in angle (same for every theta_q).
+        # The FV geometry reads material.rho0 to seed the nodal state.
+        f0_r = 1.0 / (torch.exp(xi_r) + 1.0)                   # (Nr,)
+        self.rho0 = (f0_r[:, None].expand(Nr, N_theta)
+                     ).reshape(-1).clone()                     # (Nr*N_theta,)
         # Per-mode collision rates in flattened (radial n, angular m) ordering.
         # Angular: m=0 conserved (rate 0); m=1 decays through tau_p only;
         # m>=2 decays through tau_p + tau_ee (both impurity and viscous channels).
@@ -328,11 +350,13 @@ class FermiSurface(Material):
         """Per-channel coefficients for [n, jx, jy] in delta-k storage.
 
         n[r,q]  = w_r / N_theta
-        jx[r,q] = w_r * vF * cos(theta_q) / N_theta
-        jy[r,q] = w_r * vF * sin(theta_q) / N_theta
+        jx[r,q] = w_r * |v_r| * cos(theta_q) / N_theta
+        jy[r,q] = w_r * |v_r| * sin(theta_q) / N_theta
 
-        For Nr=1 (w_r = 1) these are the standard Fermi-circle integrals; for
-        Nr>1 the radial weights w_r are the equilibrium-fluctuation-weighted
+        The current uses the band GROUP speed |v_r| = vF*sqrt(1 + T*xi_r/E_F)
+        per energy node (self.v_speed), consistent with the transport velocity;
+        at Nr=1 |v_r| = vF and these are the standard Fermi-circle integrals.
+        For Nr>1 the radial weights w_r are the equilibrium-fluctuation-weighted
         Gauss-Legendre weights from RadialBasis.
         """
         N_theta = self.angular.N_theta
@@ -348,8 +372,8 @@ class FermiSurface(Material):
         one_q = torch.full_like(cos_q, 1.0 / N_theta)
         # (Nr, N_theta) -> flatten to (Nr * N_theta,)
         n_rq  = (w_r[:, None] * one_q[None, :]).reshape(-1)
-        jx_rq = (w_r[:, None] * (self.vF * cos_q)[None, :]).reshape(-1)
-        jy_rq = (w_r[:, None] * (self.vF * sin_q)[None, :]).reshape(-1)
+        jx_rq = (w_r[:, None] * self.v_speed[:, None] * cos_q[None, :]).reshape(-1)
+        jy_rq = (w_r[:, None] * self.v_speed[:, None] * sin_q[None, :]).reshape(-1)
         return torch.stack([n_rq, jx_rq, jy_rq], dim=0)
 
     def get_contactor(self, n: torch.Tensor, **kwargs) -> Callable:
@@ -393,22 +417,32 @@ class _FermiSurfaceContactor:
         self, fs: "FermiSurface", n: torch.Tensor, *,
         dmu: float = 0.0, vD: float = 0.0,
     ) -> None:
-        # Build the modal contact distribution in (Nr_modes, dim_theta).
         n = n.to(rc.device)  # accept normals supplied on any device
         Nsel = n.shape[0]
-        dim_theta = fs.angular.dim
-        contact_modal = torch.zeros(
-            (Nsel, fs.Nr, dim_theta), device=rc.device, dtype=n.dtype,
-        )
-        phi = torch.atan2(n[:, 1], n[:, 0])                  # outward normal
-        # Voltage: set (n=0, m=0) to dmu (isotropic, equilibrium-shaped).
-        contact_modal[:, 0, 0] = dmu
-        # Drift: set (n=0, m=1) cos/sin to -(vD/vF) (cos phi, sin phi).
-        contact_modal[:, 0, 1] = -(vD / fs.vF) * torch.cos(phi)
-        contact_modal[:, 0, 2] = -(vD / fs.vF) * torch.sin(phi)
-        # Transform once to delta-k.  Flatten radial axis for from_modes.
-        contact_modal_flat = contact_modal.reshape(Nsel, fs.Nr * dim_theta)
-        self.rho_contact = fs.from_modes(contact_modal_flat)  # (Nsel, Nr*N_theta)
+        # ---- full-f contact: genuine (drifted-heated) Fermi-Dirac ghost ------
+        # Build the reservoir distribution DIRECTLY in nodes (0 <= f <= 1):
+        #     f_c[r,q] = sigmoid(dmu/T + (k.u_D)/T - xi_r),
+        # with drift velocity u_D = -vD * n_hat (vD>0 injects current inward),
+        #     (k.u_D)/T = -(kF/(vF T)) |v_r| vD cos(theta_q - phi).
+        # At vD=0 this is the isotropic FD  sigmoid(dmu/T - xi_r) -- the reservoir
+        # a {I_set, vD=0} current source samples (its level dmu is solved by the
+        # geometry layer so the net emitted current hits I_set).
+        theta = fs.angular.theta                          # (N_theta,)
+        xi_r = fs.radial.xi                               # (Nr,)
+        inv_T = 1.0 / fs.T_temp
+        phi = torch.atan2(n[:, 1], n[:, 0])               # (Nsel,)
+        cos_qmphi = (
+            torch.cos(theta)[None, :] * torch.cos(phi)[:, None]
+            + torch.sin(theta)[None, :] * torch.sin(phi)[:, None]
+        )                                                 # (Nsel, N_theta)
+        drift_coeff = -(fs.kF / (fs.vF * fs.T_temp)) * float(vD)
+        drift_rq = (drift_coeff * fs.v_speed[None, :, None]
+                    * cos_qmphi[:, None, :])              # (Nsel, Nr, N_theta)
+        base_arg = (dmu * inv_T) + drift_rq - xi_r[None, :, None]
+        self._base_arg = base_arg                         # ghost arg at dmu given
+        self._inv_T = inv_T
+        f_c = torch.sigmoid(base_arg)                     # (Nsel, Nr, N_theta)
+        self.rho_contact = f_c.reshape(Nsel, fs.Nr * fs.angular.N_theta)
 
     def __call__(self, t: float) -> torch.Tensor:
         return self.rho_contact
@@ -463,6 +497,32 @@ class _FermiSurfaceReflector:
         self.T_to_rad_0 = fs.radial.T_to_modes[0, :]         # (Nr,)
         # n=0 radial basis function psi_0(xi_r) = T_from_radial[:, 0] (length Nr)
         self.psi_0 = fs.radial.T_from_modes[:, 0]            # (Nr,)
+        # ---- full-f diffuse geometry (genuine Fermi-Dirac re-emit) ----------
+        # For full f the diffuse wall re-emits an ISOTROPIC genuine Fermi-Dirac
+        #     f_w(xi_r) = sigmoid(mu_tilde - xi_r),   mu_tilde = dmu_w / T
+        # with a SINGLE mu_tilde per wall face fixed by zero net normal mass
+        # flux.  The discrete normal mass-flux carrier per (wall, r, ordinate)
+        # is  mflux = (quad_w[r] * |v_r| / N_theta) * (k_hat . n),  splitting
+        # into outflow (k_hat.n > 0, carried by the interior trace) and inflow
+        # (k_hat.n < 0, carried by the ghost).  A_r = sum_{inflow} mflux (< 0)
+        # is the coefficient multiplying f_w[r] in the inflow mass flux.
+        khat_dot_n = (
+            n[:, 0:1] * torch.cos(theta)[None, :] +
+            n[:, 1:2] * torch.sin(theta)[None, :]
+        )                                                # (Nsel, N_theta)
+        mcoef_r = fs.radial.quad_w * fs.v_speed / self.N_theta   # (Nr,)
+        mflux = mcoef_r[None, :, None] * khat_dot_n[:, None, :]   # (Nsel,Nr,Nth)
+        pos_mask = (khat_dot_n > 0.0)[:, None, :]                 # (Nsel,1,Nth)
+        neg_mask = (khat_dot_n < 0.0)[:, None, :]
+        self.mf_pos = mflux * pos_mask                           # (Nsel,Nr,Nth)
+        self.mf_neg = mflux * neg_mask
+        self.A_r = self.mf_neg.sum(-1)                           # (Nsel,Nr) < 0
+        self.A_tot = self.A_r.sum(-1).clamp(max=-1e-300)         # (Nsel,) < 0
+        self.xi_r = fs.radial.xi                                 # (Nr,)
+        # Bracket for the mu_tilde bisection (below/above the full xi spread;
+        # +-40 comfortably saturates every sigmoid).  Precomputed 0-d tensors.
+        self.mu_lo = fs.radial.xi.min() - 40.0                   # 0-dim
+        self.mu_hi = fs.radial.xi.max() + 40.0                   # 0-dim
 
     # ---- specular: block-rotation R(phi) per harmonic, independent in radial ----
     def _specular_modal(self, a_modal: torch.Tensor) -> torch.Tensor:
@@ -480,38 +540,27 @@ class _FermiSurfaceReflector:
             out[..., 2 * m]     = sn[..., None] * a_c + c[..., None] * a_s
         return out.reshape(shape_in)
 
-    # ---- main call ----
-    def __call__(self, uM_dk: torch.Tensor) -> torch.Tensor:
-        # 1) Specular component in modes, transformed back to delta-k.
-        uM_modal  = self.fs.to_modes(uM_dk)
-        spec_modal = self._specular_modal(uM_modal)
-        spec_dk   = self.fs.from_modes(spec_modal)
-        # 2) (D_n, T_n) per radial mode -- enforce mass AND tangential-momentum
-        #    conservation at the wall to machine precision.
-        #
-        # The outgoing addition has the form
-        #     u_added(r, q) = sum_n  psi_n(xi_r) * [D_n + T_n * sin(theta_q - phi)]
-        # so D_n controls the (n, m=0) mode (mass-like) and T_n controls the
-        # (n, m=1 tangential) mode (tang-momentum-like) of the outgoing.
-        #
-        # Per radial n we solve the 2x2 system
-        #     [-w_in     beta    ] [D_n]   [-F_M_n     ]
-        #     [vF beta   vF gamma] [T_n] = [-s * F_T_n ]
-        # where
-        #   beta  = sum_{q in inflow} (v_q.n) * sin(theta_q - phi)     (<=0)
-        #   gamma = sum_{q in inflow} (v_q.n) * sin^2(theta_q - phi)   (<=0)
-        #   F_M_n = F_out_mass_n + s * F_in_spec_mass_n  (discrete mass flux)
-        #   F_T_n = F_out_tang_n + F_in_spec_tang_n     (discrete tang flux)
-        # The RHS for tang enforces the discrete identity
-        #   F_total_tang = (1 - s) * F_out_tang_n
-        # which is the continuum tang flux balance at the wall (specular
-        # preserves tang momentum, diffuse fraction dumps it into the wall).
-        # At s=1 this drives the specular's discrete-quadrature tang leak to
-        # zero; at s=0 it cancels the discrete artifact  D*beta  in the tang
-        # flux integral, leaving the gas-loses-F_out_tang continuum behavior.
-        #
-        # The 2x2 blocks decouple per n because the velocity v_q is r-indep:
-        # same (beta, gamma, w_in) for every radial level.
+    # ---- (D_n, T_n) 2x2 wall correction: exact discrete mass + tangential mom. ----
+    def _dt_added(self, uM_dk: torch.Tensor, spec_dk: torch.Tensor,
+                  s: float) -> torch.Tensor:
+        """Additive outgoing correction that enforces discrete mass AND
+        tangential-momentum conservation at the wall to machine precision.
+
+        Returns ``u_added(r, q) = sum_n psi_n(xi_r) [D_n + T_n sin(theta_q-phi)]``
+        (reshaped to ``uM_dk.shape``), where per radial mode n the 2x2 system
+
+            [-w_in     beta    ] [D_n]   [-F_M_n     ]
+            [vF beta   vF gamma] [T_n] = [-s * F_T_n ]
+
+        is solved by Cramer's rule.  ``D_n`` fixes the (n, m=0) mass-like mode and
+        ``T_n`` the (n, m=1 tangential) mode of the outgoing addition; the blocks
+        decouple per n because the velocity is radial-index-independent.  The RHS
+        mixing ``s`` is a specularity weight; the full-f reflector calls this with
+        ``s = 1`` to impose the *pure-specular* balance (F_M_n = F_out + F_in_spec,
+        F_T_n = F_out_tang + F_in_spec_tang) so the specular reflection alone
+        conserves mass and tangential momentum.  Since the isotropic equilibrium
+        f0 carries zero net normal and tangential flux, the correction computed
+        from the full f equals the one carried by the deviation about f0."""
         shape_in = uM_dk.shape
         uM4 = uM_dk.reshape(*shape_in[:-1], self.Nr, self.N_theta)
         sp4 = spec_dk.reshape(*shape_in[:-1], self.Nr, self.N_theta)
@@ -535,17 +584,74 @@ class _FermiSurfaceReflector:
         F_in_spec_mass_n = (adn_neg * sp_n_q).sum(-1)
         F_out_tang_n     = vF * (adn_pos * sin_b * uM_n_q).sum(-1)
         F_in_spec_tang_n = vF * (adn_neg * sin_b * sp_n_q).sum(-1)
-        F_M_n = F_out_mass_n + self.s * F_in_spec_mass_n
+        F_M_n = F_out_mass_n + s * F_in_spec_mass_n
         F_T_n = F_out_tang_n + F_in_spec_tang_n
         # 2x2 Cramer per (Nsel), broadcast over Nr (and any leading batch).
         det = -vF * (self.w_in * gamma + beta * beta)        # (Nsel,)  < 0
         det_b = det[:, None]
         b1 = -F_M_n
-        b2 = -self.s * F_T_n
+        b2 = -s * F_T_n
         D = (b1 * (vF * gamma)[:, None] - b2 * beta[:, None]) / det_b
         T = ((-self.w_in)[:, None] * b2 - (vF * beta)[:, None] * b1) / det_b
-        # 3) u_added(r, q) = sum_n psi_n(r) [D_n + T_n sin_q],  via T_from_modes.
+        # u_added(r, q) = sum_n psi_n(r) [D_n + T_n sin_q],  via T_from_modes.
         D_r = torch.einsum("rn,...an->...ar", T_from_r, D)
         T_r = torch.einsum("rn,...an->...ar", T_from_r, T)
         u_added = D_r.unsqueeze(-1) + T_r.unsqueeze(-1) * sin_q.unsqueeze(-2)
-        return self.s * spec_dk + u_added.reshape(shape_in)
+        return u_added.reshape(shape_in)
+
+    # ---- full-f reflection: specular (exact on full f) + genuine-FD diffuse ----
+    def _call_full_f(self, uM_dk: torch.Tensor) -> torch.Tensor:
+        """Reflect the FULL distribution f (0<=f<=1) at the wall.
+
+        Specular is exact on full f: the modal rotation leaves the isotropic
+        (n=0, m=0) part -- which carries f0 -- untouched and rotates m>=1, so
+        R(f0 + df) = f0 + R(df).  The finite-N_theta quadrature of the reflected
+        trace leaks a little mass at curved walls and tangential momentum at
+        oblique walls; the (D_n, T_n) 2x2 correction (pure-specular s=1 balance)
+        removes both to machine precision -- f0 carries zero net normal and
+        tangential flux, so the correction on full f equals that on df and is a
+        tiny additive term that leaves f in [0,1].  Diffuse re-emits an isotropic
+        genuine Fermi-Dirac at a single chemical potential mu_tilde per wall
+        face, fixed by zero net normal mass flux (exact to machine precision).
+        """
+        spec_modal = self._specular_modal(self.fs.to_modes(uM_dk))
+        spec_dk = self.fs.from_modes(spec_modal)              # = f0 + R(df)
+        spec_dk = spec_dk + self._dt_added(uM_dk, spec_dk, 1.0)  # mass+tang exact
+        s = self.s
+        if s >= 1.0:
+            return spec_dk
+        shape_in = uM_dk.shape
+        uM4 = uM_dk.reshape(*shape_in[:-1], self.Nr, self.N_theta)
+        sp4 = spec_dk.reshape(*shape_in[:-1], self.Nr, self.N_theta)
+        # Net normal mass flux = outflow(interior) + s*inflow(spec) + (1-s)*inflow(f_w)
+        # must vanish  =>  sum_r f_w[r] * A_r = RHS,   RHS = -(J_out + s S_spec)/(1-s)
+        J_out  = (self.mf_pos * uM4).sum((-1, -2))            # (...,Nsel)
+        S_spec = (self.mf_neg * sp4).sum((-1, -2))            # (...,Nsel)
+        RHS = -(J_out + s * S_spec) / (1.0 - s)               # (...,Nsel)
+        # Solve  sum_r sigmoid(mu_tilde - xi_r) * A_r = RHS  for the single
+        # per-face chemical potential mu_tilde.  h(mu) = LHS - RHS is monotonically
+        # DECREASING in mu (all A_r <= 0) from +|RHS| (mu -> -inf) to A_tot - RHS
+        # (mu -> +inf); the physical RHS in [A_tot, 0] is bracketed by
+        # [xi_min - 40, xi_max + 40].  Bisection is used rather than Newton because
+        # a fixed-iteration Newton diverges when some radial nodes sit below the
+        # band bottom (|v_r| = 0 -> A_r = 0): the objective is then flat in mu over
+        # those nodes and the flat-f_w init overshoots to +-inf.  60 halvings pin
+        # mu_tilde to ~1e-16; bisection also self-saturates if RHS is (marginally)
+        # outside the bracket, so the ghost stays Pauli-bounded unconditionally.
+        lo = torch.zeros_like(RHS) + self.mu_lo               # (...,Nsel)
+        hi = torch.zeros_like(RHS) + self.mu_hi
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            h = (torch.sigmoid(mid[..., None] - self.xi_r) * self.A_r).sum(-1) - RHS
+            take_upper = h > 0.0                              # root lies at larger mu
+            lo = torch.where(take_upper, mid, lo)
+            hi = torch.where(take_upper, hi, mid)
+        mu = 0.5 * (lo + hi)                                  # (...,Nsel)
+        fw = torch.sigmoid(mu[..., None] - self.xi_r).clamp(0.0, 1.0)  # (...,Nsel,Nr)
+        diff = fw.unsqueeze(-1).expand(*fw.shape, self.N_theta)        # isotropic
+        ghost = s * sp4 + (1.0 - s) * diff
+        return ghost.reshape(shape_in)
+
+    # ---- main call ----
+    def __call__(self, uM_dk: torch.Tensor) -> torch.Tensor:
+        return self._call_full_f(uM_dk)

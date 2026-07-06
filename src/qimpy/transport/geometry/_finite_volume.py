@@ -291,7 +291,7 @@ def _coordinate_part(mesh, nparts: int) -> np.ndarray:
     equal-count blocks. Correct but with poorer locality on branchy meshes."""
     V = np.stack([mesh.VX, mesh.VY], axis=1)
     cen = V[np.asarray(mesh.EToV, int)].mean(axis=1)
-    axis = 0 if cen[:, 0].ptp() >= cen[:, 1].ptp() else 1
+    axis = 0 if np.ptp(cen[:, 0]) >= np.ptp(cen[:, 1]) else 1  # NumPy 2.0: ndarray.ptp removed
     order = np.argsort(cen[:, axis], kind="stable")
     part = np.empty(len(order), np.int32)
     part[order] = np.minimum((np.arange(len(order)) * nparts) // len(order), nparts - 1)
@@ -401,20 +401,21 @@ class SpatialDecomp:
 class _Contact:
     """One boundary contact. ``fixed`` holds a prescribed ghost; a feedback
     contact (``floating`` probe or ``current`` source) solves a scalar level
-    each evaluation so its net current hits ``target`` (0 for floating)."""
+    (the reservoir chemical potential mu_tilde) each evaluation so its net
+    current hits ``target`` (0 for floating).  The reservoir is a genuine
+    isotropic Fermi-Dirac  f_c[r] = sigmoid(mu_tilde - xi_r)."""
 
     name: str
     idx: torch.Tensor                 # boundary-edge indices of this contact
     cur: torch.Tensor                 # (Nsel, Nk) outward number-flux operator
     kind: str = "fixed"
     ghost: Optional[torch.Tensor] = None       # fixed: prescribed exterior trace
-    unit: Optional[torch.Tensor] = None        # feedback: ghost per unit level
-    drift: Optional[torch.Tensor] = None       # feedback: prescribed drift part
     cur_out: Optional[torch.Tensor] = None     # feedback: outflow-only flux op
-    den: float = 1.0                           # feedback: inflow capacity / level
-    base: float = 0.0                          # feedback: drift inflow current
     target: float = 0.0                        # feedback: desired net current
-    level: float = 0.0                         # feedback: last solved level
+    level: float = 0.0                         # feedback: last solved mu_tilde
+    Br: Optional[torch.Tensor] = None          # feedback: per-radial inflow current cap
+    xi_r: Optional[torch.Tensor] = None        # feedback: radial energy nodes (Nr,)
+    N_theta: int = 0                           # feedback: angular node count
 
 
 class FiniteVolume(Geometry):
@@ -618,26 +619,10 @@ class FiniteVolume(Geometry):
                          if owns[i] and not is_c(nm)], int)
         self._wall = torch.as_tensor(wall, device=rc.device, dtype=torch.long)
         self._reflector = material.get_reflector(g.bn[self._wall]) if wall.size else None
-        # The reflector is linear in the wall trace, so collapse its per-step,
-        # O(M_theta)-Python-loop modal transforms into a single per-edge matrix
-        # applied as one batched matmul. Build it once by reflecting the Nk basis
-        # vectors: refl_mat[e, i, c] = reflector(e_c)[e, i].
-        self._refl_mat = None
-        if self._reflector is not None:
-            nw = self._wall.numel()
-            bn_wall = g.bn[self._wall]
-            eye = torch.eye(self.Nk, device=rc.device, dtype=g.area.dtype)
-            # Build the per-edge matrix in chunks over wall edges into a preallocated
-            # buffer: fully materializing the (Nk, nw, Nk) basis at once OOMs at
-            # large Nk (the matrix itself is nw*Nk^2).  Cap the transient at ~200 MB.
-            chunk = max(1, int(2.0e8 // (self.Nk * self.Nk * 8)))
-            self._refl_mat = torch.empty(nw, self.Nk, self.Nk,
-                                         device=rc.device, dtype=g.area.dtype)
-            for s in range(0, nw, chunk):
-                cs = min(chunk, nw - s)
-                refl_c = material.get_reflector(bn_wall[s:s + cs])
-                basis_c = eye[:, None, :].expand(self.Nk, cs, self.Nk)
-                self._refl_mat[s:s + cs] = refl_c(basis_c).permute(1, 2, 0)
+        # The full-f reflector's diffuse re-emit is NONLINEAR in the wall trace
+        # (a genuine Fermi-Dirac at a per-face chemical potential), so it is
+        # evaluated per step rather than collapsed into a precomputed per-edge
+        # matrix (as a purely linear reflector could be).
 
         def allreduce(x: float) -> float:
             return self.comm.allreduce(x) if self._mpi else x
@@ -653,22 +638,26 @@ class FiniteVolume(Geometry):
             params = dict(params)
             floating = bool(params.pop("floating", False))
             i_set = params.pop("I_set", None)
-            vD = float(params.get("vD", 0.0))
             if floating or (i_set is not None):
-                # Contactor ghost is affine in dmu: g(dmu) = dmu*unit + drift.
-                bn_ci = g.bn[ci]
-                unit = material.get_contactor(bn_ci, dmu=1.0)(0.0)
-                drift = (material.get_contactor(bn_ci, vD=vD)(0.0)
-                         if vD else torch.zeros_like(unit))
+                # Full-f current/floating source: the reservoir is a genuine
+                # isotropic Fermi-Dirac  f_c[r] = sigmoid(mu_tilde - xi_r).  The
+                # net emitted current is nonlinear in mu_tilde, so the geometry
+                # layer solves a 1-D Newton for mu_tilde each step (see _exterior).
+                # Precompute the per-radial inflow current capacity
+                #   B_r = sum_{faces, ordinates in inflow} cur[.,r,.]   (< 0)
+                # and keep cur_out for the outflow (interior) current term.
+                Nr = int(material.Nr)
+                Nth = int(material.angular.N_theta)
                 cur_in = torch.where(self._a_bnd[ci] < 0, cur, torch.zeros_like(cur))
                 cur_out = torch.where(self._a_bnd[ci] > 0, cur, torch.zeros_like(cur))
-                den = allreduce(float(-(cur_in * unit).sum()))   # global inflow capacity
-                base = allreduce(float((cur_in * drift).sum()))  # global drift inflow
+                Br_local = cur_in.reshape(-1, Nr, Nth).sum((0, 2))    # (Nr,)
+                Br = torch.tensor([allreduce(float(x)) for x in Br_local],
+                                  device=rc.device, dtype=cur.dtype)   # (Nr,) global
                 self._contacts.append(_Contact(
-                    name=nm, idx=ci, cur=cur, kind="current",
-                    unit=unit, drift=drift, cur_out=cur_out,
-                    den=(den if abs(den) > 1e-300 else 1e-300), base=base,
-                    target=(0.0 if floating else float(i_set))))
+                    name=nm, idx=ci, cur=cur, kind="current", cur_out=cur_out,
+                    target=(0.0 if floating else float(i_set)),
+                    Br=Br, xi_r=material.radial.xi.to(cur.dtype),
+                    N_theta=Nth))
             else:
                 ghost = material.get_contactor(g.bn[ci], **params)(0.0)
                 self._contacts.append(_Contact(
@@ -722,20 +711,39 @@ class FiniteVolume(Geometry):
         level so the net current equals their target; only inflow channels are
         consumed downstream by the upwind flux."""
         uP = uMb.clone()
-        if self._refl_mat is not None:
-            uP[self._wall] = torch.einsum(
-                "eic,ec->ei", self._refl_mat, uMb[self._wall])
+        if self._reflector is not None and self._wall.numel():
+            # Full-f wall: nonlinear (specular + genuine-FD diffuse) per step.
+            uP[self._wall] = self._reflector(uMb[self._wall]).to(uP)
         for c in self._contacts:
             if c.kind == "fixed":
                 uP[c.idx] = c.ghost.to(uP)
             else:
-                # I_net(level) = num_out + base - level*den; solve = target. The
-                # outflow term is summed across ranks so the level is global.
-                num = float((c.cur_out * uMb[c.idx]).sum())
+                # Full-f reservoir: solve mu_tilde so the net current hits target,
+                #   C_out + sum_r sigmoid(mu_tilde - xi_r) * B_r = target,
+                # then emit the isotropic Fermi-Dirac f_c[r] = sigmoid(mu-xi_r).
+                # C_out (outflow, interior-carried) is summed across ranks so the
+                # solved level is global; B_r is already global.
+                C_out = float((c.cur_out * uMb[c.idx]).sum())
                 if self._mpi:
-                    num = self.comm.allreduce(num)
-                c.level = (num + c.base - c.target) / c.den
-                uP[c.idx] = (c.level * c.unit + c.drift).to(uP)
+                    C_out = self.comm.allreduce(C_out)
+                Br, xi = c.Br, c.xi_r
+                rhs = c.target - C_out
+                F0 = torch.clamp(rhs / Br.sum(), 1e-6, 1.0 - 1e-6)  # flat-f init
+                mu = torch.log(F0 / (1.0 - F0))
+                for _ in range(8):                                  # 1-D Newton
+                    fw = torch.sigmoid(mu - xi)                     # (Nr,)
+                    g  = (fw * Br).sum() - rhs
+                    gp = (fw * (1.0 - fw) * Br).sum()               # < 0
+                    mu = mu - g / gp
+                c.level = float(mu)
+                fw = torch.sigmoid(mu - xi).clamp(0.0, 1.0)         # (Nr,)
+                Nsel = int(c.idx.numel())
+                # Explicit last dim (not -1): under MPI a rank may own zero of
+                # this contact's cells (Nsel=0); reshape(-1) is ambiguous on a
+                # 0-element tensor, so give the exact channel count Nr*N_theta.
+                uP[c.idx] = (fw[None, :, None]
+                             .expand(Nsel, xi.numel(), c.N_theta)
+                             .reshape(Nsel, xi.numel() * c.N_theta).to(uP))
         return uP
 
     def _spatial_rhs(self, u: torch.Tensor, t: float) -> torch.Tensor:

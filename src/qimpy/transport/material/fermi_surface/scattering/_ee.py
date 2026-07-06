@@ -369,7 +369,12 @@ class EEScattering(TreeNode):
         t_ratio = T / self.E_F
         xi_c = fs.radial.xi.to(torch.float64).cpu()  # collocation nodes
         Tfm = fs.radial.T_from_modes.to(torch.float64).cpu()  # psi_l(xi_c)
-        V = torch.vander(xi_c, Nr, increasing=True)  # (Nr, Nr)
+        # Device-safe Vandermonde (== torch.vander(xi_c, Nr, increasing=True)):
+        # torch.vander is treated as a device-constructor, so an active
+        # default-device context injects an unsupported device= kwarg on some
+        # torch builds. Building it by broadcasting avoids that entirely.
+        _pows = torch.arange(Nr, device=xi_c.device, dtype=xi_c.dtype)
+        V = xi_c[:, None] ** _pows  # (Nr, Nr)
         psi_coeff = (
             torch.linalg.solve(V, Tfm)
             if Nr > 1
