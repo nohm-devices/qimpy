@@ -56,7 +56,7 @@ with h5py.File(ckpt) as f:
 from qimpy.transport.plot import run_finite_volume
 outpng = os.path.join(tmp, "frame_{}.png")
 run_finite_volume([ckpt], slice(None), outpng, {"field": "n"},
-                  {"mode": "quiver", "density": 1.2}, 90)
+                  {"density": 1.4, "linewidth": 1.0, "arrowsize": 1.0}, 110)
 pngs = [p for p in os.listdir(tmp) if p.endswith(".png")]
 print("PNGs written:", sorted(pngs))
 print("PASS: staggered checkpoint + face-native plot" if pngs else "CHECK: no PNG")
