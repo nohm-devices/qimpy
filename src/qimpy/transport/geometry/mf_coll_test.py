@@ -41,9 +41,10 @@ def krate():
     mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
     uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
     dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
-    gmu, gTe = fv._grad(mu), fv._grad(Te); gkD = fv._grad(fs.mstar * u / fs.hbar)
+    qf = torch.stack([mu, Te, fs.mstar * u[:, 0] / fs.hbar, fs.mstar * u[:, 1] / fs.hbar], 1)
+    av = fv._frame_adv(qf, mu, Te, u).reshape(fv.K, 4, fs.Nr, fs.angular.N_theta)
     dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
-    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, av[:, 0], av[:, 1], av[:, 2], av[:, 3])
     dxi = float(torch.diff(fs.radial.xi).abs().min())
     return float(xid.abs().max()) / dxi + float(phid.abs().max()) / fs.angular.wphi
 

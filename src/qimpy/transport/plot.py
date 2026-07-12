@@ -14,17 +14,14 @@ from qimpy.io import log_config, Checkpoint
 # Checkpoint time is in Hartree atomic units; 1 a.u. = ℏ/E_h s.
 _PS_PER_AU_TIME = 2.4188843265857e-5
 
-# TODO(staggered output -- fix later): vector outputs (currents, heat fluxes,
-# etc.) need to be output at the EDGES of the triangular elements, whereas
-# scalars (density, temperature) need to be CELL-CENTERED. The solver currently
-# writes every fv_observable -- scalar and vector alike -- as a single
-# cell-centered (triangle-centroid) average, which is right for the scalars but
-# wrong for the vectors: on a triangular finite-volume mesh a flux's natural
-# home is the edge (face) midpoint, not the cell center. For now the streamlines
-# are traced straight from the cell-centered current (an approximation). The
-# proper fix is in the solver's checkpoint output -- emit vector quantities on
-# element edges and scalars on cells -- after which the current can be plotted
-# on the faces.
+# Staggered output: vectors are now face-native. Scalars (density, temperature)
+# are CELL-CENTERED in `fv_observables`; vector fluxes (number-current j, heat
+# flux q) are emitted by the solver at triangle EDGE (face) midpoints as their
+# normal-flux densities `fv_edge_flux` = [j.n^, q.n^] on the static `edge_midpoints`
+# / `edge_normals` faces. `run_finite_volume` reconstructs the cell current from
+# those per-face normals by least squares (no cell-centered current is assumed);
+# legacy checkpoints without `fv_edge_flux` fall back to the old cell-averaged
+# current for compatibility.
 
 
 def main() -> None:
@@ -98,6 +95,46 @@ def fv_edge_geometry(verts, tris):
     bcell0 = cell0[boundary]                                 # adj cell per bedge
     return dict(emid=emid, cell0=cell0, cell1=cell1, bsegs=bsegs, bkeys=bkeys,
                 bcell0=bcell0)
+
+
+def fv_face_to_cell(verts, tris, edge_mid, edge_nrm):
+    """Static least-squares operator: cell-centered vector from per-face normal data.
+
+    The solver emits vector fluxes as scalar normal-flux densities ``F.n^`` at the
+    face (edge) midpoints (staggered grid). To trace streamlines we need a cell
+    vector, so per triangle we solve the small least-squares system that best
+    matches its three face normals,
+        j_c = (sum_f n^_f (x) n^_f)^{-1} sum_f (F.n^)_f n^_f,
+    which is exact for a locally uniform field (3 faces, 2 unknowns, rank 2). Only
+    the geometry is precomputed here (matched once via a midpoint KD-tree to the
+    solver's own edge list, so the stored normal's SIGN is honoured); the per-frame
+    values plug into :func:`fv_reconstruct_cell`. Returns ``(face_edge (K,3) int,
+    face_nrm (K,3,2), Minv (K,2,2))``. Pure numpy, computed once per mesh."""
+    from scipy.spatial import cKDTree
+    K = tris.shape[0]
+    tree = cKDTree(np.asarray(edge_mid, float))
+    loc = np.array([[0, 1], [1, 2], [2, 0]])                 # triangle's 3 local faces
+    face_edge = np.zeros((K, 3), int)
+    face_nrm = np.zeros((K, 3, 2))
+    Minv = np.zeros((K, 2, 2))
+    for k in range(K):
+        M = np.zeros((2, 2))
+        for f in range(3):
+            mid = 0.5 * (verts[tris[k, loc[f, 0]]] + verts[tris[k, loc[f, 1]]])
+            j = int(tree.query(mid)[1])                      # matching solver edge
+            nhat = np.asarray(edge_nrm[j], float)
+            face_edge[k, f] = j
+            face_nrm[k, f] = nhat
+            M += np.outer(nhat, nhat)
+        Minv[k] = np.linalg.inv(M + 1e-30 * np.eye(2))       # rank-2, tiny ridge
+    return face_edge, face_nrm, Minv
+
+
+def fv_reconstruct_cell(Fn, face_edge, face_nrm, Minv):
+    """Cell-centered vector (K,2) from per-face normal-flux densities ``Fn`` (Nedge,)
+    via the precomputed least-squares operator (see :func:`fv_face_to_cell`)."""
+    b = np.einsum("kf,kfd->kd", Fn[face_edge], face_nrm)     # sum_f (F.n^)_f n^_f
+    return np.einsum("kde,ke->kd", Minv, b)                  # (K, 2)
 
 
 def fv_contact_mask(bkeys, boundary_edges, boundary_markers,
@@ -238,17 +275,32 @@ def _read_contact_names(g):
     return names or None
 
 
+def _read_str_list(g, key):
+    """Read a comma-joined string dataset (e.g. ``observable_names``) into an
+    ORDER-PRESERVING list of labels, or None if absent. Used to map a requested
+    scalar field to its column in ``fv_observables``."""
+    try:
+        arr = np.array(g[key])
+    except Exception:
+        return None
+    s = arr.item()
+    s = s.decode() if isinstance(s, (bytes, bytearray)) else str(s)
+    labels = [q.strip() for q in s.split(",") if q.strip()]
+    return labels or None
+
+
 def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> None:
     """Frame-parallel, mesh-native rendering of FiniteVolume (finite-volume) output.
 
-    The finite-volume state is one average per triangle. Density is a
-    cell-centred quantity, drawn as a flat-shaded ``tripcolor`` (piecewise
-    constant, the honest FV picture) over the actual mesh. The current is also
-    stored cell-averaged, so streamlines are traced from the cell-centred field
-    interpolated over the mesh and masked to the interior so none stray outside
-    the device (see the staggered-output TODO: a flux really belongs on the
-    faces). Each rank renders its strided subset of frames, so post-processing
-    scales like the solve."""
+    Scalars are cell-centred: the chosen field (density by default) is drawn as a
+    flat-shaded ``tripcolor`` (piecewise constant, the honest FV picture) over the
+    actual mesh. Vectors are FACE-NATIVE: the solver emits the current/heat-flux
+    normal densities at the triangle edge midpoints (``fv_edge_flux`` on
+    ``edge_midpoints``/``edge_normals``); streamlines are traced from a cell current
+    reconstructed by least squares from those per-face normals (``fv_face_to_cell``)
+    -- no cell-centred current is assumed. Older checkpoints without ``fv_edge_flux``
+    fall back to the previous cell-averaged current. Each rank renders its strided
+    subset of frames, so post-processing scales like the solve."""
     import os
     import matplotlib.tri as mtri
     from matplotlib.collections import LineCollection
@@ -260,6 +312,11 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
         tris = np.array(g["mesh_triangles"])         # (K, 3)
         mesh_file = g.attrs.get("mesh_file", b"")
         contact_names = _read_contact_names(g)       # authoritative set or None
+        obs_names = _read_str_list(g, "observable_names")   # column labels or None
+        # Face-native vectors: present iff the solver emitted the staggered output.
+        has_faces = "fv_edge_flux" in g
+        edge_mid = np.array(g["edge_midpoints"]) if has_faces else None   # (Nedge, 2)
+        edge_nrm = np.array(g["edge_normals"]) if has_faces else None     # (Nedge, 2)
     mesh_file = (mesh_file.decode() if isinstance(mesh_file, bytes)
                  else str(mesh_file))
     triang = mtri.Triangulation(verts[:, 0], verts[:, 1], tris)
@@ -268,6 +325,13 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
     cell_cent = verts[tris].mean(axis=1)             # (K, 2) triangle centroids
     span = max(verts[:, 0].max() - verts[:, 0].min(),
                verts[:, 1].max() - verts[:, 1].min())
+    # Cell-centred scalar to shade (density by default); mapped to its stored column.
+    field = density.get("field", "n")
+    fcol = obs_names.index(field) if (obs_names and field in obs_names) else 0
+    # Precompute the static face->cell least-squares operator for the vectors
+    # (only needed when tracing reconstructed streamlines).
+    if has_faces and streamlines is not None:
+        face_edge, face_nrm, Minv = fv_face_to_cell(verts, tris, edge_mid, edge_nrm)
     # Contact edges (gold) vs walls (black), from the mesh's own markers.
     contact = np.zeros(len(edges["bkeys"]), dtype=bool)
     contact_labels = np.full(len(edges["bkeys"]), "wall", dtype=object)
@@ -297,9 +361,11 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
             g = cp["/geometry"]
             i_step_list = np.array(g["i_step"])[mine]
             t_list = np.array(g["t"])[mine]
-            obs = np.array(g["fv_observables"][mine])   # (nframe, K, n_obs)
+            obs = np.array(g["fv_observables"][mine])   # (nframe, K, n_scalar)
+            edge_flux = (np.array(g["fv_edge_flux"][mine])   # (nframe, Nedge, 2)
+                         if has_faces else None)
         for fr, (i_step, t) in enumerate(zip(i_step_list, t_list)):
-            n_val = obs[fr, :, 0]                        # (K,) per-cell density
+            n_val = obs[fr, :, fcol]                     # (K,) per-cell scalar
             vmax = float(np.nanmax(np.abs(n_val)))
             if not np.isfinite(vmax) or vmax == 0.0:
                 vmax = 1.0
@@ -325,20 +391,38 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
                             bbox=dict(boxstyle="round,pad=0.2", fc="white",
                                       ec=gold, alpha=0.85, lw=1.0))
             cb = fig.colorbar(tpc, ax=ax, fraction=0.046, pad=0.04)
-            cb.set_label(rf"Density ($\times|\rho|_{{\max}}$ = {vmax:.2e})")
-            if streamlines is not None and obs.shape[-1] >= 3:
-                # Current is stored cell-averaged (centroid) -- see the
-                # staggered-output TODO above. Interpolate it from the cell
-                # centroids and mask to the mesh interior so streamlines stay
-                # inside the device.
-                U = griddata(cell_cent, obs[fr, :, 1], (Xs, Ys), method="linear")
-                V = griddata(cell_cent, obs[fr, :, 2], (Xs, Ys), method="linear")
-                U = np.where(inside, np.nan_to_num(U), np.nan)
-                V = np.where(inside, np.nan_to_num(V), np.nan)
-                ax.streamplot(xs, ys, U, V,
-                              density=streamlines.get("density", 1.5),
-                              linewidth=streamlines.get("linewidth", 0.9),
-                              arrowsize=streamlines.get("arrowsize", 0.9), color="k")
+            label = "Density" if fcol == 0 else field
+            cb.set_label(rf"{label} ($\times$max = {vmax:.2e})")
+            if streamlines is not None and (has_faces or obs.shape[-1] >= 3):
+                jx = jy = None
+                if has_faces:
+                    # FACE-NATIVE current: stored as its normal-flux density j.n^ at
+                    # the edge midpoints. mode="quiver" draws those face normals
+                    # directly; otherwise reconstruct the cell current by least
+                    # squares from the per-face normals (fv_face_to_cell) and trace
+                    # it -- no cell-centred current is stored or assumed.
+                    Fn = edge_flux[fr, :, 0]                 # number-current j.n^
+                    if streamlines.get("mode") == "quiver":
+                        ax.quiver(edge_mid[:, 0], edge_mid[:, 1],
+                                  Fn * edge_nrm[:, 0], Fn * edge_nrm[:, 1],
+                                  color="k", zorder=4, pivot="mid", angles="xy",
+                                  width=streamlines.get("width", 0.003),
+                                  scale=streamlines.get("quiver_scale", None))
+                    else:
+                        Jc = fv_reconstruct_cell(Fn, face_edge, face_nrm, Minv)
+                        jx, jy = Jc[:, 0], Jc[:, 1]
+                else:
+                    # Legacy checkpoint: current stored cell-averaged (centroids).
+                    jx, jy = obs[fr, :, 1], obs[fr, :, 2]
+                if jx is not None:
+                    U = griddata(cell_cent, jx, (Xs, Ys), method="linear")
+                    V = griddata(cell_cent, jy, (Xs, Ys), method="linear")
+                    U = np.where(inside, np.nan_to_num(U), np.nan)
+                    V = np.where(inside, np.nan_to_num(V), np.nan)
+                    ax.streamplot(xs, ys, U, V,
+                                  density=streamlines.get("density", 1.5),
+                                  linewidth=streamlines.get("linewidth", 0.9),
+                                  arrowsize=streamlines.get("arrowsize", 0.9), color="k")
             plot_file = output.format(i_step)
             fig.savefig(plot_file, bbox_inches="tight", dpi=dpi)
             plt.close(fig)

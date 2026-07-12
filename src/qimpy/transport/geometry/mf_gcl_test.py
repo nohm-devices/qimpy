@@ -40,9 +40,10 @@ for c in (0.0, 0.37, 1.0, 2.7):
     mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
     uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
     dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
-    gmu, gTe = fv._grad(mu), fv._grad(Te); gkD = fv._grad(fs.mstar * u / fs.hbar)
+    qf = torch.stack([mu, Te, fs.mstar * u[:, 0] / fs.hbar, fs.mstar * u[:, 1] / fs.hbar], 1)
+    av = fv._frame_adv(qf, mu, Te, u).reshape(fv.K, 4, fs.Nr, fs.angular.N_theta)
     dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
-    xidot, phidot = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+    xidot, phidot = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, av[:, 0], av[:, 1], av[:, 2], av[:, 3])
     Jz = fs.mstar * Te / fs.hbar ** 2
     dG = fv._transportG(fv._u, uf, Jz, mu, Te, u, xidot, phidot, None, None, 0.0)
     dJv = fv._transportG(None, uf, Jz, mu, Te, u, xidot, phidot, None, None, 0.0)

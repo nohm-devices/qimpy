@@ -56,6 +56,7 @@ class FVGeom:
 
     area: torch.Tensor; inv_area: torch.Tensor; inradius: torch.Tensor   # (K,)
     centroid_np: np.ndarray; vertices_np: np.ndarray; triangles_np: np.ndarray
+    face_mid_np: np.ndarray    # (K, n_face, 2) per-cell face (edge) midpoints -> staggered output
     eL: torch.Tensor; eR: torch.Tensor; eLF: torch.Tensor; eRF: torch.Tensor  # (Ne,)
     en: torch.Tensor; elen: torch.Tensor                                  # (Ne,2),(Ne,)
     bcell: torch.Tensor; bF: torch.Tensor; bmark: torch.Tensor            # (Nb,)
@@ -169,7 +170,7 @@ def build_fv_geom(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     area_t = t(area)
     return FVGeom(
         area=area_t, inv_area=1.0 / area_t, inradius=t(inradius),
-        centroid_np=centroid, vertices_np=V, triangles_np=tri,
+        centroid_np=centroid, vertices_np=V, triangles_np=tri, face_mid_np=fmid,
         eL=t(kL, long=True), eR=t(kR, long=True),
         eLF=t(kL * 3 + fL, long=True), eRF=t(kR * 3 + fR, long=True),
         en=t(fnrm[kL, fL]), elen=t(flen[kL, fL]),
@@ -252,7 +253,7 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     area_t = t(area)
     return FVGeom(
         area=area_t, inv_area=1.0 / area_t, inradius=t(inradius),
-        centroid_np=centroid, vertices_np=V, triangles_np=seg,
+        centroid_np=centroid, vertices_np=V, triangles_np=seg, face_mid_np=fmid,
         eL=t(kL, long=True), eR=t(kR, long=True),
         eLF=t(kL * 2 + fL, long=True), eRF=t(kR * 2 + fR, long=True),
         en=t(fnrm[kL, fL]), elen=t(flen[kL, fL]),
@@ -621,6 +622,8 @@ class FiniteVolume(Geometry):
 
         self._stash_t, self._stash_i, self._stash_obs = [], [], []
         self._stash_terms = []   # per-frame (4, K_own, Nr*dim): [a, lin, quad, cub]
+        self._stash_edge = []    # per-frame (Nedge, 2) face normal-flux [j.n^, q.n^]
+        self._edge_geom_cache = None   # static (midpoints, normals, lengths), lazy
 
     def _setup_boundary(self, material: Material) -> None:
         """Group boundary edges by marker into a wall (reflector) set and one
@@ -840,6 +843,11 @@ class FiniteVolume(Geometry):
         eL, eR, en, elen, iA = g.eL, g.eR, g.en, g.elen, g.inv_area
         U = self._U
         dU = torch.zeros_like(U)
+        # Staggered output: per-edge normal-flux DENSITIES [number j.n^, energy q.n^],
+        # the SAME KFVS lab flux booked below but kept per unit edge length (i.e.
+        # pre-`* elen`), so it lives at the face midpoint.  update_stash reads these.
+        self._Ff_int_dens = U.new_zeros((g.eL.shape[0], 2))
+        self._Ff_bnd_dens = U.new_zeros((g.bcell.shape[0], 2))
         # ---- interior: kinetic flux-vector split (KFVS) -- NO Rusanov ----------
         # One faithful Boltzmann discretization: the U-flux is the exact lab moment
         # of the SAME per-node kinetic upwind that streams f (see _shape_rhs):
@@ -882,6 +890,7 @@ class FiniteVolume(Geometry):
              (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2)),
              (base * (eps + fs.hbar * (ux * kx + uy * ky)
                       + 0.5 * fs.mstar * (u_e * u_e).sum(-1)[:, None, None])).sum((-1, -2))], -1)
+        self._Ff_int_dens = torch.stack((Ff[:, 0], Ff[:, 3]), dim=-1)        # (Ne,2) j.n^, q.n^
         Ff = Ff * elen[:, None]                                              # (Ne,4)
         dU.index_add_(0, eL, -Ff * iA[eL, None])
         dU.index_add_(0, eR, +Ff * iA[eR, None])
@@ -934,6 +943,7 @@ class FiniteVolume(Geometry):
                  (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2))], -1)
             flux_E = EQ[:, 3] + (base * (eps + fs.hbar * (ux * kx + uy * ky)
                                  + 0.5 * fs.mstar * (u_e ** 2).sum(-1)[:, None, None])).sum((-1, -2))
+            self._Ff_bnd_dens = torch.stack((flux_n, flux_E), dim=-1)        # (Nb,2) j.n^, q.n^
             dU[:, 0].index_add_(0, bc, -flux_n * blen * iA[bc])
             dU[:, 1:3].index_add_(0, bc, -flux_J * (blen * iA[bc])[:, None])
             dU[:, 3].index_add_(0, bc, -flux_E * blen * iA[bc])
@@ -1000,6 +1010,28 @@ class FiniteVolume(Geometry):
         Gf = (f * Jz[:, None]) if f is not None else Jz[:, None].expand(self.K, self.Nk)
         return dG + self.material.kspace_div(Gf, xidot, phidot, glo, ghi)
 
+    def _frame_adv(self, q, mu, Te, u):
+        """(v+u)·∇_r q per (cell, node) in DIVERGENCE form ∇·((v+u)q) − q ∇·(v+u), using
+        the transport's OWN per-node upwind face flux -- the same-operator choice, so the
+        discrete material derivative that sets ξ̇',φ̇ is consistent with the flux that
+        streams f𝒥 (discrete D_mesh k → 0: the moving-mesh shape transport becomes
+        free-stream / moment preserving, not just first-order).  q:(K,m) -> (K,m,Nk).
+        Zero-gradient at the boundary (interior faces only; the frame is a per-cell
+        reservoir), which also drops the spurious boundary term the Green-Gauss ∇ carried."""
+        g = self.geom
+        eL, eR, elen, iA = g.eL, g.eR, g.elen, g.inv_area
+        a_e = self._edge_speed(mu, Te, u, self._ang_int, eL, eR)      # (Ne,Nk) = (v+u)·n̂
+        fL = elen[:, None] * a_e
+        div1 = q.new_zeros(self.K, self.Nk)                           # ∇·(v+u)
+        div1.index_add_(0, eL, fL * iA[eL, None]); div1.index_add_(0, eR, -fL * iA[eR, None])
+        up = a_e > 0
+        divq = q.new_zeros(self.K, q.shape[1], self.Nk)              # ∇·((v+u)q)
+        for j in range(q.shape[1]):
+            fq = fL * torch.where(up, q[eL, j, None], q[eR, j, None])
+            divq[:, j].index_add_(0, eL, fq * iA[eL, None])
+            divq[:, j].index_add_(0, eR, -fq * iA[eR, None])
+        return divq - q[:, :, None] * div1[:, None, :]              # (K,m,Nk)
+
     def _cfl_substep(self, mu, Te, u, xidot, phidot):
         """Largest stable substep from the real-space (HEATED band speed |v_node|+|u|)
         AND k-space (|ξ̇'|/w_ξ, |φ̇|/w_φ) signal speeds -- self-stable at ANY passed dt.
@@ -1031,11 +1063,16 @@ class FiniteVolume(Geometry):
             mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
             uf = self._faces_fn(self._u).reshape(-1, self.Nk)   # reconstruct faces once, reuse
             dU = self._march_U(self._u, mu, Te, u, t, uf)       # KFVS lab flux (rate; dt-free)
-            # FULL shell transport (14) grid velocities from frame gradients + rates.
-            gmu, gTe = self._grad(mu), self._grad(Te)
-            gkD = self._grad(fs.mstar * u / fs.hbar)
+            # FULL shell transport (14) grid velocities.  ∂_t(μ,Tₑ,k_D) from the flux-form
+            # U-march; (v+u)·∇(μ,Tₑ,k_D) in DIVERGENCE form via the transport's own flux
+            # operator (_frame_adv) so the discrete material derivative is same-operator
+            # consistent with the streaming (D_mesh k -> 0, free-stream/moment exact).
+            qframe = torch.stack([mu, Te, fs.mstar * u[:, 0] / fs.hbar,
+                                  fs.mstar * u[:, 1] / fs.hbar], 1)          # (K,4)
+            av = self._frame_adv(qframe, mu, Te, u).reshape(self.K, 4, fs.Nr, fs.angular.N_theta)
             dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
-            xidot, phidot = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+            xidot, phidot = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD,
+                                                av[:, 0], av[:, 1], av[:, 2], av[:, 3])
             h = min(left, self._cfl_substep(mu, Te, u, xidot, phidot))  # CFL-limited substep
             if not (h > 0.0 and np.isfinite(h)):
                 raise RuntimeError("step_moving_frame: non-finite CFL substep -- frame velocity diverged")
@@ -1126,7 +1163,63 @@ class FiniteVolume(Geometry):
         """Self-adjusting level of each feedback contact, from the last evaluation."""
         return {c.name: c.level for c in self._contacts if c.kind != "fixed"}
 
+    def _edge_geometry_static(self):
+        """Static per-edge midpoints/normals/lengths, ordered interior-then-boundary
+        to match the fv_edge_flux layout (the SAME order _march_U books its interior
+        `Ff` then its boundary flux).  Pure numpy on the host; cached."""
+        if self._edge_geom_cache is None:
+            g, nf = self.geom, self._nf
+            fmid = g.face_mid_np                                  # (K, nf, 2)
+            eL = g.eL.detach().cpu().numpy(); eLF = g.eLF.detach().cpu().numpy()
+            bc = g.bcell.detach().cpu().numpy(); bF = g.bF.detach().cpu().numpy()
+            mid_i = fmid[eL, eLF % nf] if len(eL) else np.zeros((0, 2))
+            mid_b = fmid[bc, bF % nf] if len(bc) else np.zeros((0, 2))
+            mid = np.concatenate([mid_i, mid_b], 0)              # (Nedge, 2)
+            nrm = np.concatenate([g.en.detach().cpu().numpy(),
+                                  g.bn.detach().cpu().numpy()], 0)    # (Nedge, 2)
+            length = np.concatenate([g.elen.detach().cpu().numpy(),
+                                     g.blen.detach().cpu().numpy()], 0)  # (Nedge,)
+            self._edge_geom_cache = (np.ascontiguousarray(mid, np.float64),
+                                     np.ascontiguousarray(nrm, np.float64),
+                                     np.ascontiguousarray(length, np.float64))
+        return self._edge_geom_cache
+
+    def _stash_moving(self, i_step: int, t: float) -> None:
+        """Staggered output for the moving drift-frame scheme.  Records CELL-CENTERED
+        scalars [n, T_e, |u|, E] per owned cell AND per-edge normal-flux DENSITIES
+        [j.n^, q.n^] at every interior+boundary face midpoint.  The edge fluxes are
+        the SAME KFVS lab fluxes the U-march books (captured inside _march_U), not a
+        recomputed cell-centered approximation.  MPI: each edge is filled only by the
+        rank owning its reference cell (interior -> owner of eL, boundary -> owner of
+        bcell), so every edge has exactly one owner and a checkpoint-time SUM across
+        ranks assembles the global per-edge array with no double counting."""
+        fs, g = self.material, self.geom
+        sl = slice(self._own_start, self._own_stop)
+        _, Te_o, u_o = fs.recover_frame(self._U[sl], Te_guess=self._Te[sl])
+        cell_obs = torch.stack([self._U[sl, 0], Te_o, u_o.norm(dim=1),
+                                self._U[sl, 3]], dim=-1)          # (K_own, 4)
+        # Per-edge fluxes: reuse _march_U (populates self._Ff_int_dens/_Ff_bnd_dens).
+        if self._decomp is not None:
+            self._decomp.exchange(self._u)
+            self._decomp.exchange(self._U)
+        mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
+        uf = self._faces_fn(self._u).reshape(-1, self.Nk)
+        self._march_U(self._u, mu, Te, u, t, uf)
+        edge_flux = torch.cat([self._Ff_int_dens, self._Ff_bnd_dens], 0)  # (Nedge,2)
+        if self._mpi:                                            # keep only owned edges
+            lo, hi = self._own_start, self._own_stop
+            own = torch.cat([(g.eL >= lo) & (g.eL < hi),
+                             (g.bcell >= lo) & (g.bcell < hi)], 0)[:, None]
+            edge_flux = torch.where(own, edge_flux, torch.zeros_like(edge_flux))
+        self._stash_i.append(i_step)
+        self._stash_t.append(t)
+        self._stash_obs.append(cell_obs.detach().cpu().numpy())
+        self._stash_edge.append(edge_flux.detach().cpu().numpy())
+
     def update_stash(self, i_step: int, t: float) -> None:
+        if self._moving:
+            self._stash_moving(i_step, t)     # staggered: cell scalars + face fluxes
+            return
         # Stash observables for this rank's owned cells (its checkpoint slice).
         u_own = self._u[self._own_start:self._own_stop]
         obs = torch.einsum("oc,kc->ko", self.material.get_observables(t), u_own)
@@ -1153,7 +1246,11 @@ class FiniteVolume(Geometry):
         self, cp_path: CheckpointPath, context: CheckpointContext
     ) -> list[str]:
         g = self.geom
-        names = self.material.get_observable_names()
+        # Moving drift-frame: fv_observables holds CELL-CENTERED scalars only
+        # [n, T_e, |u|, E]; the vector currents/heat flux are emitted face-native
+        # in fv_edge_flux (below), NOT as cell-centered observables.
+        names = (["n", "T_e", "u_mag", "E"] if self._moving
+                 else self.material.get_observable_names())
         cp_path.attrs["order"] = 0                            # piecewise-constant FV
         cp_path.attrs["mesh_file"] = self.mesh_file
         saved = [
@@ -1179,6 +1276,22 @@ class FiniteVolume(Geometry):
             checkpoint.write_slice(checkpoint[f"{path}/fv_observables"],
                                    (0, self._own_start, 0),
                                    torch.from_numpy(np.stack(self._stash_obs)))
+        if self._moving and len(self._stash_edge):
+            # Staggered VECTOR output: per-edge normal-flux densities [j.n^, q.n^] at
+            # the face midpoints, plus the static face geometry (midpoints, normals,
+            # lengths) so the plotter has faces.  Each edge is owned by exactly one
+            # rank (interior -> eL block, boundary -> bcell block); the per-frame
+            # arrays are zero off the owner, so an MPI SUM assembles the global array.
+            mid, nrm, length = self._edge_geometry_static()
+            saved += [cp_path.write("edge_midpoints", torch.from_numpy(mid)),
+                      cp_path.write("edge_normals", torch.from_numpy(nrm)),
+                      cp_path.write("edge_lengths", torch.from_numpy(length))]
+            edge_arr = np.ascontiguousarray(np.stack(self._stash_edge))  # (nstash,Nedge,2)
+            if self._mpi:
+                out = np.empty_like(edge_arr)
+                self.comm.Allreduce(edge_arr, out, op=MPI.SUM)   # one owner per edge
+                edge_arr = out
+            saved.append(cp_path.write("fv_edge_flux", torch.from_numpy(edge_arr)))
         if self.save_rho:
             # Raw per-cell state (n_cells, n_channels), for exact restart /
             # steady-state warm start. Each rank writes its owned cell block.
@@ -1211,4 +1324,5 @@ class FiniteVolume(Geometry):
             saved.append("fv_terms")
         self._stash_t, self._stash_i, self._stash_obs = [], [], []
         self._stash_terms = []
+        self._stash_edge = []
         return saved

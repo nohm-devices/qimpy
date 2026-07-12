@@ -641,19 +641,20 @@ class FermiSurface(Material):
         dTe = (-c * dn + a * dEth) / det
         return dmu, dTe, dkD
 
-    def shell_velocities(self, mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD):
-        """Grid velocities xidot (165), phidot (166) per (K,Nr,Nθ).  D q = d_t q +
-        (v+u).grad_r q ; v = ħ k̄/m* (cosθ,sinθ).  gmu,gTe:(K,2)  gkD:(K,2,2)=d_d(k_D)_i."""
+    def shell_velocities(self, mu, Te, u, dmu, dTe, dkD, adv_mu, adv_Te, adv_kDx, adv_kDy):
+        """Grid velocities xidot (165), phidot (166) per (K,Nr,Nθ).  D q = ∂_t q +
+        (v+u)·∇_r q, with the advection (v+u)·∇q passed in already in DIVERGENCE form
+        (same-operator as the transport flux, from FiniteVolume._frame_adv) so the
+        discrete D_mesh k -> 0 and the moving-mesh shape transport is free-stream /
+        moment preserving.  ∂_t parts dmu,dTe,dkD from the flux-form U-march.  v=ħk̄/m*."""
         kb = self._kbar(mu, Te)                                    # (K,Nr)
         cph = torch.cos(self.angular.theta); sph = torch.sin(self.angular.theta)
         vx = (self.hbar / self.mstar) * kb[:, :, None] * cph       # (K,Nr,Nθ)
         vy = (self.hbar / self.mstar) * kb[:, :, None] * sph
-        vpx = vx + u[:, 0][:, None, None]; vpy = vy + u[:, 1][:, None, None]
-
-        def D(dq, gq):
-            return dq[:, None, None] + vpx * gq[:, 0][:, None, None] + vpy * gq[:, 1][:, None, None]
-        Dmu, DTe = D(dmu, gmu), D(dTe, gTe)
-        DkDx = D(dkD[:, 0], gkD[:, :, 0]); DkDy = D(dkD[:, 1], gkD[:, :, 1])
+        Dmu = dmu[:, None, None] + adv_mu
+        DTe = dTe[:, None, None] + adv_Te
+        DkDx = dkD[:, 0][:, None, None] + adv_kDx
+        DkDy = dkD[:, 1][:, None, None] + adv_kDy
         hv_DkD = self.hbar * (vx * DkDx + vy * DkDy)
         xip = self.radial.xi[None, :, None]
         xidot = -(hv_DkD + Dmu + xip * DTe) / Te[:, None, None]
