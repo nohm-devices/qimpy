@@ -28,9 +28,10 @@ def krate(fv, fs):
     mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
     uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
     dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
-    gmu, gTe = fv._grad(mu), fv._grad(Te); gkD = fv._grad(fs.mstar * u / fs.hbar)
+    qf = torch.stack([mu, Te, fs.mstar * u[:, 0] / fs.hbar, fs.mstar * u[:, 1] / fs.hbar], 1)
+    av = fv._frame_adv(qf, mu, Te, u).reshape(fv.K, 4, fs.Nr, fs.angular.N_theta)
     dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
-    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, av[:, 0], av[:, 1], av[:, 2], av[:, 3])
     dxi = float(torch.diff(fs.radial.xi).abs().min())
     return float(xid.abs().max()) / dxi + float(phid.abs().max()) / fs.angular.wphi
 
@@ -43,15 +44,17 @@ for tau_ee, tag in [(np.inf, "BALLISTIC tau_ee=inf"), (50.0 * (L / vF), "tau_ee=
     cen = torch.as_tensor(fv.geom.centroid_np, device=dev)
     mu = torch.full((fv.K,), fs.E_F, device=dev); Te = T * (1 + 0.05 * torch.cos(2 * np.pi * cen[:, 0]))
     u = torch.zeros(fv.K, 2, device=dev); u[:, 0] = 0.3 * vF * torch.sin(2 * np.pi * cen[:, 1])
-    fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone(); fv._u = fs.rho0[None, :].repeat(fv.K, 1).clone()
+    fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone()
+    fv._u = torch.zeros((fv.K, fs.Nr * fs.angular.N_theta), device=dev)   # delta_g=0 <=> f=f0
     dt_real = 0.4 * float(fv.geom.inradius.min()) / (fs.v_speed.max().item() + 0.3 * vF)
     print(f"\n=== {tag}  skip_collision={fv._skip_collision} ===")
     for st in range(121):
         if st % 15 == 0:
             mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
+            ff = fs.f_of_g(fv._u)                          # occupation from unbounded delta_g
             fin = torch.isfinite(fv._u).all().item() and torch.isfinite(Te).all().item()
             print(f" st{st:3d}: Te/T=[{(Te/T).min():.2f},{(Te/T).max():.2f}] mu/Te_min={(mu/Te).min():.2f}"
-                  f" |f-f0|={float((fv._u-fs.rho0).abs().max()):.2e} f=[{fv._u.min():.1e},{fv._u.max():.4f}]"
+                  f" |f-f0|={float((ff-fs.rho0).abs().max()):.2e} f=[{float(ff.min()):.1e},{float(ff.max()):.6f}]"
                   f" fin={fin}")
             if not fin:
                 break

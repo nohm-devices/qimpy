@@ -99,7 +99,7 @@ for drift in (0.15, 3.0):
     Te = T * (1.0 + 0.05 * torch.cos(2 * np.pi * cen[:, 0]))
     u = torch.zeros(fv.K, 2, device=dev); u[:, 0] = drift * vF * torch.sin(2 * np.pi * cen[:, 1])
     fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone()
-    fv._u = fs.rho0[None, :].repeat(fv.K, 1).clone()
+    fv._u = torch.zeros((fv.K, fs.Nr * fs.angular.N_theta), device=dev)   # delta_g=0 <=> f=f0
     U0 = fv.U_totals().clone()
     Jsc = float((fv.geom.area[:, None] * fv._U[:, 1:3].abs()).sum()) + 1e-300
     # pass a dt 8x OVER the CFL so the solver's internal substepping is exercised
@@ -109,9 +109,13 @@ for drift in (0.15, 3.0):
         fv.step_moving_frame(0.0, 8.0 * cfl_dt(fv, fs, dt_real))
     dN, dpx, dpy, dE = cons_report(U0, fv.U_totals(), Jsc)
     cr = fv.consistency_residual()
+    ff = fs.f_of_g(fv._u)                                  # occupation reconstructed from delta_g
+    # STRICT no-overshoot: sigma maps any real delta_g into the OPEN simplex (no clip
+    # ever hit); the state is unbounded but f = sigma(-xi'+delta_g) in (0,1) exactly.
+    assert float(ff.min()) > -1e-12 and float(ff.max()) < 1.0 + 1e-12, "Pauli overshoot!"
     print(f"PERIODIC drift={drift:4.2f}vF |kD|/kF={fs.mstar*drift*vF/kF:4.1f}: cons(N,px,py,E)="
           f"({dN:.1e},{dpx:.1e},{dpy:.1e},{dE:.1e}) consist={float(cr.max()):.1e} "
-          f"f in [{fv._u.min():.2e},{fv._u.max():.4f}] finite={torch.isfinite(fv._u).all().item()}")
+          f"f in [{float(ff.min()):.2e},{float(ff.max()):.6f}] finite={torch.isfinite(fv._u).all().item()}")
 
 print("-" * 100)
 dm = os.path.join(tmp, "dev.npz"); device_mesh(20, 1.0, dm)
@@ -124,9 +128,13 @@ for st in range(15):
     if st % 5 == 0 or st == 14:
         cr = fv.consistency_residual()
         Ns.append(float(fv.U_totals()[0]))
+        ff = fs.f_of_g(fv._u)
+        assert float(ff.min()) > -1e-12 and float(ff.max()) < 1.0 + 1e-12, "Pauli overshoot!"
         print(f"DEVICE step {st:3d}: N={fv.U_totals()[0]:.6e} consist={float(cr.max()):.1e} "
-              f"f in [{fv._u.min():.2e},{fv._u.max():.4f}] finite={torch.isfinite(fv._u).all().item()}")
+              f"f in [{float(ff.min()):.2e},{float(ff.max()):.6f}] finite={torch.isfinite(fv._u).all().item()}")
 print("=" * 100)
-ok = torch.isfinite(fv._u).all().item()
-print("PASS: moving-frame FiniteVolume runs on periodic + device meshes."
-      if ok else "CHECK: non-finite state.")
+ff = fs.f_of_g(fv._u)
+ok = (torch.isfinite(fv._u).all().item()
+      and float(ff.min()) > -1e-12 and float(ff.max()) < 1.0 + 1e-12)   # strict (0,1), no clip
+print("PASS: moving-frame FiniteVolume runs on periodic + device meshes (f strictly in (0,1))."
+      if ok else "CHECK: non-finite state or Pauli overshoot.")

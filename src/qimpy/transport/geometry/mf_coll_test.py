@@ -34,7 +34,8 @@ dev = fs.rho0.device
 cen = torch.as_tensor(fv.geom.centroid_np, device=dev)
 mu = torch.full((fv.K,), fs.E_F, device=dev); Te = T * (1 + 0.05 * torch.cos(2 * np.pi * cen[:, 0]))
 u = torch.zeros(fv.K, 2, device=dev); u[:, 0] = 0.3 * vF * torch.sin(2 * np.pi * cen[:, 1])
-fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone(); fv._u = fs.rho0[None, :].repeat(fv.K, 1).clone()
+fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone()
+fv._u = torch.zeros((fv.K, fs.Nr * fs.angular.N_theta), device=dev)   # delta_g=0 <=> f=f0
 U0 = fv.U_totals().clone()
 Jsc = float((fv.geom.area[:, None] * fv._U[:, 1:3].abs()).sum()) + 1e-300
 def krate():
@@ -56,9 +57,15 @@ for st in range(15):
         Ut = fv.U_totals(); cr = fv.consistency_residual()
         dN = abs(Ut[0] - U0[0]) / abs(U0[0]); dE = abs(Ut[3] - U0[3]) / abs(U0[3])
         dpx = abs(Ut[1] - U0[1]) / Jsc; dpy = abs(Ut[2] - U0[2]) / Jsc
-        damp = float((fv._u - fs.rho0).abs().max())
+        ff = fs.f_of_g(fv._u)                              # occupation from unbounded delta_g
+        # STRICT no-overshoot: f = sigma(-xi'+delta_g) in (0,1) exactly, no clip ever hit.
+        assert float(ff.min()) > -1e-12 and float(ff.max()) < 1.0 + 1e-12, "Pauli overshoot!"
+        damp = float((ff - fs.rho0).abs().max())
         if d_amp0 is None:
             d_amp0 = damp
         print(f"st{st:3d}: cons(N,px,py,E)=({dN:.1e},{dpx:.1e},{dpy:.1e},{dE:.1e}) "
-              f"consist={float(cr.max()):.1e} |f-f0|max={damp:.2e} fmax={fv._u.max():.4f}")
-print("PASS" if torch.isfinite(fv._u).all() and not fv._skip_collision else "CHECK")
+              f"consist={float(cr.max()):.1e} |f-f0|max={damp:.2e} fmax={float(ff.max()):.6f}")
+ff = fs.f_of_g(fv._u)
+ok = (torch.isfinite(fv._u).all().item() and not fv._skip_collision
+      and float(ff.min()) > -1e-12 and float(ff.max()) < 1.0 + 1e-12)   # strict (0,1), no clip
+print("PASS (f strictly in (0,1), collision active)" if ok else "CHECK")

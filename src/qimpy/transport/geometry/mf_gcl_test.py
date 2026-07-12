@@ -35,21 +35,27 @@ u = torch.zeros(fv.K, 2, device=dev)
 u[:, 0] = 0.8 * vF * torch.sin(2 * np.pi * cen[:, 1]); u[:, 1] = 0.4 * vF * torch.cos(2 * np.pi * cen[:, 0])
 fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone()
 
+# The discrete GCL free-stream invariant is a SHELL-CONSTANT occupation f (its k-space
+# advection vanishes trivially).  The state is now the unbounded delta_g = logit(f)+xi',
+# so a constant level c is stored as delta_g = g_of_f(c) (= logit(c)+xi') and reconstructed
+# as f = f_of_g(delta_g) = c.  (delta_g=0 would give f=f0, which VARIES over xi' and is
+# only stationary under the full self-consistent frame -- not this isolated probe.)
 for c in (0.0, 0.37, 1.0, 2.7):
-    fv._u = torch.full((fv.K, fs.Nr * fs.angular.N_theta), float(c), device=dev)
+    fv._u = fs.g_of_f(torch.full((fv.K, fs.Nr * fs.angular.N_theta), float(c), device=dev))
+    f = fs.f_of_g(fv._u)                                  # shell-constant occupation (= c)
     mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
-    uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
+    uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)           # reconstruct delta_g faces
     dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
     qf = torch.stack([mu, Te, fs.mstar * u[:, 0] / fs.hbar, fs.mstar * u[:, 1] / fs.hbar], 1)
     av = fv._frame_adv(qf, mu, Te, u).reshape(fv.K, 4, fs.Nr, fs.angular.N_theta)
     dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
     xidot, phidot = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, av[:, 0], av[:, 1], av[:, 2], av[:, 3])
     Jz = fs.mstar * Te / fs.hbar ** 2
-    dG = fv._transportG(fv._u, uf, Jz, mu, Te, u, xidot, phidot, None, None, 0.0)
+    dG = fv._transportG(f, uf, Jz, mu, Te, u, xidot, phidot, None, None, 0.0)
     dJv = fv._transportG(None, uf, Jz, mu, Te, u, xidot, phidot, None, None, 0.0)
     dt = 1e-3
-    f_tr = fv._u + dt * (dG - fv._u * dJv) / Jz[:, None]
-    res = float((f_tr - fv._u).abs().max())
+    f_tr = f + dt * (dG - f * dJv) / Jz[:, None]
+    res = float((f_tr - f).abs().max())
     print(f"GCL uniform f={c:4.2f}: |ξ̇'|max={float(xidot.abs().max()):.1e} |φ̇|max={float(phidot.abs().max()):.1e}"
           f"  ->  max|df| = {res:.2e}  (want ~1e-14)")
-print("PASS: GCL preserves uniform f under a moving frame." )
+print("PASS: GCL preserves uniform (shell-constant) f under a moving frame.")

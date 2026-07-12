@@ -569,6 +569,83 @@ class FermiSurface(Material):
         return torch.stack([Psi_n, Psi_Jn * nx - Psi_Jt * ny,
                             Psi_Jn * ny + Psi_Jt * nx, Psi_E], -1)
 
+    def eq_flux_pm(self, mu, Te, u, nx, ny):
+        """One-sided analytic drifted-heated-FD equilibrium moments carrying the deep
+        filled Fermi CORE:  Phi^+ = 1/2(Phi + Psi),  Phi^- = 1/2(Phi - Psi), each (...,4),
+        with Phi = signed lab flux (eq_flux) and Psi = |v.n^| abs moment (eq_abs_flux).
+
+        THIS is the genuine velocity flux-vector split of the core/equilibrium: the
+        interior/boundary KFVS books  Phi^+_L + Phi^-_R  (== the central
+        1/2(Phi_L+Phi_R) - 1/2(Psi_R-Psi_L) construction, algebraically identical but
+        now a per-cell own-frame split).  Phi odd, Psi even in n^ => single-valued
+        F(R,L,-n^) = -F(L,R,n^).  eq_flux/eq_abs_flux are KEPT (the ~82%-of-mass filled
+        sea has no shell nodes and MUST stay analytic)."""
+        Phi = self.eq_flux(mu, Te, u, nx, ny)
+        Psi = self.eq_abs_flux(mu, Te, u, nx, ny)
+        return 0.5 * (Phi + Psi), 0.5 * (Phi - Psi)
+
+    # ---- unbounded evolved shape:  delta-g = logit(f) + xi'  (state variable) ----
+    def f_of_g(self, dg):
+        """Occupation f = sigma(-xi' + dg) in (0,1) for ANY real dg (the evolved state
+        stays unbounded; sigma maps it into the open simplex, NO clip).  dg: (..., Nk)
+        flat over (Nr,N_theta); xi' broadcast over the angular nodes.  sigma computed as
+        1/2(1 + tanh(g/2)) (overflow-free).  dg=0 <=> f = f0 = rho0."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        g = -self.radial.xi[:, None] + dg.reshape(*dg.shape[:-1], Nr, Nth)
+        return (0.5 * (1.0 + torch.tanh(0.5 * g))).reshape(dg.shape)
+
+    def g_of_f(self, f):
+        """delta-g = logit(f) + xi' from an occupation f.  f is clamped to
+        (1e-300, 1 - 1e-16) as a round-off READ-IN guard ONLY (the stored state is
+        unbounded and is re-set by project_g; this clamp never bounds the evolution).
+        f: (..., Nk) -> dg: (..., Nk)."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        fc = f.reshape(*f.shape[:-1], Nr, Nth).clamp(1e-300, 1.0 - 1e-16)
+        return (torch.log(fc / (1.0 - fc)) + self.radial.xi[:, None]).reshape(f.shape)
+
+    def project_g(self, dg, mu, Te, u, iters: int = 8):
+        """Moment-free projection recast in the unbounded variable g (replaces
+        project_moment_free + pauli_reproject in the state path).  Newton on 4
+        multipliers lam over the drift-INDEPENDENT frame basis B={1, xi', k_bar cos,
+        k_bar sin} (post-march frame), so the deviation df = sigma(-xi' + dg + sum lam B)
+        - f0 carries ZERO of the 4 flat-measure conserved moments  <=>  moments_of_f(f)
+        = U_from_frame(mu,Te,u).  Residual R_a = cnorm Sum flat_w wphi J B_a df; SPD Gram
+        J_ab = cnorm Sum flat_w wphi J B_a f(1-f) B_b (f-metric); batched 4x4 solve, fixed
+        iters (compile-safe, no host sync).  f = sigma(.) stays in (0,1) at EVERY iterate
+        => zero overshoot, NO clip.  u is accepted for API symmetry but unused: the frame
+        basis is drift-independent (the NO-GO consistency fix).  dg: (..., Nk)."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        xi = self.radial.xi[:, None]                                  # (Nr,1)
+        kb = self._kbar(mu, Te)[..., :, None]                         # (...,Nr,1)
+        cph, sph = torch.cos(self.angular.theta), torch.sin(self.angular.theta)
+        kx, ky = kb * cph, kb * sph                                   # (...,Nr,N_theta)
+        one = torch.ones_like(kx)
+        B = torch.stack([one, xi * one, kx, ky], dim=-3)             # (...,4,Nr,N_theta)
+        Jc = self.mstar * Te / self.hbar ** 2
+        mw = (self.cnorm * self.radial.flat_w[:, None] * self.angular.wphi
+              ) * Jc[..., None, None]                                # (...,Nr,1) q-independent
+        f0 = self.rho0.reshape(Nr, Nth)
+        dgr = dg.reshape(*dg.shape[:-1], Nr, Nth)
+        lam = dg.new_zeros(*dg.shape[:-1], 4)
+        eye4 = torch.eye(4, dtype=dg.dtype, device=dg.device)
+        for _ in range(iters):
+            arg = -xi + dgr + torch.einsum('...a,...arq->...rq', lam, B)
+            f = 0.5 * (1.0 + torch.tanh(0.5 * arg))                  # in (0,1) always
+            df = f - f0
+            R = torch.einsum('...arq,...rq->...a', B, mw * df)       # (...,4) want 0
+            # f-metric df/darg = f(1-f), FLOORED so a fully railed cell (f->0/1 at every
+            # node, e.g. after a strong collision step) keeps a positive-definite Gram --
+            # the linear projection had a constant Gram and never saw this; the exact
+            # f-metric Gram vanishes when railed => singular solve.  Floor + a tiny
+            # relative ridge make the batched 4x4 solve unconditionally well-posed; on a
+            # railed cell lam -> ~0 (the moments can't be moved), leaving f in (0,1).
+            fp = (f * (1.0 - f)).clamp_min(1e-10)                    # floored f-metric
+            Jmat = torch.einsum('...arq,...rq,...brq->...ab', B, mw * fp, B)  # (...,4,4) SPD
+            ridge = 1e-12 * Jmat.diagonal(dim1=-2, dim2=-1).amax(-1).clamp_min(1e-300)
+            Jmat = Jmat + ridge[..., None, None] * eye4
+            lam = lam - torch.linalg.solve(Jmat, R.unsqueeze(-1)).squeeze(-1)
+        return (dgr + torch.einsum('...a,...arq->...rq', lam, B)).reshape(dg.shape)
+
     def project_moment_free(self, d, mu, Te):
         """Remove the {1, xi', k_bar cos, k_bar sin} components of the deviation d in
         the FLAT-measure shell inner product.  On GL radial + midpoint angular nodes
@@ -592,11 +669,6 @@ class FermiSurface(Material):
         dr = strip(dr, kb * cph)
         dr = strip(dr, kb * sph)
         return dr.reshape(d.shape)
-
-    def pauli_reproject(self, f, mu, Te):
-        """Pauli clip to [0,1] then re-project the deviation moment-free (restores
-        exact consistency; leaves a tiny bounded overshoot)."""
-        return self.rho0 + self.project_moment_free(f.clamp(0.0, 1.0) - self.rho0, mu, Te)
 
     def U_from_frame(self, mu, Te, u):
         """Conserved lab densities (n,Jx,Jy,E) from the analytic frame (f=f0)."""
