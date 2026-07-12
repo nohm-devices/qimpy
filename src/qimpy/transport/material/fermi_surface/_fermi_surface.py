@@ -397,9 +397,13 @@ class FermiSurface(Material):
     # the two-metric rule.  f0 = self.rho0 = sigma(-xi) is the frame reference.
     # ================================================================
     def _kbar(self, mu, Te):
-        """|k_bar|(xi_r) per (cell, radial node): sqrt(2 m*(mu+Te xi'))/hbar. (...,Nr)."""
+        """|k_bar|(xi_r) per (cell, radial node): sqrt(2 m*(mu+Te xi'))/hbar. (...,Nr).
+        eps is floored > 0 so k̄ never reaches the polar-origin singularity (1/k̄ in the
+        grid velocity φ̇): a node crosses the band bottom (eps<0) only when the gas heats
+        out of the degenerate regime (mu/Te < |xi'_inner|), and such nodes are deep-filled
+        core (f≈1, deviation≈0) -> the floor is physically inert but keeps φ̇ finite."""
         eps = mu[..., None] + Te[..., None] * self.radial.xi
-        return torch.sqrt(torch.clamp(2.0 * self.mstar * eps, min=0.0)) / self.hbar
+        return torch.sqrt(2.0 * self.mstar * eps.clamp_min(1e-6 * self.E_F)) / self.hbar
 
     def n_FD(self, mu, Te):
         """2D drifted-heated-FD density  g Te ln(1+e^{mu/Te})."""
@@ -426,8 +430,10 @@ class FermiSurface(Material):
         return self.g2d * Te * Te * torch.where(x >= 0.0, Fpos, Fneg)
 
     def mu_of_nT(self, n, Te):
-        """Invert n = g Te ln(1+e^{mu/Te}): mu = Te (y + ln(1 - e^{-y})), y=n/(g Te)."""
-        y = n / (self.g2d * Te)
+        """Invert n = g Te ln(1+e^{mu/Te}): mu = Te (y + ln(1 - e^{-y})), y=n/(g Te).
+        y floored so ln(1-e^{-y}) stays finite (mu->-inf as n->0 otherwise: a near-empty
+        cell would poison recover_frame)."""
+        y = (n / (self.g2d * Te)).clamp_min(1e-8)
         return Te * (y + torch.log1p(-torch.exp(-y)))
 
     def _fd_jac(self, mu, Te):
@@ -443,7 +449,7 @@ class FermiSurface(Material):
         """(n,Jx,Jy,E) -> (mu, Te, u).  u,Eth analytic; Te by a fixed Newton on the
         n-constant path Eth_FD(mu_of_nT(n,Te),Te)=Eth (compile-safe, no host sync);
         mu analytic.  U: (...,4)."""
-        n = U[..., 0].clamp_min(1e-30)
+        n = U[..., 0].clamp_min(1e-10 * self.g2d * self.E_F)   # physical floor >> mu_of_nT -inf threshold
         u = U[..., 1:3] / (self.mstar * n[..., None])
         Eth = U[..., 3] - 0.5 * self.mstar * n * (u * u).sum(-1)
         Te = torch.full_like(n, self.T_temp) if Te_guess is None else Te_guess.clone()
@@ -496,6 +502,72 @@ class FermiSurface(Material):
         q = ((Eth + 0.5 * self.mstar * n * u2)[..., None] * u
              + Pu + qsh * torch.stack([M3x, M3y], -1))
         return Fn, Pi, q
+
+    def eq_flux(self, mu, Te, u, nx, ny):
+        """Analytic drifted-heated-FD equilibrium lab flux dotted with the face
+        normal (nx,ny): (Phi_n, Phi_Jx, Phi_Jy, Phi_E).n^  ->  (...,4).  Closed
+        form of assemble_fluxes(rho0, .).n^ (deviation d=0), carrying the filled
+        Fermi CORE analytically with NO shell contraction.  Used by the interior
+        kinetic flux-vector split as the central equilibrium term."""
+        n = self.n_FD(mu, Te); Eth = self.Eth_FD(mu, Te)
+        un = u[..., 0] * nx + u[..., 1] * ny
+        u2 = (u * u).sum(-1)
+        return torch.stack([n * un,
+                            Eth * nx + self.mstar * n * u[..., 0] * un,
+                            Eth * ny + self.mstar * n * u[..., 1] * un,
+                            (2.0 * Eth + 0.5 * self.mstar * n * u2) * un], -1)
+
+    def eq_abs_flux(self, mu, Te, u, nx, ny):
+        """Kinetic |v_lab.n^| ABSOLUTE moments of the drifted-heated FD equilibrium
+        (Psi_n, Psi_Jx, Psi_Jy, Psi_E) -> (...,4): the flux-vector-split (KFVS-on-
+        f0) dissipation that carries the v_F sound characteristics a central
+        equilibrium misses.  This is the ONLY interior dissipation (no Rusanov).
+
+        EXACT half-range |v.n^| moments of the filled drifted disk (degenerate T=0
+        Fermi sea of radius v_F centred at the drift u), as closed piecewise forms
+        in the drift ratio  s = u.n^/v_F.  I0, I1, I02 are the disk integrals of
+        |xi+s| against {1, xi, xi^2+eta^2} over the unit disk (xi,eta):
+
+            |s|<1 (subsonic):
+              I0  = (2/3) r (2+s^2)           + 2 s asin(s)
+              I1  = (s/6) r (5-2 s^2)         + (1/2) asin(s)
+              I02 = r (4/5 + s^2/15 + 2 s^4/15) + s asin(s)      r = sqrt(1-s^2)
+            |s|>=1 (supersonic, drift-dominated -- v_F cancels analytically):
+              I0 = pi|s|,   I1 = (pi/4) sign(s),   I02 = (pi/2)|s|
+
+        The exact form is (i) ALWAYS PSD -- I0>=4/3>0 for every s (the old quartic
+        fit crossed zero at s=3.459 -> anti-dissipative negative diffusion), and
+        (ii) FINITE as mu->0: v_F is floored, and for |s|>=1 the branch cancels the
+        floored v_F exactly (Psi_n->n|u.n^|, Psi_Jn->m* n |u.n^|(u.n^),
+        Psi_E->1/2 m* n |u.n^| |u|^2), so the floor value is physically inert.
+        Batched over a leading axis."""
+        n = self.n_FD(mu, Te)
+        # Floor v_F so mu<=0 (a valid hot/non-degenerate state that recover_frame
+        # returns) stays finite; only triggers for mu < ~1e-24 E_F (i.e. mu<=0).
+        vF = torch.sqrt(torch.clamp(2.0 * mu / self.mstar, min=0.0)).clamp_min(1e-12 * self.vF)
+        un = u[..., 0] * nx + u[..., 1] * ny            # u.n^   (normal drift)
+        ut = -u[..., 0] * ny + u[..., 1] * nx           # u.t^   (tangential drift)
+        u2 = (u * u).sum(-1)
+        s = un / vF
+        s2 = s * s
+        sub = s2 < 1.0
+        r = torch.sqrt(torch.clamp(1.0 - s2, min=0.0))          # sqrt(1-s^2); 0 if |s|>=1
+        asr = torch.asin(s.clamp(-1.0, 1.0))                    # arcsin s (subsonic branch)
+        absS = s.abs()
+        sgnS = torch.sign(s)
+        I0 = torch.where(sub, (2.0 / 3.0) * r * (2.0 + s2) + 2.0 * s * asr,
+                         np.pi * absS)
+        I1 = torch.where(sub, (s / 6.0) * r * (5.0 - 2.0 * s2) + 0.5 * asr,
+                         (np.pi / 4.0) * sgnS)
+        I02 = torch.where(sub, r * (0.8 + s2 / 15.0 + 2.0 * s2 * s2 / 15.0) + s * asr,
+                          (np.pi / 2.0) * absS)
+        pref = n / np.pi
+        Psi_n  = pref * vF * I0
+        Psi_Jn = self.mstar * pref * vF * vF * (I1 + s * I0)    # normal-momentum
+        Psi_Jt = self.mstar * ut * Psi_n                       # tangential (passive)
+        Psi_E  = 0.5 * self.mstar * pref * vF ** 3 * (I02 + 2.0 * s * I1 + (u2 / (vF * vF)) * I0)
+        return torch.stack([Psi_n, Psi_Jn * nx - Psi_Jt * ny,
+                            Psi_Jn * ny + Psi_Jt * nx, Psi_E], -1)
 
     def project_moment_free(self, d, mu, Te):
         """Remove the {1, xi', k_bar cos, k_bar sin} components of the deviation d in
@@ -554,6 +626,59 @@ class FermiSurface(Material):
         Jy = self.hbar * (kD[..., 1] * n + kby)
         E = Eth + 0.5 * self.mstar * n * (u * u).sum(-1) + self.hbar * (u[..., 0] * kbx + u[..., 1] * kby)
         return torch.stack([n, Jx, Jy, E], -1)
+
+    # ---- k-space grid-motion transport (14) + volume GCL (18) ----
+    def dframe_from_dU(self, dU, mu, Te, u):
+        """d_t(mu,Te,k_D) from the marched dU=(dn,dJ,dE) (eqs 165/168/169)."""
+        n = self.n_FD(mu, Te)
+        dn, dJ, dE = dU[..., 0], dU[..., 1:3], dU[..., 3]
+        kD = self.mstar * u / self.hbar
+        dkD = dJ / (self.hbar * n[..., None]) - (kD / n[..., None]) * dn[..., None]
+        dEth = dE - (u * dJ).sum(-1) + 0.5 * self.mstar * (u * u).sum(-1) * dn
+        a, b, c, d = self._fd_jac(mu, Te)
+        det = a * d - b * c
+        dmu = (d * dn - b * dEth) / det
+        dTe = (-c * dn + a * dEth) / det
+        return dmu, dTe, dkD
+
+    def shell_velocities(self, mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD):
+        """Grid velocities xidot (165), phidot (166) per (K,Nr,Nθ).  D q = d_t q +
+        (v+u).grad_r q ; v = ħ k̄/m* (cosθ,sinθ).  gmu,gTe:(K,2)  gkD:(K,2,2)=d_d(k_D)_i."""
+        kb = self._kbar(mu, Te)                                    # (K,Nr)
+        cph = torch.cos(self.angular.theta); sph = torch.sin(self.angular.theta)
+        vx = (self.hbar / self.mstar) * kb[:, :, None] * cph       # (K,Nr,Nθ)
+        vy = (self.hbar / self.mstar) * kb[:, :, None] * sph
+        vpx = vx + u[:, 0][:, None, None]; vpy = vy + u[:, 1][:, None, None]
+
+        def D(dq, gq):
+            return dq[:, None, None] + vpx * gq[:, 0][:, None, None] + vpy * gq[:, 1][:, None, None]
+        Dmu, DTe = D(dmu, gmu), D(dTe, gTe)
+        DkDx = D(dkD[:, 0], gkD[:, :, 0]); DkDy = D(dkD[:, 1], gkD[:, :, 1])
+        hv_DkD = self.hbar * (vx * DkDx + vy * DkDy)
+        xip = self.radial.xi[None, :, None]
+        xidot = -(hv_DkD + Dmu + xip * DTe) / Te[:, None, None]
+        phidot = -(-sph * DkDx + cph * DkDy) / kb[:, :, None]
+        return xidot, phidot
+
+    def kspace_div(self, G, xidot, phidot, glo, ghi):
+        """Radial (ξ', GL nodes, midpoint faces, control-vol=flat_w) + angular (φ,
+        periodic) conservative divergence of a shell density G=f𝒥.  glo/ghi:(...,1,Nθ)
+        core/tail ghosts, or None for zero-gradient (the GCL uniform-f test)."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        G = G.reshape(*G.shape[:-1], Nr, Nth)
+        if glo is None:
+            glo, ghi = G[..., :1, :], G[..., -1:, :]
+        Gpad = torch.cat([glo, G, ghi], dim=-2)
+        xdp = torch.cat([xidot[..., :1, :], xidot, xidot[..., -1:, :]], dim=-2)
+        xdf = 0.5 * (xdp[..., :-1, :] + xdp[..., 1:, :])
+        Gup = torch.where(xdf > 0, Gpad[..., :-1, :], Gpad[..., 1:, :])
+        Fr = xdf * Gup
+        out = -(Fr[..., 1:, :] - Fr[..., :-1, :]) / self.radial.flat_w[:, None]
+        pdf = 0.5 * (phidot + torch.roll(phidot, -1, dims=-1))
+        Ga = torch.where(pdf > 0, G, torch.roll(G, -1, dims=-1))
+        Fa = pdf * Ga
+        out = out - (Fa - torch.roll(Fa, 1, dims=-1)) / self.angular.wphi
+        return out.reshape(*out.shape[:-2], Nr * Nth)
 
     def get_contactor(self, n: torch.Tensor, **kwargs) -> Callable:
         return _FermiSurfaceContactor(self, n, **kwargs)
@@ -681,15 +806,20 @@ class _FermiSurfaceReflector:
         #     f_w(xi_r) = sigmoid(mu_tilde - xi_r),   mu_tilde = dmu_w / T
         # with a SINGLE mu_tilde per wall face fixed by zero net normal mass
         # flux.  The discrete normal mass-flux carrier per (wall, r, ordinate)
-        # is  mflux = (quad_w[r] * |v_r| / N_theta) * (k_hat . n),  splitting
+        # is  mflux = (flat_w[r] * |v_r| / N_theta) * (k_hat . n),  splitting
         # into outflow (k_hat.n > 0, carried by the interior trace) and inflow
         # (k_hat.n < 0, carried by the ghost).  A_r = sum_{inflow} mflux (< 0)
         # is the coefficient multiplying f_w[r] in the inflow mass flux.
+        # The measure is the FLAT phase-space weight flat_w (NOT the sech^2 quad_w):
+        # the physical particle flux -- and the flat-measure moment the moving-frame
+        # U-march books at the wall -- is the flat one, so balancing the diffuse
+        # re-emit here in flat_w makes the wall's net normal mass flux round-off
+        # (a sech^2 balance left an O(1e-4 n vF) flat-measure leak; see final_review2).
         khat_dot_n = (
             n[:, 0:1] * torch.cos(theta)[None, :] +
             n[:, 1:2] * torch.sin(theta)[None, :]
         )                                                # (Nsel, N_theta)
-        mcoef_r = fs.radial.quad_w * fs.v_speed / self.N_theta   # (Nr,)
+        mcoef_r = fs.radial.flat_w * fs.v_speed / self.N_theta   # (Nr,)
         mflux = mcoef_r[None, :, None] * khat_dot_n[:, None, :]   # (Nsel,Nr,Nth)
         pos_mask = (khat_dot_n > 0.0)[:, None, :]                 # (Nsel,1,Nth)
         neg_mask = (khat_dot_n < 0.0)[:, None, :]

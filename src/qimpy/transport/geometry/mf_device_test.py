@@ -63,6 +63,22 @@ def build(path, contacts):
     return fs, fv
 
 
+def kspace_rate(fv, fs):
+    """max k-space advection rate |ξ̇'|/Δξ'_min + |φ̇|/Δφ, for the moving-mesh CFL."""
+    mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
+    uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
+    dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
+    gmu, gTe = fv._grad(mu), fv._grad(Te); gkD = fv._grad(fs.mstar * u / fs.hbar)
+    dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
+    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+    dxi = float(torch.diff(fs.radial.xi).abs().min())
+    return float(xid.abs().max()) / dxi + float(phid.abs().max()) / fs.angular.wphi
+
+
+def cfl_dt(fv, fs, dt_real):
+    return min(dt_real, 0.3 / max(kspace_rate(fv, fs), 1e-30))
+
+
 def cons_report(U0, Ut, area_u0):
     dN = abs(Ut[0] - U0[0]) / abs(U0[0])
     dE = abs(Ut[3] - U0[3]) / abs(U0[3])
@@ -85,10 +101,11 @@ for drift in (0.15, 3.0):
     fv._u = fs.rho0[None, :].repeat(fv.K, 1).clone()
     U0 = fv.U_totals().clone()
     Jsc = float((fv.geom.area[:, None] * fv._U[:, 1:3].abs()).sum()) + 1e-300
-    vmax = fs.v_speed.max().item() + drift * vF
-    dt = 0.4 * float(fv.geom.inradius.min()) / vmax
-    for st in range(200):
-        fv.step_moving_frame(0.0, dt)
+    # pass a dt 8x OVER the CFL so the solver's internal substepping is exercised
+    # (self-stable: the harness does NOT clamp dt to a stable value).
+    dt_real = 0.4 * float(fv.geom.inradius.min()) / (fs.v_speed.max().item() + drift * vF)
+    for st in range(15):
+        fv.step_moving_frame(0.0, 8.0 * cfl_dt(fv, fs, dt_real))
     dN, dpx, dpy, dE = cons_report(U0, fv.U_totals(), Jsc)
     cr = fv.consistency_residual()
     print(f"PERIODIC drift={drift:4.2f}vF |kD|/kF={fs.mstar*drift*vF/kF:4.1f}: cons(N,px,py,E)="
@@ -98,12 +115,12 @@ for drift in (0.15, 3.0):
 print("-" * 100)
 dm = os.path.join(tmp, "dev.npz"); device_mesh(20, 1.0, dm)
 fs, fv = build(dm, {"source": {"dmu": 0.3 * T}, "drain": {"dmu": 0.0}})
-N0 = float(fv.U_totals()[0]); vmax = fs.v_speed.max().item()
-dt = 0.4 * float(fv.geom.inradius.min()) / vmax
+N0 = float(fv.U_totals()[0])
+dt_real = 0.4 * float(fv.geom.inradius.min()) / fs.v_speed.max().item()
 Ns = []
-for st in range(150):
-    fv.step_moving_frame(0.0, dt)
-    if st % 30 == 0 or st == 149:
+for st in range(15):
+    fv.step_moving_frame(0.0, 8.0 * cfl_dt(fv, fs, dt_real))
+    if st % 5 == 0 or st == 14:
         cr = fv.consistency_residual()
         Ns.append(float(fv.U_totals()[0]))
         print(f"DEVICE step {st:3d}: N={fv.U_totals()[0]:.6e} consist={float(cr.max()):.1e} "

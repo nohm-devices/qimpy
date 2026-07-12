@@ -37,11 +37,21 @@ u = torch.zeros(fv.K, 2, device=dev); u[:, 0] = 0.3 * vF * torch.sin(2 * np.pi *
 fv._U = fs.U_from_frame(mu, Te, u); fv._Te = Te.clone(); fv._u = fs.rho0[None, :].repeat(fv.K, 1).clone()
 U0 = fv.U_totals().clone()
 Jsc = float((fv.geom.area[:, None] * fv._U[:, 1:3].abs()).sum()) + 1e-300
-dt = 0.4 * float(fv.geom.inradius.min()) / (fs.v_speed.max().item() + 0.3 * vF)
+def krate():
+    mu, Te, u = fs.recover_frame(fv._U, Te_guess=fv._Te)
+    uf = fv._faces_fn(fv._u).reshape(-1, fv.Nk)
+    dU = fv._march_U(fv._u, mu, Te, u, 0.0, uf)
+    gmu, gTe = fv._grad(mu), fv._grad(Te); gkD = fv._grad(fs.mstar * u / fs.hbar)
+    dmu, dTe, dkD = fs.dframe_from_dU(dU, mu, Te, u)
+    xid, phid = fs.shell_velocities(mu, Te, u, dmu, dTe, dkD, gmu, gTe, gkD)
+    dxi = float(torch.diff(fs.radial.xi).abs().min())
+    return float(xid.abs().max()) / dxi + float(phid.abs().max()) / fs.angular.wphi
+
+dt_real = 0.4 * float(fv.geom.inradius.min()) / (fs.v_speed.max().item() + 0.3 * vF)
 d_amp0 = None
-for st in range(120):
-    fv.step_moving_frame(0.0, dt)
-    if st % 30 == 0 or st == 119:
+for st in range(15):
+    fv.step_moving_frame(0.0, 8.0 * min(dt_real, 0.3 / max(krate(), 1e-30)))   # 8x over-CFL
+    if st % 5 == 0 or st == 14:
         Ut = fv.U_totals(); cr = fv.consistency_residual()
         dN = abs(Ut[0] - U0[0]) / abs(U0[0]); dE = abs(Ut[3] - U0[3]) / abs(U0[3])
         dpx = abs(Ut[1] - U0[1]) / Jsc; dpy = abs(Ut[2] - U0[2]) / Jsc
