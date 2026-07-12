@@ -136,7 +136,7 @@ class TimeEvolution(TreeNode):
             self.save_interval = max(1, int(np.round(dt_save / self.dt)))
             self.n_collate = int(n_collate)
             self.integrator = integrator
-            if integrator not in {"RK2", "RK4", "SSPRK3"}:
+            if integrator not in {"RK2", "RK4", "SSPRK3", "MovingFrame"}:
                 raise InvalidInputException(f"Unrecognized {integrator = }")
             self.positivity = bool(positivity)
             if self.positivity and integrator != "SSPRK3":
@@ -148,6 +148,9 @@ class TimeEvolution(TreeNode):
         """Advance one step (RK2/RK4, or SSPRK3 for positivity preservation)."""
         t = self.t
         dt = self.dt
+        if self.integrator == "MovingFrame":
+            geometry.step_moving_frame(t, dt)     # coupled U-march + shape + projection
+            return
         rho0 = geometry.rho
         _limit = getattr(geometry, "limit_positivity", None)
         if not getattr(self, "positivity", False):

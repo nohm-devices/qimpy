@@ -50,6 +50,7 @@ class AngularBasis:
         self.M = M
         self.dim = 2 * M + 1
         self.N_theta = Nq
+        self.wphi = 2.0 * np.pi / Nq          # uniform angular integration weight
         # Midpoint (half-offset) nodes.  Unlike the endpoint grid 2*pi*q/Nq, this
         # set is symmetric under theta->-theta and (even Nq) theta->pi-theta, i.e.
         # the v_y->-v_y and v_x->-v_x reflections; the endpoint grid breaks
@@ -108,6 +109,7 @@ class RadialBasis:
             # Trivial: single point at the Fermi surface, identity transforms.
             self.xi           = torch.zeros(1, dtype=dtype, device=dev)
             self.quad_w       = torch.ones(1,  dtype=dtype, device=dev)
+            self.flat_w       = torch.ones(1,  dtype=dtype, device=dev)  # flat phase-space measure
             self.T_from_modes = torch.ones((1, 1), dtype=dtype, device=dev)
             self.T_to_modes   = torch.ones((1, 1), dtype=dtype, device=dev)
             return
@@ -144,6 +146,7 @@ class RadialBasis:
             )
         self.xi           = torch.as_tensor(xi,  dtype=dtype, device=dev)
         self.quad_w       = torch.as_tensor(w_q, dtype=dtype, device=dev)
+        self.flat_w       = torch.as_tensor(w_x, dtype=dtype, device=dev)  # flat GL phase-space measure
         self.T_from_modes = torch.as_tensor(Tfm, dtype=dtype, device=dev)
         self.T_to_modes   = torch.as_tensor(Ttm, dtype=dtype, device=dev)
 
@@ -191,10 +194,12 @@ class FermiSurface(Material):
         tau_p: float = np.inf, tau_ee: float = np.inf,
         r_c: float = np.inf, specularity: float = 1.0,
         ee_scattering: Optional[Union[EEScattering, dict]] = None,
+        moving_frame: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         super().__init__()
+        self.moving_frame = bool(moving_frame)
         self.kF, self.vF = kF, vF
         self.M_theta, self.Nr = M_theta, Nr
         self.T_temp, self.xi_max = T, xi_max
@@ -208,6 +213,13 @@ class FermiSurface(Material):
         # Fermi energy for the band group-velocity speed factor (parabolic band:
         # E_F = kF^2/(2 m*) = kF * vF / 2, since vF = kF/m*).
         self.E_F = 0.5 * kF * vF
+        # Moving drift-frame constants (atomic units, hbar=1; parabolic 2D band).
+        # m* = kF/vF; spin gs=2; 2D DOS g = gs m*/(2 pi); k-integral norm gs/(2pi)^2.
+        self.hbar = 1.0
+        self.mstar = kF / vF
+        self.gs = 2.0
+        self.g2d = self.gs * self.mstar / (2.0 * np.pi)
+        self.cnorm = self.gs / (2.0 * np.pi) ** 2
         # Even angular-node count (rounded up to a multiple of 4, >= 2M+1): with
         # the midpoint quadrature this is symmetric under both v_x->-v_x and
         # v_y->-v_y and places no node tangent to an axis-aligned wall (avoids a
@@ -375,6 +387,173 @@ class FermiSurface(Material):
         jx_rq = (w_r[:, None] * self.v_speed[:, None] * cos_q[None, :]).reshape(-1)
         jy_rq = (w_r[:, None] * self.v_speed[:, None] * sin_q[None, :]).reshape(-1)
         return torch.stack([n_rq, jx_rq, jy_rq], dim=0)
+
+    # ================================================================
+    # Moving drift-frame kit (Stage 1): conserved-density closure, shell
+    # moments, lab fluxes, and the moment-free projection.  Everything is
+    # batched over a leading cell axis (...,) and lives in momentum space
+    # only (no geometry).  It uses the FLAT phase-space measure radial.flat_w
+    # (NOT the sech^2 quad_w, which stays inside the collision operator) --
+    # the two-metric rule.  f0 = self.rho0 = sigma(-xi) is the frame reference.
+    # ================================================================
+    def _kbar(self, mu, Te):
+        """|k_bar|(xi_r) per (cell, radial node): sqrt(2 m*(mu+Te xi'))/hbar. (...,Nr)."""
+        eps = mu[..., None] + Te[..., None] * self.radial.xi
+        return torch.sqrt(torch.clamp(2.0 * self.mstar * eps, min=0.0)) / self.hbar
+
+    def n_FD(self, mu, Te):
+        """2D drifted-heated-FD density  g Te ln(1+e^{mu/Te})."""
+        return self.g2d * Te * torch.logaddexp(torch.zeros_like(mu), mu / Te)
+
+    def Eth_FD(self, mu, Te):
+        """Frame thermal energy density  g Te^2 (-Li2(-e^{mu/Te})), valid at ANY
+        mu/Te (degenerate AND heated).  Uses the dilog inversion so both branches
+        expand in |t|=e^{-|x|} <= 1: for x>=0 the Sommerfeld form 1/2 x^2 + pi^2/6
+        minus the convergent tail; for x<0 the direct alternating series.  This is
+        essential once strong collisionless shear heating drives mu/Te toward 0."""
+        x = mu / Te
+        tpos = torch.exp(-torch.clamp(x, min=0.0))       # e^{-x} for x>=0
+        tneg = torch.exp(torch.clamp(x, max=0.0))        # e^{x}  for x<0
+
+        def _neg_li2_neg(t):                             # -Li2(-t) = sum (-1)^{k+1} t^k/k^2
+            s = torch.zeros_like(t); tk = torch.ones_like(t)
+            for k in range(1, 97):                       # 96 terms: machine for |mu/Te|>~0.1
+                tk = tk * t
+                s = s + ((1.0 if k % 2 else -1.0) / (k * k)) * tk
+            return s
+        Fpos = 0.5 * x * x + (np.pi ** 2 / 6.0) - _neg_li2_neg(tpos)
+        Fneg = _neg_li2_neg(tneg)
+        return self.g2d * Te * Te * torch.where(x >= 0.0, Fpos, Fneg)
+
+    def mu_of_nT(self, n, Te):
+        """Invert n = g Te ln(1+e^{mu/Te}): mu = Te (y + ln(1 - e^{-y})), y=n/(g Te)."""
+        y = n / (self.g2d * Te)
+        return Te * (y + torch.log1p(-torch.exp(-y)))
+
+    def _fd_jac(self, mu, Te):
+        """Analytic thermodynamic Jacobian (dn_dmu, dn_dTe, dEth_dmu, dEth_dTe)."""
+        x = mu / Te
+        L1 = torch.logaddexp(torch.zeros_like(x), x)
+        sig = torch.sigmoid(x)
+        n = self.g2d * Te * L1
+        Eth = self.Eth_FD(mu, Te)
+        return self.g2d * sig, self.g2d * (L1 - x * sig), n, 2.0 * Eth / Te - x * n
+
+    def recover_frame(self, U, Te_guess=None, iters: int = 6):
+        """(n,Jx,Jy,E) -> (mu, Te, u).  u,Eth analytic; Te by a fixed Newton on the
+        n-constant path Eth_FD(mu_of_nT(n,Te),Te)=Eth (compile-safe, no host sync);
+        mu analytic.  U: (...,4)."""
+        n = U[..., 0].clamp_min(1e-30)
+        u = U[..., 1:3] / (self.mstar * n[..., None])
+        Eth = U[..., 3] - 0.5 * self.mstar * n * (u * u).sum(-1)
+        Te = torch.full_like(n, self.T_temp) if Te_guess is None else Te_guess.clone()
+        for _ in range(iters):
+            mu = self.mu_of_nT(n, Te)
+            dn_dmu, dn_dTe, dEth_dmu, dEth_dTe = self._fd_jac(mu, Te)
+            g = self.Eth_FD(mu, Te) - Eth
+            gp = dEth_dTe - dEth_dmu * (dn_dTe / dn_dmu)          # dEth/dTe at fixed n
+            Te = torch.clamp(Te - g / gp, min=1e-6 * self.T_temp)
+        return self.mu_of_nT(n, Te), Te, u
+
+    def _dev(self, f):
+        """Deviation d = f - f0 reshaped to (..., Nr, N_theta)."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        return (f - self.rho0).reshape(*f.shape[:-1], Nr, Nth)
+
+    def shell_moments(self, f, mu, Te):
+        """FLAT-measure deviation moments -> stress P (incl. FD core) and 3rd moment
+        M3; all (...,).  f: (..., Nk)."""
+        d = self._dev(f)
+        Jc = self.mstar * Te / self.hbar ** 2
+        wk = (self.radial.flat_w[:, None] * self.angular.wphi) * Jc[..., None, None]
+        kb = self._kbar(mu, Te)[..., :, None]                    # (...,Nr,1)
+        cph, sph = torch.cos(self.angular.theta), torch.sin(self.angular.theta)
+        kx, ky, k2 = kb * cph, kb * sph, kb * kb
+        wkd = wk * d
+        Pxx = self.cnorm * (wkd * kx * kx).sum((-1, -2))
+        Pyy = self.cnorm * (wkd * ky * ky).sum((-1, -2))
+        Pxy = self.cnorm * (wkd * kx * ky).sum((-1, -2))
+        M3x = self.cnorm * (wkd * k2 * kx).sum((-1, -2))
+        M3y = self.cnorm * (wkd * k2 * ky).sum((-1, -2))
+        trc = (2.0 * self.mstar / self.hbar ** 2) * self.Eth_FD(mu, Te)   # isotropic FD core
+        return 0.5 * trc + Pxx, 0.5 * trc + Pyy, Pxy, M3x, M3y
+
+    def assemble_fluxes(self, f, mu, Te, u):
+        """Lab fluxes (Fn=n u, Pi, q) -- frame-independent physical tensors -- from
+        the shape f and the per-cell frame.  Fn:(...,2) Pi:(...,2,2) q:(...,2)."""
+        n = self.n_FD(mu, Te); Eth = self.Eth_FD(mu, Te)
+        Pxx, Pyy, Pxy, M3x, M3y = self.shell_moments(f, mu, Te)
+        c = self.hbar ** 2 / self.mstar; u2 = (u * u).sum(-1)
+        Fn = n[..., None] * u
+        Pxx_l = c * Pxx + self.mstar * n * u[..., 0] ** 2
+        Pyy_l = c * Pyy + self.mstar * n * u[..., 1] ** 2
+        Pxy_l = c * Pxy + self.mstar * n * u[..., 0] * u[..., 1]
+        Pi = torch.stack([torch.stack([Pxx_l, Pxy_l], -1),
+                          torch.stack([Pxy_l, Pyy_l], -1)], -2)
+        Pu = torch.stack([c * (Pxx * u[..., 0] + Pxy * u[..., 1]),
+                          c * (Pxy * u[..., 0] + Pyy * u[..., 1])], -1)
+        qsh = self.hbar ** 3 / (2 * self.mstar ** 2)
+        q = ((Eth + 0.5 * self.mstar * n * u2)[..., None] * u
+             + Pu + qsh * torch.stack([M3x, M3y], -1))
+        return Fn, Pi, q
+
+    def project_moment_free(self, d, mu, Te):
+        """Remove the {1, xi', k_bar cos, k_bar sin} components of the deviation d in
+        the FLAT-measure shell inner product.  On GL radial + midpoint angular nodes
+        the Gram is EXACTLY diagonal, so this is 4 independent scalar projections
+        (Jc, wphi cancel).  Nulls (int df, <k_bar>, int eps df) to round-off, any
+        drift.  d: (..., Nk)  ->  d_perp: (..., Nk)."""
+        Nr, Nth = self.Nr, self.angular.N_theta
+        dr = d.reshape(*d.shape[:-1], Nr, Nth)
+        w = self.radial.flat_w[:, None].expand(Nr, Nth)          # (Nr,N_theta) full measure
+        xi = self.radial.xi[:, None]                             # (Nr,1)
+        kb = self._kbar(mu, Te)[..., :, None]                    # (...,Nr,1)
+        cph, sph = torch.cos(self.angular.theta), torch.sin(self.angular.theta)
+
+        def strip(cur, B):                                       # remove <B,cur>/<B,B> B
+            num = (w * B * cur).sum((-1, -2), keepdim=True)
+            den = (w * B * B).sum((-1, -2), keepdim=True).clamp_min(1e-300)
+            return cur - (num / den) * B
+
+        dr = strip(dr, torch.ones((), dtype=d.dtype, device=d.device))
+        dr = strip(dr, xi)
+        dr = strip(dr, kb * cph)
+        dr = strip(dr, kb * sph)
+        return dr.reshape(d.shape)
+
+    def pauli_reproject(self, f, mu, Te):
+        """Pauli clip to [0,1] then re-project the deviation moment-free (restores
+        exact consistency; leaves a tiny bounded overshoot)."""
+        return self.rho0 + self.project_moment_free(f.clamp(0.0, 1.0) - self.rho0, mu, Te)
+
+    def U_from_frame(self, mu, Te, u):
+        """Conserved lab densities (n,Jx,Jy,E) from the analytic frame (f=f0)."""
+        n = self.n_FD(mu, Te)
+        J = self.mstar * n[..., None] * u
+        E = self.Eth_FD(mu, Te) + 0.5 * self.mstar * n * (u * u).sum(-1)
+        return torch.cat([n[..., None], J, E[..., None]], -1)
+
+    def moments_of_f(self, f, mu, Te, u):
+        """Physical lab (n,Jx,Jy,E) computed FROM the shape f in the given frame --
+        the consistency probe.  Equals U_from_frame after project_moment_free."""
+        d = self._dev(f)
+        Jc = self.mstar * Te / self.hbar ** 2
+        wk = (self.radial.flat_w[:, None] * self.angular.wphi) * Jc[..., None, None]
+        kb = self._kbar(mu, Te)[..., :, None]
+        cph, sph = torch.cos(self.angular.theta), torch.sin(self.angular.theta)
+        # Frame energy weight = affine eps_df = mu + Te xi' (== 1/2 hbar^2 kbar^2/m*
+        # in the degenerate window, but stays consistent with the {1,xi'} projection
+        # basis when heating pushes nodes toward/below the band bottom).
+        eps = (mu[..., None] + Te[..., None] * self.radial.xi)[..., :, None]
+        n = self.n_FD(mu, Te) + self.cnorm * (wk * d).sum((-1, -2))
+        kbx = self.cnorm * (wk * kb * cph * d).sum((-1, -2))
+        kby = self.cnorm * (wk * kb * sph * d).sum((-1, -2))
+        Eth = self.Eth_FD(mu, Te) + self.cnorm * (wk * eps * d).sum((-1, -2))
+        kD = self.mstar * u / self.hbar
+        Jx = self.hbar * (kD[..., 0] * n + kbx)
+        Jy = self.hbar * (kD[..., 1] * n + kby)
+        E = Eth + 0.5 * self.mstar * n * (u * u).sum(-1) + self.hbar * (u[..., 0] * kbx + u[..., 1] * kby)
+        return torch.stack([n, Jx, Jy, E], -1)
 
     def get_contactor(self, n: torch.Tensor, **kwargs) -> Callable:
         return _FermiSurfaceContactor(self, n, **kwargs)

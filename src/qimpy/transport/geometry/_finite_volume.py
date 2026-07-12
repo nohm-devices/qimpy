@@ -597,6 +597,28 @@ class FiniteVolume(Geometry):
             self._u = rho0.flatten().to(rc.device, v.dtype)[None, :].repeat(self.K, 1)
         else:
             self._u = torch.zeros(self.K, self.Nk, device=rc.device, dtype=v.dtype)
+
+        # ---- moving drift-frame (exact scheme) setup ---------------------------
+        # Each cell carries a frame (mu,Te,u); the conserved lab densities U=(n,Jx,
+        # Jy,E) are the primary object, f the shape.  The per-edge streaming velocity
+        # is (v_node(frame)+u).n, so the precomputed global a_int/_wL/_wR are kept
+        # only for the ballistic fallback (material.moving_frame=False).
+        self._moving = bool(getattr(material, "moving_frame", False))
+        if self._moving:
+            fs = material
+            cth = torch.cos(fs.angular.theta); sth = torch.sin(fs.angular.theta)   # (Nθ,)
+            # frame-INDEPENDENT geometric factor  k̂·n̂  per (edge, angular node)
+            self._ang_int = g.en[:, 0:1] * cth[None, :] + g.en[:, 1:2] * sth[None, :]   # (Ne,Nθ)
+            self._ang_bnd = g.bn[:, 0:1] * cth[None, :] + g.bn[:, 1:2] * sth[None, :]   # (Nb,Nθ)
+            self._xi = fs.radial.xi                                                     # (Nr,)
+            self._vmax_shell = float(fs.v_speed.max())         # Rusanov + CFL signal speed
+            # seed U from the uniform-equilibrium frame (f already = rho0 isotropic)
+            mu0 = torch.full((self.K,), fs.E_F, device=rc.device, dtype=v.dtype)
+            Te0 = torch.full((self.K,), fs.T_temp, device=rc.device, dtype=v.dtype)
+            u0 = torch.zeros(self.K, 2, device=rc.device, dtype=v.dtype)
+            self._U = fs.U_from_frame(mu0, Te0, u0)            # (K,4)
+            self._Te = Te0                                     # frame-recovery warm start
+
         self._stash_t, self._stash_i, self._stash_obs = [], [], []
         self._stash_terms = []   # per-frame (4, K_own, Nr*dim): [a, lin, quad, cub]
 
@@ -778,6 +800,158 @@ class FiniteVolume(Geometry):
         if self._dl_A is None:
             return u
         return u - (u @ self._dl_A) @ self._dl_B.T
+
+    # ==================================================================
+    #  Moving drift-frame exact scheme (Stage 1, ballistic).
+    #  March conserved U=(n,Jx,Jy,E) by frame-independent lab fluxes with a
+    #  Rusanov shared-face flux (telescopes -> exact continuity at any per-cell
+    #  frame); transport the shape f with the per-edge frame velocity; recover
+    #  the post-march frame; project the deviation moment-free (moment(f)=U).
+    # ==================================================================
+    def _edge_speed(self, mu, Te, u, ang, eL, eR, bcell=None):
+        """Per-(edge, node) streaming velocity (v_node(frame_e)+u_e).n.
+        Interior: face-average the two neighbours' frames; boundary: the cell frame."""
+        fs = self.material
+        if bcell is None:
+            mu_e = 0.5 * (mu[eL] + mu[eR]); Te_e = 0.5 * (Te[eL] + Te[eR])
+            u_e = 0.5 * (u[eL] + u[eR]); en = self.geom.en
+        else:
+            mu_e, Te_e, u_e, en = mu[bcell], Te[bcell], u[bcell], self.geom.bn
+        eps = mu_e[:, None] + Te_e[:, None] * self._xi                       # (Nedge,Nr)
+        vfac = (fs.hbar / fs.mstar) * torch.sqrt(
+            torch.clamp(2.0 * fs.mstar * eps, min=0.0)) / fs.hbar            # (Nedge,Nr)
+        udotn = (u_e * en).sum(-1)                                          # (Nedge,)
+        return (vfac[:, :, None] * ang[:, None, :]
+                + udotn[:, None, None]).reshape(ang.shape[0], self.Nk)      # (Nedge,Nk)
+
+    def _march_U(self, f, mu, Te, u, t, uf):
+        """dU/dt from the frame-independent lab fluxes (n u, Pi, q), Rusanov shared
+        face + boundary booking through the existing contactor/reflector ghost.
+        ``uf`` are the (reused) reconstructed face values of f."""
+        fs, g = self.material, self.geom
+        eL, eR, en, elen, iA = g.eL, g.eR, g.en, g.elen, g.inv_area
+        Fn, Pi, q = fs.assemble_fluxes(f, mu, Te, u)                        # (K,2),(K,2,2),(K,2)
+        U = self._U
+        dU = torch.zeros_like(U)
+        udotn = (0.5 * (u[eL] + u[eR]) * en).sum(-1)                        # (Ne,)
+        alpha = udotn.abs() + self._vmax_shell                             # (Ne,) signal speed
+        # scalar channels (mass, energy): central (W.n) + Rusanov -0.5 a (U_R-U_L)
+        def scal(W, comp):
+            Fd = (0.5 * (W[eL] + W[eR]) * en).sum(-1) * elen
+            Fd = Fd - 0.5 * alpha * (U[eR, comp] - U[eL, comp]) * elen
+            dU[:, comp].index_add_(0, eL, -Fd * iA[eL])
+            dU[:, comp].index_add_(0, eR, +Fd * iA[eR])
+        scal(Fn, 0); scal(q, 3)
+        # momentum: central (Pi.n) + Rusanov on (Jx,Jy)
+        Pn = torch.einsum('fij,fj->fi', 0.5 * (Pi[eL] + Pi[eR]), en) * elen[:, None]
+        Pn = Pn - 0.5 * alpha[:, None] * (U[eR, 1:3] - U[eL, 1:3]) * elen[:, None]
+        dU[:, 1:3].index_add_(0, eL, -Pn * iA[eL, None])
+        dU[:, 1:3].index_add_(0, eR, +Pn * iA[eR, None])
+        # boundary: direct flat-measure kinetic moment of the ACTUAL upwind ghost.
+        # Split f_bnd = f0 + d_bnd: the analytic drifted-FD flux carries the filled
+        # CORE (~80% of the mass), the shell-deviation moment carries the ghost's
+        # actual content (so walls/contacts genuinely drive U).  See port_B2.md.
+        if g.bcell.numel():
+            bn, blen, bc = g.bn, g.blen, g.bcell
+            uMb = uf[g.bF]
+            uP = self._exterior(uMb, t)
+            a_b = self._edge_speed(mu, Te, u, self._ang_bnd, None, None, bcell=bc)   # v_lab.n per node
+            f_bnd = torch.where(a_b > 0, uMb, uP)              # outflow interior / inflow ghost
+            Fn0, Pi0, q0 = fs.assemble_fluxes(fs.rho0.expand(bc.numel(), self.Nk),
+                                              mu[bc], Te[bc], u[bc])   # equilibrium (core) flux
+            flux_n = (Fn0 * bn).sum(-1)
+            flux_J = torch.einsum('fij,fj->fi', Pi0, bn)
+            flux_E = (q0 * bn).sum(-1)
+            Nr, Nth = fs.Nr, fs.angular.N_theta
+            dfb = (f_bnd - fs.rho0).reshape(-1, Nr, Nth)
+            Jc = fs.mstar * Te[bc] / fs.hbar ** 2
+            wk = (fs.radial.flat_w[:, None] * fs.angular.wphi) * Jc[:, None, None]
+            ab = a_b.reshape(-1, Nr, Nth)
+            kb = fs._kbar(mu[bc], Te[bc])[:, :, None]
+            cph, sph = torch.cos(fs.angular.theta), torch.sin(fs.angular.theta)
+            kx, ky = kb * cph, kb * sph
+            eps = (mu[bc][:, None] + Te[bc][:, None] * fs.radial.xi)[:, :, None]
+            ux, uy = u[bc, 0][:, None, None], u[bc, 1][:, None, None]
+            base = fs.cnorm * wk * ab * dfb
+            flux_n = flux_n + base.sum((-1, -2))
+            flux_J = flux_J + torch.stack(
+                [(base * (fs.hbar * kx + fs.mstar * ux)).sum((-1, -2)),
+                 (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2))], -1)
+            flux_E = flux_E + (base * (eps + fs.hbar * (ux * kx + uy * ky)
+                               + 0.5 * fs.mstar * (u[bc] ** 2).sum(-1)[:, None, None])).sum((-1, -2))
+            dU[:, 0].index_add_(0, bc, -flux_n * blen * iA[bc])
+            dU[:, 1:3].index_add_(0, bc, -flux_J * (blen * iA[bc])[:, None])
+            dU[:, 3].index_add_(0, bc, -flux_E * blen * iA[bc])
+        # momentum relaxation (tau_p): the DRIFT momentum lives in U, and the shape
+        # collision cannot touch it (projection re-pins), so book -J/tau_p here.
+        # Elastic: energy is retained (drift KE -> heat via the closure), E untouched.
+        tip = float(getattr(fs, "tau_inv_p", 0.0))
+        if tip:
+            dU[:, 1:3] = dU[:, 1:3] - tip * self._U[:, 1:3]
+        return dU
+
+    def _shape_rhs(self, f, mu, Te, u, t, uf):
+        """Upwind transport of the shape f with the per-edge frame velocity.
+        ``uf`` are the (reused) reconstructed face values of f."""
+        g = self.geom
+        eL, eR, eLF, eRF, elen, iA = g.eL, g.eR, g.eLF, g.eRF, g.elen, g.inv_area
+        df = torch.zeros_like(f)
+        a_e = self._edge_speed(mu, Te, u, self._ang_int, eL, eR)           # (Ne,Nk)
+        uup = torch.where(a_e > 0, uf[eLF], uf[eRF])
+        flux = a_e * elen[:, None] * uup
+        df.index_add_(0, eL, -flux * iA[eL, None])
+        df.index_add_(0, eR, +flux * iA[eR, None])
+        if g.bcell.numel():
+            uMb = uf[g.bF]
+            uP = self._exterior(uMb, t)
+            a_b = self._edge_speed(mu, Te, u, self._ang_bnd, None, None, bcell=g.bcell)
+            f_bnd = torch.where(a_b > 0, uMb, uP)
+            fluxb = a_b * g.blen[:, None] * f_bnd
+            df.index_add_(0, g.bcell, -fluxb * iA[g.bcell, None])
+        return df
+
+    def step_moving_frame(self, t: float, dt: float) -> None:
+        """One coupled exact step: recover frame -> march U (Rusanov + BC) and
+        transport shape -> recover post-frame -> project moment-free -> Pauli."""
+        fs = self.material
+        if self._decomp is not None:
+            self._decomp.exchange(self._u)
+            self._decomp.exchange(self._U)          # ghost neighbours' conserved densities
+        mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
+        uf = self._faces_fn(self._u).reshape(-1, self.Nk)   # reconstruct faces once, reuse
+        dU = self._march_U(self._u, mu, Te, u, t, uf)
+        U_new = self._U + dt * dU
+        f_tr = self._u + dt * self._shape_rhs(self._u, mu, Te, u, t, uf)
+        if not self._skip_collision:
+            # Collisions relax the SHAPE toward the local frame equilibrium f0 (its
+            # modal null space is the conserved subspace); U is marched by transport
+            # only, and the projection re-pins f's low moments to U, so the collision
+            # touches only the viscous/higher shape.  Stage 2: rates frozen at T_ref.
+            f_tr = f_tr + dt * fs.rho_dot(self._u, t, id(self))
+        mu2, Te2, u2 = fs.recover_frame(U_new, Te_guess=Te)
+        f_new = fs.pauli_reproject(fs.rho0 + fs.project_moment_free(f_tr - fs.rho0, mu2, Te2),
+                                   mu2, Te2)
+        if self._owned_mask is not None:
+            U_new = torch.where(self._owned_mask, U_new, self._U)
+        self._U, self._u, self._Te = U_new, self._dealias(f_new), Te2
+
+    # ---- moving-frame diagnostics (conservation / consistency) ----
+    def U_totals(self) -> torch.Tensor:
+        """Domain totals (int n, int Jx, int Jy, int E) = sum_c A_c U_c (owned cells)."""
+        sl = slice(self._own_start, self._own_stop)
+        tot = (self.geom.area[sl, None] * self._U[sl]).sum(0)
+        return self.comm.allreduce(tot) if self._mpi else tot
+
+    def consistency_residual(self) -> torch.Tensor:
+        """max_c |moment_of_f(f_c) - U_c| / scale, per channel (owned cells) -- the
+        machine-precision check that the shape's moments equal the marched densities."""
+        fs = self.material
+        sl = slice(self._own_start, self._own_stop)
+        mu, Te, u = fs.recover_frame(self._U[sl], Te_guess=self._Te[sl])
+        Uf = fs.moments_of_f(self._u[sl], mu, Te, u)
+        scale = self._U[sl].abs().mean(0).clamp_min(1e-300)
+        res = ((Uf - self._U[sl]).abs() / scale).max(0).values
+        return self.comm.allreduce(res) if self._mpi else res
 
     # ---- qimpy Geometry contract ----
     def rho_dot(self, rho: TensorList, t: float) -> TensorList:
