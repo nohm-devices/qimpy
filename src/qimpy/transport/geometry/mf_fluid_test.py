@@ -104,7 +104,7 @@ fv3 = FiniteVolume(material=fs3, mesh_file=pm, contacts={"periodic": None}, cfl=
 mu3 = torch.full((fv3.K,), fs3.E_F, device=dev)                      # uniform p,rho
 Te3 = torch.full((fv3.K,), T, device=dev)
 u3 = torch.zeros(fv3.K, 2, device=dev)
-u3[:, 0] = 0.05 * vF * torch.tanh(3.0 * torch.sin(2 * np.pi * cen[:, 1]))   # shear layer
+u3[:, 0] = 0.05 * vF * torch.sin(2 * np.pi * cen[:, 1])   # smooth (resolved) shear layer
 fv3._U = fs3.U_from_frame(mu3, Te3, u3); fv3._Te = Te3.clone()
 ux0 = u3[:, 0].clone()
 dt3 = 0.4 * float(fv3.geom.inradius.min()) / float(fs3.sound_speed(mu3, Te3).max())
