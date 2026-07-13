@@ -95,6 +95,25 @@ t_kin = (time.time() - t0) / 20
 print(f"TIMING: fluid {t_fluid*1e3:.2f} ms/step  kinetic {t_kin*1e3:.2f} ms/step  "
       f"speedup {t_kin/max(t_fluid,1e-9):.1f}x")
 
+# ---------- (4) SHEAR CONTACT: HLLC should barely diffuse a stationary u_x(y) layer ----------
+# Uniform density/pressure, u_y=0, x-velocity shear varying in y: a contact discontinuity
+# (tangential-velocity jump) that is a stationary Euler solution.  HLLC rides it on the
+# contact wave S_* (near-zero diffusion); HLL would smear it with acoustic dissipation.
+fs3 = FermiSurface(kF=kF, vF=vF, M_theta=8, Nr=4, T=T, xi_max=6.0, fluid_model=True, process_grid=pg)
+fv3 = FiniteVolume(material=fs3, mesh_file=pm, contacts={"periodic": None}, cfl=0.4, process_grid=pg)
+mu3 = torch.full((fv3.K,), fs3.E_F, device=dev)                      # uniform p,rho
+Te3 = torch.full((fv3.K,), T, device=dev)
+u3 = torch.zeros(fv3.K, 2, device=dev)
+u3[:, 0] = 0.05 * vF * torch.tanh(3.0 * torch.sin(2 * np.pi * cen[:, 1]))   # shear layer
+fv3._U = fs3.U_from_frame(mu3, Te3, u3); fv3._Te = Te3.clone()
+ux0 = u3[:, 0].clone()
+dt3 = 0.4 * float(fv3.geom.inradius.min()) / float(fs3.sound_speed(mu3, Te3).max())
+for st in range(50):
+    fv3.step_fluid(0.0, dt3)
+_, _, u3b = fs3.recover_frame(fv3._U)
+shear_drift = float((u3b[:, 0] - ux0).abs().max()) / (0.05 * vF)
+print(f"SHEAR contact (HLLC): stationary u_x(y) layer relative drift after 50 steps = {shear_drift:.2e}")
+
 ok = finP and finD and ux_pos and dN < 1e-12 and dpx < 1e-12 and dE < 1e-12
-print("PASS: fluid model conserves (periodic) + runs stable device w/ source->drain current"
+print("PASS: fluid model (HLLC) conserves (periodic) + stable device current + preserves shear contact"
       if ok else "CHECK")

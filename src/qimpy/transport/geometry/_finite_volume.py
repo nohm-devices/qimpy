@@ -1141,24 +1141,46 @@ class FiniteVolume(Geometry):
             self._U, self._u, self._Te = U_new, g_new, Te2
             left -= h; t += h
 
-    @staticmethod
-    def _hll(UL, UR, FL, FR, unL, unR, csL, csR):
-        """HLL MACROSCOPIC Riemann flux for the moment (Euler) system.  Upwinds on the
-        moment system's own acoustic characteristics via the Davis wave-speed bounds
-        S_L=min(unL−csL,unR−csR), S_R=max(unL+csL,unR+csR) (un=u·n̂, cs=sound_speed):
-        F = F_L (S_L≥0) / F_R (S_R≤0) / (S_R F_L−S_L F_R+S_L S_R(U_R−U_L))/(S_R−S_L).
-        Single-valued in (L,R,n̂) → telescopes → conservative.  All inputs per edge:
-        U*,F* (Ne,4); un*,cs* (Ne,).  Reduces to central+c_s dissipation when deeply
-        subsonic (both acoustic waves ~±c_s); that is the correct acoustic dissipation,
-        not an ad-hoc v_max.  (HLLC would additionally resolve the shear/entropy contact.)"""
-        SL = torch.minimum(unL - csL, unR - csR)[:, None]          # (Ne,1)
-        SR = torch.maximum(unL + csL, unR + csR)[:, None]
-        star = (SR * FL - SL * FR + (SL * SR) * (UR - UL)) / (SR - SL).clamp_min(1e-300)
-        return torch.where(SL >= 0.0, FL, torch.where(SR <= 0.0, FR, star))
+    def _hllc(self, UL, UR, FL, FR, nx, ny, uL, uR, pL, pR, csL, csR):
+        """HLLC MACROSCOPIC Riemann flux for the moment (Euler) system.  Unlike HLL it
+        keeps the MIDDLE contact/shear wave S_* -- the tangential velocity u_t and the
+        entropy jump ride the contact, so a shear layer is advected sharply instead of
+        being smeared by the acoustic dissipation (HLL's deep-subsonic central+c_s blend).
+
+        Davis acoustic bounds S_L=min(u_nL−c_L,u_nR−c_R), S_R=max(u_nL+c_L,u_nR+c_R); Toro
+        contact speed S_* = [p_R−p_L + ρ_L u_nL(S_L−u_nL) − ρ_R u_nR(S_R−u_nR)] /
+        [ρ_L(S_L−u_nL) − ρ_R(S_R−u_nR)]  (ρ=m*n, p=Eth).  Star state (in lab n,Jx,Jy,E),
+        ω_K=ρ_K(S_K−u_nK)/(S_K−S_*), u*_K = S_* n̂ + u_tK t̂:
+          U*_K = (ω_K/m*, ω_K u*_Kx, ω_K u*_Ky, ω_K[E_K/ρ_K+(S_*−u_nK)(S_*+p_K/(ρ_K(S_K−u_nK)))]).
+        F = F_L / F_L+S_L(U*_L−U_L) / F_R+S_R(U*_R−U_R) / F_R by the sign of S_L,S_*,S_R.
+        Single-valued in (L,R,n̂) ⇒ telescopes ⇒ conservative.  All (Ne,·).  Deeply subsonic
+        flows here keep the star states well-defined (ρ>0 floored); no HLL fallback needed."""
+        m = self.material.mstar
+        tx, ty = -ny, nx                                            # tangential t̂=(−ny,nx)
+        unL = uL[:, 0] * nx + uL[:, 1] * ny; unR = uR[:, 0] * nx + uR[:, 1] * ny
+        utL = uL[:, 0] * tx + uL[:, 1] * ty; utR = uR[:, 0] * tx + uR[:, 1] * ty
+        rhoL = m * UL[:, 0]; rhoR = m * UR[:, 0]                    # mass density
+        SL = torch.minimum(unL - csL, unR - csR)
+        SR = torch.maximum(unL + csL, unR + csR)
+        mL = rhoL * (SL - unL); mR = rhoR * (SR - unR)             # ρ(S−u_n): mL<0<mR
+        sgn = lambda x: torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+        dstar = (mL - mR); dstar = torch.where(dstar.abs() > 1e-300, dstar, -1e-300 * sgn(dstar) - 1e-300)
+        Sstar = (pR - pL + unL * mL - unR * mR) / dstar
+        dL = SL - Sstar; dL = torch.where(dL.abs() > 1e-300, dL, dL - 1e-300)
+        dR = SR - Sstar; dR = torch.where(dR.abs() > 1e-300, dR, dR + 1e-300)
+        omL = mL / dL; omR = mR / dR                               # ρ*_L, ρ*_R
+        UsL = torch.stack([omL / m, omL * (Sstar * nx + utL * tx), omL * (Sstar * ny + utL * ty),
+                           omL * (UL[:, 3] / rhoL + (Sstar - unL) * (Sstar + pL / mL))], -1)
+        UsR = torch.stack([omR / m, omR * (Sstar * nx + utR * tx), omR * (Sstar * ny + utR * ty),
+                           omR * (UR[:, 3] / rhoR + (Sstar - unR) * (Sstar + pR / mR))], -1)
+        SL_, SR_, Ss_ = SL[:, None], SR[:, None], Sstar[:, None]
+        return torch.where(SL_ >= 0.0, FL,
+               torch.where(Ss_ >= 0.0, FL + SL_ * (UsL - UL),
+               torch.where(SR_ >= 0.0, FR + SR_ * (UsR - UR), FR)))
 
     def step_fluid(self, t: float, dt: float) -> None:
         """FAST INVISCID FLUID MODEL.  March the conserved moments U=(n,Jx,Jy,E) with an
-        HLL macroscopic Riemann solver on the equilibrium moment flux F(U)=eq_flux (f≡f0),
+        HLLC (contact-resolving) macroscopic Riemann solver on the equilibrium flux F=eq_flux (f≡f0),
         upwinding on the moment system's OWN characteristics u·n̂±c_s (c_s=v_F/√2) -- NOT
         the kinetic KFVS.  No shell, no reconstruction, no projection, no k-space ⇒ O(K)
         per step (much cheaper than step_moving_frame).  Walls reflect (u→u−2(u·n̂)n̂: exact
@@ -1177,12 +1199,13 @@ class FiniteVolume(Geometry):
                 self._decomp.exchange(self._U)
             mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
             cs = fs.sound_speed(mu, Te)                              # (K,) macroscopic c_s
+            p = fs.Eth_FD(mu, Te)                                    # (K,) pressure P = Eth
             dU = torch.zeros_like(self._U)
-            # interior HLL on the equilibrium flux
+            # interior HLLC on the equilibrium flux
             FL = fs.eq_flux(mu[eL], Te[eL], u[eL], nx, ny)          # (Ne,4)
             FR = fs.eq_flux(mu[eR], Te[eR], u[eR], nx, ny)
-            Ff = self._hll(self._U[eL], self._U[eR], FL, FR,
-                           (u[eL] * en).sum(-1), (u[eR] * en).sum(-1), cs[eL], cs[eR])
+            Ff = self._hllc(self._U[eL], self._U[eR], FL, FR, nx, ny,
+                            u[eL], u[eR], p[eL], p[eR], cs[eL], cs[eR])
             self._Ff_int_dens = torch.stack((Ff[:, 0], Ff[:, 3]), dim=-1)   # staggered-plot cache
             Ff = Ff * elen[:, None]
             dU.index_add_(0, eL, -Ff * iA[eL, None])
@@ -1200,8 +1223,8 @@ class FiniteVolume(Geometry):
                 u_g = torch.where(is_w[:, None], u_refl, torch.zeros_like(u_c))
                 Fc = fs.eq_flux(mu_c, Te_c, u_c, bnx, bny)
                 Fg = fs.eq_flux(mu_g, Te_g, u_g, bnx, bny)
-                Fb = self._hll(self._U[bc], fs.U_from_frame(mu_g, Te_g, u_g), Fc, Fg,
-                               un_c, (u_g * bn).sum(-1), cs[bc], fs.sound_speed(mu_g, Te_g))
+                Fb = self._hllc(self._U[bc], fs.U_from_frame(mu_g, Te_g, u_g), Fc, Fg, bnx, bny,
+                                u_c, u_g, p[bc], fs.Eth_FD(mu_g, Te_g), cs[bc], fs.sound_speed(mu_g, Te_g))
                 self._Ff_bnd_dens = torch.stack((Fb[:, 0], Fb[:, 3]), dim=-1)
                 dU.index_add_(0, bc, -Fb * (blen * iA[bc])[:, None])
             if tip:                                                 # τ_p sink (0 at τ_p=∞)
