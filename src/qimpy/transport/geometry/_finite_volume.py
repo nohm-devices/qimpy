@@ -605,6 +605,9 @@ class FiniteVolume(Geometry):
         # is (v_node(frame)+u).n, so the precomputed global a_int/_wL/_wR are kept
         # only for the ballistic fallback (material.moving_frame=False).
         self._moving = bool(getattr(material, "moving_frame", False))
+        # Fast INVISCID fluid model: march U with a MACROSCOPIC HLL Riemann solver on the
+        # equilibrium moment flux (no shell / reconstruction / projection / k-space).
+        self._fluid = bool(getattr(material, "fluid_model", False))
         self._cfl = float(cfl)
         if self._moving:
             fs = material
@@ -655,6 +658,16 @@ class FiniteVolume(Geometry):
         # entering only through the shell deviation).  Covers ALL boundary edges.
         self._is_wall_b = torch.as_tensor(
             [not is_c(nm) for nm in name_of], device=rc.device, dtype=torch.bool)
+        # Fluid model: per-boundary-edge reservoir chemical potential.  A voltage contact
+        # is an isotropic Fermi-Dirac reservoir at mu = E_F + dmu (drift u=0); walls
+        # reflect (mu unused).  (I_set / floating contacts fall back to mu=E_F here --
+        # the fluid path is the fast voltage-driven model; use the kinetic path for
+        # current-feedback contacts.)
+        if bool(getattr(material, "fluid_model", False)):
+            resmu = [material.E_F + float((self.contacts.get(nm) or {}).get("dmu", 0.0))
+                     for nm in name_of]
+            self._fluid_res_mu = torch.as_tensor(
+                resmu, device=rc.device, dtype=g.bn.dtype)
         # The full-f reflector's diffuse re-emit is NONLINEAR in the wall trace
         # (a genuine Fermi-Dirac at a per-face chemical potential), so it is
         # evaluated per step rather than collapsed into a precomputed per-edge
@@ -1126,6 +1139,81 @@ class FiniteVolume(Geometry):
             if self._owned_mask is not None:
                 U_new = torch.where(self._owned_mask, U_new, self._U)
             self._U, self._u, self._Te = U_new, g_new, Te2
+            left -= h; t += h
+
+    @staticmethod
+    def _hll(UL, UR, FL, FR, unL, unR, csL, csR):
+        """HLL MACROSCOPIC Riemann flux for the moment (Euler) system.  Upwinds on the
+        moment system's own acoustic characteristics via the Davis wave-speed bounds
+        S_L=min(unL−csL,unR−csR), S_R=max(unL+csL,unR+csR) (un=u·n̂, cs=sound_speed):
+        F = F_L (S_L≥0) / F_R (S_R≤0) / (S_R F_L−S_L F_R+S_L S_R(U_R−U_L))/(S_R−S_L).
+        Single-valued in (L,R,n̂) → telescopes → conservative.  All inputs per edge:
+        U*,F* (Ne,4); un*,cs* (Ne,).  Reduces to central+c_s dissipation when deeply
+        subsonic (both acoustic waves ~±c_s); that is the correct acoustic dissipation,
+        not an ad-hoc v_max.  (HLLC would additionally resolve the shear/entropy contact.)"""
+        SL = torch.minimum(unL - csL, unR - csR)[:, None]          # (Ne,1)
+        SR = torch.maximum(unL + csL, unR + csR)[:, None]
+        star = (SR * FL - SL * FR + (SL * SR) * (UR - UL)) / (SR - SL).clamp_min(1e-300)
+        return torch.where(SL >= 0.0, FL, torch.where(SR <= 0.0, FR, star))
+
+    def step_fluid(self, t: float, dt: float) -> None:
+        """FAST INVISCID FLUID MODEL.  March the conserved moments U=(n,Jx,Jy,E) with an
+        HLL macroscopic Riemann solver on the equilibrium moment flux F(U)=eq_flux (f≡f0),
+        upwinding on the moment system's OWN characteristics u·n̂±c_s (c_s=v_F/√2) -- NOT
+        the kinetic KFVS.  No shell, no reconstruction, no projection, no k-space ⇒ O(K)
+        per step (much cheaper than step_moving_frame).  Walls reflect (u→u−2(u·n̂)n̂: exact
+        zero normal mass flux by the S_L=−S_R symmetry); voltage contacts inject an FD
+        reservoir at E_F+dmu.  τ_p momentum sink honored; self-substeps to the acoustic CFL."""
+        fs, g = self.material, self.geom
+        eL, eR, en, elen, iA = g.eL, g.eR, g.en, g.elen, g.inv_area
+        nx, ny = en[:, 0], en[:, 1]
+        tip = float(getattr(fs, "tau_inv_p", 0.0))
+        left = float(dt); n_sub = 0
+        while left > 1e-12 * float(dt) + 1e-300:
+            n_sub += 1
+            if n_sub > 100000:
+                raise RuntimeError("step_fluid: CFL substep cap exceeded")
+            if self._decomp is not None:
+                self._decomp.exchange(self._U)
+            mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
+            cs = fs.sound_speed(mu, Te)                              # (K,) macroscopic c_s
+            dU = torch.zeros_like(self._U)
+            # interior HLL on the equilibrium flux
+            FL = fs.eq_flux(mu[eL], Te[eL], u[eL], nx, ny)          # (Ne,4)
+            FR = fs.eq_flux(mu[eR], Te[eR], u[eR], nx, ny)
+            Ff = self._hll(self._U[eL], self._U[eR], FL, FR,
+                           (u[eL] * en).sum(-1), (u[eR] * en).sum(-1), cs[eL], cs[eR])
+            self._Ff_int_dens = torch.stack((Ff[:, 0], Ff[:, 3]), dim=-1)   # staggered-plot cache
+            Ff = Ff * elen[:, None]
+            dU.index_add_(0, eL, -Ff * iA[eL, None])
+            dU.index_add_(0, eR, +Ff * iA[eR, None])
+            # boundary HLL: cell vs ghost frame (wall reflect / contact reservoir)
+            if g.bcell.numel():
+                bn, blen, bc = g.bn, g.blen, g.bcell
+                bnx, bny = bn[:, 0], bn[:, 1]
+                mu_c, Te_c, u_c = mu[bc], Te[bc], u[bc]
+                un_c = (u_c * bn).sum(-1)
+                u_refl = u_c - 2.0 * un_c[:, None] * bn
+                is_w = self._is_wall_b
+                mu_g = torch.where(is_w, mu_c, self._fluid_res_mu)
+                Te_g = torch.where(is_w, Te_c, torch.full_like(Te_c, fs.T_temp))
+                u_g = torch.where(is_w[:, None], u_refl, torch.zeros_like(u_c))
+                Fc = fs.eq_flux(mu_c, Te_c, u_c, bnx, bny)
+                Fg = fs.eq_flux(mu_g, Te_g, u_g, bnx, bny)
+                Fb = self._hll(self._U[bc], fs.U_from_frame(mu_g, Te_g, u_g), Fc, Fg,
+                               un_c, (u_g * bn).sum(-1), cs[bc], fs.sound_speed(mu_g, Te_g))
+                self._Ff_bnd_dens = torch.stack((Fb[:, 0], Fb[:, 3]), dim=-1)
+                dU.index_add_(0, bc, -Fb * (blen * iA[bc])[:, None])
+            if tip:                                                 # τ_p sink (0 at τ_p=∞)
+                dU[:, 1:3] = dU[:, 1:3] - tip * self._U[:, 1:3]
+            smax = float((u.norm(dim=1) + cs).max())                # acoustic signal speed
+            h = min(left, self._cfl * float(self.geom.inradius.min()) / max(smax, 1e-30))
+            if not (h > 0.0 and np.isfinite(h)):
+                raise RuntimeError("step_fluid: non-finite CFL substep")
+            U_new = self._U + h * dU
+            if self._owned_mask is not None:
+                U_new = torch.where(self._owned_mask, U_new, self._U)
+            self._U, self._Te = U_new, Te
             left -= h; t += h
 
     # ---- moving-frame diagnostics (conservation / consistency) ----

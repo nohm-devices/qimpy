@@ -195,11 +195,16 @@ class FermiSurface(Material):
         r_c: float = np.inf, specularity: float = 1.0,
         ee_scattering: Optional[Union[EEScattering, dict]] = None,
         moving_frame: bool = False,
+        fluid_model: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         super().__init__()
-        self.moving_frame = bool(moving_frame)
+        # fluid_model implies the moving-frame conserved-density (U) representation:
+        # both march U=(n,Jx,Jy,E); the fluid path just replaces the kinetic KFVS flux
+        # with a MACROSCOPIC HLL Riemann solver and drops the shell entirely.
+        self.fluid_model = bool(fluid_model)
+        self.moving_frame = bool(moving_frame) or self.fluid_model
         self.kF, self.vF = kF, vF
         self.M_theta, self.Nr = M_theta, Nr
         self.T_temp, self.xi_max = T, xi_max
@@ -583,6 +588,14 @@ class FermiSurface(Material):
         Phi = self.eq_flux(mu, Te, u, nx, ny)
         Psi = self.eq_abs_flux(mu, Te, u, nx, ny)
         return 0.5 * (Phi + Psi), 0.5 * (Phi - Psi)
+
+    def sound_speed(self, mu, Te):
+        """First-sound speed of the 2D degenerate electron fluid,
+        c_s = v_F/sqrt(2) = sqrt(mu/m*)  (c_s^2 = E_F/m* = 1/2 v_F^2) -- the MACROSCOPIC
+        characteristic speed of the moment (Euler) system.  This is what the fluid-model
+        HLL Riemann solver upwinds on (the acoustic waves u.n^ +- c_s), NOT the kinetic
+        |v.n^| moment eq_abs_flux the KFVS scheme uses.  mu floored for a hot transient."""
+        return torch.sqrt(mu.clamp_min(1e-12 * self.E_F) / self.mstar)
 
     # ---- unbounded evolved shape:  delta-g = logit(f) + xi'  (state variable) ----
     def f_of_g(self, dg):
