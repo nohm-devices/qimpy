@@ -992,6 +992,20 @@ class FiniteVolume(Geometry):
             Ff_b = (Php_c + Phm_g
                     + self._shell_dev_moment(mu_bf, Te_bf, u_bf, a_cp, df_cell)
                     + self._shell_dev_moment(mu_bf, Te_bf, u_g, a_gm, df_ghost))   # (Nb,4)
+            # WALL exact mass conservation in the MOVING measure.  The reflector balances
+            # its (specular+diffuse) re-emit in the no-drift v·n̂ measure, but the moving
+            # KFVS books a=v·n̂+u·n̂, leaving a ~u·n̂ net normal MASS flux -- yet a wall passes
+            # NO particles.  Add a per-wall-edge isotropic ghost-INFLOW occupation correction
+            # c chosen so the net normal mass flux is exactly zero (contacts are skipped:
+            # they DO pass mass).  c ~ the leak (~1e-5), so the ghost stays Pauli-bounded and
+            # the induced momentum/energy change is negligible.
+            wm = fs.cnorm * (fs.radial.flat_w[:, None] * fs.angular.wphi) \
+                * (fs.mstar * Te_bf / fs.hbar ** 2)[:, None, None]           # (Nb,Nr,Nth)
+            coef = (wm * a_gm).sum((-1, -2))                                 # d(mass)/dc  (<0)
+            cwall = torch.where(self._is_wall_b & (coef.abs() > 1e-300),
+                                -Ff_b[:, 0] / coef, torch.zeros_like(coef))
+            Ff_b = Ff_b + self._shell_dev_moment(
+                mu_bf, Te_bf, u_g, a_gm, cwall[:, None, None].expand(-1, Nr, Nth))
             flux_n, flux_J, flux_E = Ff_b[:, 0], Ff_b[:, 1:3], Ff_b[:, 3]
             self._Ff_bnd_dens = torch.stack((flux_n, flux_E), dim=-1)        # (Nb,2) j.n^, q.n^
             dU[:, 0].index_add_(0, bc, -flux_n * blen * iA[bc])
