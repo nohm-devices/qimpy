@@ -1154,8 +1154,16 @@ class FiniteVolume(Geometry):
                 # Collide the MOMENT-FREE deviation about f0 (project removes the four
                 # invariants {N,E,px,py}) so C[f0]=0; added in f-space (route a builds the
                 # occupation f_tr).  τ_p=∞ short-circuits this via _skip_collision.
+                # Collision in the EQUILIBRIUM-WEIGHTED (entropy/g) metric: the linearized
+                # e-e operator acts on delta-g = delta_f / w_eq (w_eq = f0(1-f0), the Fermi
+                # window), NOT on delta_f directly.  Applying it to delta_f under-weights the
+                # band-edge nodes (w_eq ~ 0.01 at xi'=+-6), so the transport pumps an edge
+                # node to f=0 while the bulk is damped -> rail.  col = w_eq * rho_relax(delta_f
+                # / w_eq) restores the edge; re-project flat-moment-free (conserve n,J,E).
+                w_eq = (fs.rho0 * (1.0 - fs.rho0)).clamp_min(1e-12)
                 d0 = fs.project_moment_free(f - fs.rho0, mu, Te)
-                f_tr = f_tr + h * fs.rho_dot(d0, t, id(self))
+                col = w_eq * fs.rho_relax(d0 / w_eq, h)
+                f_tr = f_tr + fs.project_moment_free(col, mu, Te)
             mu2, Te2, u2 = fs.recover_frame(U_new, Te_guess=Te)
             # Moment-free projection recast in the unbounded g (in-simplex, exact
             # consistency): replaces project_moment_free + pauli_reproject.  f_tr is read

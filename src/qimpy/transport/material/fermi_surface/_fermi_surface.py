@@ -359,6 +359,34 @@ class FermiSurface(Material):
             a_dot = a_dot + self.k_speed * Ga4.reshape(*a.shape)
         return self.from_modes(a_dot)
 
+    def rho_relax(self, rho: torch.Tensor, dt: float) -> torch.Tensor:
+        """EXACT modal relaxation CHANGE over dt, replacing the explicit forward-Euler
+        ``dt * rho_dot(rho)`` in the shape update.  The linear collision is DIAGONAL in the
+        mode basis (rho_dot = -rates_modal * a), so each mode has the closed-form decay
+        a_m -> a_m exp(-rate_m dt); the change to add is  a_m (exp(-rate_m dt) - 1).
+
+        A relaxation can only DAMP, so it cannot physically blow up -- the explicit step
+        did, because for a stiff mode (rate_m dt > 2) the forward-Euler factor (-rate_m dt)
+        overshoots past equilibrium (|1 - rate_m dt| > 1).  The exact factor expm1(-r dt) in
+        [-1, 0] is unconditionally stable and never overshoots, for ANY dt.  Reduces to
+        -rate_m dt (= dt * rho_dot) in the non-stiff limit, so nothing changes when it was
+        already fine.  The cyclotron generator and the nonlinear e-e operator (if present)
+        are not diagonal; they stay explicit (dt * that part) -- exact for the pure
+        relaxation-time collision (tau_ee), which is where the blow-up was."""
+        has_ee = hasattr(self, "ee_scattering")
+        if self.rates_modal.abs().sum() == 0 and self.k_speed == 0.0 and not has_ee:
+            return torch.zeros_like(rho)
+        a = self.to_modes(rho)
+        a_change = torch.expm1(-self.rates_modal * dt) * a         # exact diagonal decay
+        if has_ee:
+            a_change = a_change + dt * self.ee_scattering.a_dot(a)  # nonlinear: explicit
+        if self.k_speed:
+            Nr, dim_t = self.Nr, self.angular.dim
+            a4 = a.reshape(*a.shape[:-1], Nr, dim_t)
+            Ga4 = torch.einsum("dc,...nc->...nd", self.angular.G, a4)
+            a_change = a_change + dt * self.k_speed * Ga4.reshape(*a.shape)
+        return self.from_modes(a_change)
+
     def get_observable_names(self) -> list[str]:
         return ["n", "jx", "jy"]
 
@@ -641,22 +669,29 @@ class FermiSurface(Material):
         dgr = dg.reshape(*dg.shape[:-1], Nr, Nth)
         lam = dg.new_zeros(*dg.shape[:-1], 4)
         eye4 = torch.eye(4, dtype=dg.dtype, device=dg.device)
+        tr = 4.0                                                     # trust-region radius (in g)
         for _ in range(iters):
             arg = -xi + dgr + torch.einsum('...a,...arq->...rq', lam, B)
             f = 0.5 * (1.0 + torch.tanh(0.5 * arg))                  # in (0,1) always
             df = f - f0
             R = torch.einsum('...arq,...rq->...a', B, mw * df)       # (...,4) want 0
-            # f-metric df/darg = f(1-f), FLOORED so a fully railed cell (f->0/1 at every
-            # node, e.g. after a strong collision step) keeps a positive-definite Gram --
-            # the linear projection had a constant Gram and never saw this; the exact
-            # f-metric Gram vanishes when railed => singular solve.  Floor + a tiny
-            # relative ridge make the batched 4x4 solve unconditionally well-posed; on a
-            # railed cell lam -> ~0 (the moments can't be moved), leaving f in (0,1).
+            # f-metric df/darg = f(1-f), FLOORED so a railed node (f->0/1, e.g. a band-edge
+            # state emptying under a strong drive) keeps a positive-definite Gram; + a tiny
+            # relative ridge makes the batched 4x4 solve unconditionally well-posed.
             fp = (f * (1.0 - f)).clamp_min(1e-10)                    # floored f-metric
             Jmat = torch.einsum('...arq,...rq,...brq->...ab', B, mw * fp, B)  # (...,4,4) SPD
             ridge = 1e-12 * Jmat.diagonal(dim1=-2, dim2=-1).amax(-1).clamp_min(1e-300)
             Jmat = Jmat + ridge[..., None, None] * eye4
-            lam = lam - torch.linalg.solve(Jmat, R.unsqueeze(-1)).squeeze(-1)
+            dlam = torch.linalg.solve(Jmat, R.unsqueeze(-1)).squeeze(-1)
+            # TRUST REGION: when a node rails (f(1-f)->0) the Gram nearly nulls that
+            # direction and the raw Newton step explodes (|delta_g| -> 1e10).  Cap the
+            # per-iteration change in the argument to `tr` (scale the whole step so no node
+            # moves by > tr); railed nodes then converge in a few bounded steps instead of
+            # overshooting, keeping delta_g finite and consistency machine-precise.
+            darg = torch.einsum('...a,...arq->...rq', dlam, B)
+            amax = darg.abs().amax(dim=(-1, -2))                     # (...,) per-cell max |Δarg|
+            scale = tr / amax.clamp_min(tr)                          # (...,)  <= 1
+            lam = lam - dlam * scale.unsqueeze(-1)
         return (dgr + torch.einsum('...a,...arq->...rq', lam, B)).reshape(dg.shape)
 
     def project_moment_free(self, d, mu, Te):
