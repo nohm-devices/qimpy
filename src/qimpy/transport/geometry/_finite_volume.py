@@ -903,6 +903,92 @@ class FiniteVolume(Geometry):
              (base * (eps + fs.hbar * (ux * kx + uy * ky)
                       + 0.5 * fs.mstar * u2)).sum((-1, -2))], -1)
 
+    def _wall_ghost_dev(self, mu_bf, Te_bf, u_bf, u_g, bn,
+                        a_cp, a_gm, df_cell, df_ghost):
+        """Exact moving-measure WALL ghost-deviation (SEPARATED specular + diffuse).
+
+        Replaces the reflector's contact-frame wall ghost ``df_ghost`` (kept on contacts)
+        with  s·δf_spec + (1−s)·δf_diff  at the wall edges, chosen so the SHELL wall flux
+          _shell_dev_moment(cell, a_cp, δf_cell) + _shell_dev_moment(ghost, a_gm, δf_ghost)
+        conserves the physically-correct moments in the DRIFT (a = v·n̂ + u·n̂) measure the
+        KFVS books -- the reflector balances in the no-drift v·n̂ measure, so the moving
+        books leak tangential momentum / energy the mass-only fix ignored:
+          * mass = 0 for ANY specularity;
+          * SPECULAR (weight s): mass = tang = energy = 0 (elastic free-slip; the wall
+            pressure, i.e. NORMAL momentum, stays free);
+          * DIFFUSE  (weight 1−s): mass = 0, tang = 0 by isotropy, energy free (the
+            physical thermalization drag/heat -- NOT zeroed).
+        The analytic core Φ⁺_cell(u_bf) + Φ⁻_ghost(u_refl) already conserves mass, tang AND
+        energy exactly (Φ odd, Ψ even in u·n̂), so the entire residual is in the shell; only
+        the ghost (inflow, a_gm) branch is corrected.  Returns the full-boundary df_ghost
+        with the wall rows overwritten (contact rows untouched)."""
+        fs = self.material
+        refl = self._reflector
+        w = self._wall                                          # boundary-edge indices of walls
+        Nw = int(w.numel())
+        Nr, Nth = fs.Nr, fs.angular.N_theta
+        s = float(fs.specularity)
+        xi = fs.radial.xi                                       # (Nr,)
+        theta = fs.angular.theta                               # (Nth,)
+        # gather the wall-edge frame / geometry / one-sided speeds / interior deviation
+        muw, Tew, uw, ugw = mu_bf[w], Te_bf[w], u_bf[w], u_g[w]
+        bnw = bn[w]; nxw, nyw = bnw[:, 0], bnw[:, 1]
+        a_cpw, a_gmw = a_cp[w], a_gm[w]                         # (Nw,Nr,Nth)
+        dfcw = df_cell[w]                                       # (Nw,Nr,Nth) interior trace dev
+
+        def tang(F):                                           # tangential moment: −Jx n_y + Jy n_x
+            return -F[:, 1] * nyw + F[:, 2] * nxw
+
+        # Outflow shell moment (interior trace leaving through a_cp); shared specular+diffuse.
+        Fout4 = self._shell_dev_moment(muw, Tew, uw, a_cpw, dfcw)      # (Nw,4)
+        # ---- (1) SPECULAR: angular mirror of δf_cell about n̂ + 3-mode moving-measure balance
+        spec = fs.from_modes(refl._specular_modal(
+            fs.to_modes(dfcw.reshape(Nw, -1)))).reshape(Nw, Nr, Nth)   # R(δf_cell)
+        res4 = Fout4 + self._shell_dev_moment(muw, Tew, ugw, a_gmw, spec)   # residual (Nw,4)
+        # 3 correction modes carried by the ghost INFLOW (a_gm):
+        #   B0 = 1 (isotropic, mass), B1 = ξ' (radial, energy), B2 = sin(θ−φ_n) (tangential m=1)
+        B0 = dfcw.new_ones(Nw, Nr, Nth)
+        B1 = xi[None, :, None].expand(Nw, Nr, Nth)
+        sin_qm = (torch.sin(theta)[None, :] * nxw[:, None]            # sin(θ−φ_n), cosφ_n=n_x,
+                  - torch.cos(theta)[None, :] * nyw[:, None])         # sinφ_n=n_y (unit normal)
+        B2 = sin_qm[:, None, :].expand(Nw, Nr, Nth)
+        cols = []
+        for Bk in (B0, B1, B2):
+            Mk = self._shell_dev_moment(muw, Tew, ugw, a_gmw, Bk)     # (Nw,4)
+            cols.append(torch.stack([Mk[:, 0], tang(Mk), Mk[:, 3]], -1))   # (mass,tang,energy)
+        M = torch.stack(cols, -1)                              # (Nw,3,3): M[:,row,k]
+        rhs = -torch.stack([res4[:, 0], tang(res4), res4[:, 3]], -1)       # (Nw,3)
+        # Tiny relative ridge -> unconditionally well-posed (e.g. Nr=1 makes B1=ξ'≡0 singular).
+        ridge = 1e-14 * M.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-300)
+        M = M + ridge[:, None, None] * torch.eye(3, dtype=M.dtype, device=M.device)
+        c = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)         # (Nw,3)
+        df_spec = spec + (c[:, 0][:, None, None] * B0
+                          + c[:, 1][:, None, None] * B1
+                          + c[:, 2][:, None, None] * B2)
+        # ---- (2) DIFFUSE: isotropic FD σ(μ̃−ξ'), μ̃ set for zero moving-measure MASS flux ----
+        # Mass is LINEAR in the isotropic ghost value f_w[r]: the a_gm mass channel of
+        # _shell_dev_moment for δf=f_w[r]−f0_r is  Σ_r A_r (f_w[r]−f0_r), with
+        #   A_r = cnorm·(m* Te/ħ²)·flat_w[r]·wφ·Σ_q a_gm[r,q]   (≤ 0, monotone ⇒ bisection).
+        Jc = fs.mstar * Tew / fs.hbar ** 2                     # (Nw,)
+        A_r = (fs.cnorm * fs.angular.wphi) * (
+            Jc[:, None] * fs.radial.flat_w[None, :] * a_gmw.sum(-1))     # (Nw,Nr) ≤ 0
+        f0_r = fs.rho0.reshape(Nr, Nth)[:, 0]                  # isotropic FD per radial node
+        RHS = (A_r * f0_r[None, :]).sum(-1) - Fout4[:, 0]      # want Σ_r A_r σ(μ̃−ξ') = RHS
+        lo = dfcw.new_zeros(Nw) + refl.mu_lo                   # bracket (precomputed 0-dim)
+        hi = dfcw.new_zeros(Nw) + refl.mu_hi
+        for _ in range(50):                                    # fixed iters (compile-safe)
+            mid = 0.5 * (lo + hi)
+            h = (torch.sigmoid(mid[:, None] - xi[None, :]) * A_r).sum(-1) - RHS
+            up = h > 0.0                                       # LHS decreasing ⇒ root at larger μ̃
+            lo = torch.where(up, mid, lo)
+            hi = torch.where(up, hi, mid)
+        fw = torch.sigmoid(0.5 * (lo + hi)[:, None] - xi[None, :])       # (Nw,Nr)
+        df_diff = (fw - f0_r[None, :])[:, :, None].expand(Nw, Nr, Nth)
+        # ---- (3) combine and scatter into the full-boundary df_ghost (contacts unchanged) --
+        out = df_ghost.clone()
+        out[w] = s * df_spec + (1.0 - s) * df_diff             # torch.where(is_wall_b, ., .)
+        return out
+
     def _march_U(self, f, mu, Te, u, t, uf):
         """dU/dt from the frame-independent lab fluxes (n u, Pi, q) via a kinetic
         flux-vector-split (KFVS) shared face + boundary booking through the existing
@@ -916,6 +1002,9 @@ class FiniteVolume(Geometry):
         # pre-`* elen`), so it lives at the face midpoint.  update_stash reads these.
         self._Ff_int_dens = U.new_zeros((g.eL.shape[0], 2))
         self._Ff_bnd_dens = U.new_zeros((g.bcell.shape[0], 2))
+        # Per-boundary-edge lab MOMENTUM flux density (Jx.n^, Jy.n^) -- a diagnostic
+        # for the wall momentum balance (net tangential = -flux_Jx n_y + flux_Jy n_x).
+        self._Ff_bnd_J = U.new_zeros((g.bcell.shape[0], 2))
         # ---- interior: genuine per-cell OWN-frame kinetic flux-vector split (KFVS) ----
         # One faithful Boltzmann discretization; the U-flux is the exact lab moment of
         # the SAME per-node own-frame split that streams f (see _transportG):
@@ -980,34 +1069,30 @@ class FiniteVolume(Geometry):
             df_ghost = (f_ghost - fs.rho0).reshape(-1, Nr, Nth)
             # (1) analytic core/equilibrium FVS: Phi^+_cell + Phi^-_ghost (cell vs ghost
             # frame); at a wall the mass channel cancels (Phi_n odd, Psi_n even in u.n^),
-            # so the ~80%-of-mass filled core does not leak.  (2) shell deviation split in
-            # each OWN frame: a_cell^+ (f_cell-f0)J + a_ghost^- (f_ghost-f0)J.  All in the
-            # reconstructed boundary-face frame (same 2nd-order reconstruction as interior).
+            # so the ~80%-of-mass filled core does not leak -- AND (proved: Phi odd, Psi
+            # even in u.n^) tangential momentum and energy cancel too, so the core needs
+            # NO correction.  (2) shell deviation split in each OWN frame: a_cell^+
+            # (f_cell-f0)J + a_ghost^- (f_ghost-f0)J, reconstructed boundary-face frame.
             Php_c, _ = fs.eq_flux_pm(mu_bf, Te_bf, u_bf, bnx, bny)
             _, Phm_g = fs.eq_flux_pm(mu_bf, Te_bf, u_g, bnx, bny)
             a_cell = self._a_cell(mu_bf, Te_bf, u_bf, self._ang_bnd, bn)
             a_ghost = self._a_cell(mu_bf, Te_bf, u_g, self._ang_bnd, bn)
             a_cp = a_cell.clamp(min=0.0).reshape(-1, Nr, Nth)
             a_gm = a_ghost.clamp(max=0.0).reshape(-1, Nr, Nth)
+            # COMPLETE moving-measure WALL boundary operator (replaces the mass-only fix):
+            # a SEPARATED specular + diffuse ghost deviation whose shell wall flux conserves
+            # the physically-correct moments EXACTLY in the drift measure -- mass=0 (any s),
+            # plus specular mass+tang+energy=0 and diffuse mass=0 (its tang=0 by isotropy,
+            # energy = physical thermalization).  Contacts keep df_ghost (they carry current).
+            if self._reflector is not None and self._wall.numel():
+                df_ghost = self._wall_ghost_dev(
+                    mu_bf, Te_bf, u_bf, u_g, bn, a_cp, a_gm, df_cell, df_ghost)
             Ff_b = (Php_c + Phm_g
                     + self._shell_dev_moment(mu_bf, Te_bf, u_bf, a_cp, df_cell)
                     + self._shell_dev_moment(mu_bf, Te_bf, u_g, a_gm, df_ghost))   # (Nb,4)
-            # WALL exact mass conservation in the MOVING measure.  The reflector balances
-            # its (specular+diffuse) re-emit in the no-drift v·n̂ measure, but the moving
-            # KFVS books a=v·n̂+u·n̂, leaving a ~u·n̂ net normal MASS flux -- yet a wall passes
-            # NO particles.  Add a per-wall-edge isotropic ghost-INFLOW occupation correction
-            # c chosen so the net normal mass flux is exactly zero (contacts are skipped:
-            # they DO pass mass).  c ~ the leak (~1e-5), so the ghost stays Pauli-bounded and
-            # the induced momentum/energy change is negligible.
-            wm = fs.cnorm * (fs.radial.flat_w[:, None] * fs.angular.wphi) \
-                * (fs.mstar * Te_bf / fs.hbar ** 2)[:, None, None]           # (Nb,Nr,Nth)
-            coef = (wm * a_gm).sum((-1, -2))                                 # d(mass)/dc  (<0)
-            cwall = torch.where(self._is_wall_b & (coef.abs() > 1e-300),
-                                -Ff_b[:, 0] / coef, torch.zeros_like(coef))
-            Ff_b = Ff_b + self._shell_dev_moment(
-                mu_bf, Te_bf, u_g, a_gm, cwall[:, None, None].expand(-1, Nr, Nth))
             flux_n, flux_J, flux_E = Ff_b[:, 0], Ff_b[:, 1:3], Ff_b[:, 3]
             self._Ff_bnd_dens = torch.stack((flux_n, flux_E), dim=-1)        # (Nb,2) j.n^, q.n^
+            self._Ff_bnd_J = flux_J                                          # (Nb,2) Jx.n^, Jy.n^
             dU[:, 0].index_add_(0, bc, -flux_n * blen * iA[bc])
             dU[:, 1:3].index_add_(0, bc, -flux_J * (blen * iA[bc])[:, None])
             dU[:, 3].index_add_(0, bc, -flux_E * blen * iA[bc])
