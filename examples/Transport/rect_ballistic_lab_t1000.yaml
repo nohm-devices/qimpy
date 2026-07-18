@@ -1,0 +1,26 @@
+# Non-comoving lab-frame BALLISTIC, M_theta=1024, Nr=1, to t=1000 (long-time steadiness).
+fermi_surface:
+  kF: 1.0
+  vF: 1.5
+  M_theta: 1024
+  Nr: 1
+  tau_p: .inf
+  tau_ee: .inf
+  r_c: .inf
+  specularity: 1.0
+
+spatial_transport:
+  mesh_file: rect-domain-tri.npz
+  compile: true          # ~2.5x faster stepping (needed to reach t=1000 in ~1h)
+  contacts:
+    source:
+      dmu: +0.05
+    drain:
+      dmu: -0.05
+
+time_evolution:
+  t_max: 1000.0
+  dt_save: 20.0
+  n_collate: 8
+
+checkpoint_out: rect_lab1000_out/advect_{:04d}.h5

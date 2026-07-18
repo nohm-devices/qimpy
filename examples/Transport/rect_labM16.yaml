@@ -1,0 +1,7 @@
+fermi_surface: {kF: 1.0, vF: 1.5, M_theta: 16, Nr: 1, tau_p: .inf, tau_ee: .inf, r_c: .inf, specularity: 1.0}
+spatial_transport:
+  mesh_file: rect-domain-tri.npz
+  compile: false
+  contacts: {source: {dmu: +0.05}, drain: {dmu: -0.05}}
+time_evolution: {t_max: 50.0, dt_save: 10.0, n_collate: 1, integrator: RK2}
+checkpoint_out: rect_labM16_out/advect_{:04d}.h5

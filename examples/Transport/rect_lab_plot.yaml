@@ -1,0 +1,14 @@
+checkpoints: rect_lab_out/*.h5
+output: rect_lab_dev_frames/frame{:04d}.png
+
+density:
+  cmap: bwr
+  interpolation: bilinear
+  linthresh: 0.1
+  deviation: true
+
+streamlines:
+  transparency: no
+  density: 2
+  linewidth: 0.7
+  arrowsize: 0.5

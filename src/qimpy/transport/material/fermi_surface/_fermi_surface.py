@@ -196,6 +196,8 @@ class FermiSurface(Material):
         ee_scattering: Optional[Union[EEScattering, dict]] = None,
         moving_frame: bool = False,
         fluid_model: bool = False,
+        frame_1st_order: bool = False,
+        bj_limiter: bool = False,
         process_grid: ProcessGrid,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
@@ -205,6 +207,8 @@ class FermiSurface(Material):
         # with a MACROSCOPIC HLL Riemann solver and drops the shell entirely.
         self.fluid_model = bool(fluid_model)
         self.moving_frame = bool(moving_frame) or self.fluid_model
+        self._frame_1st_order = bool(frame_1st_order)   # debug: 1st-order (cell) frame reconstruction
+        self._bj_limiter = bool(bj_limiter)             # debug: strict Barth-Jespersen limiter
         self.kF, self.vF = kF, vF
         self.M_theta, self.Nr = M_theta, Nr
         self.T_temp, self.xi_max = T, xi_max

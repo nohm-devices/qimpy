@@ -605,9 +605,6 @@ class FiniteVolume(Geometry):
         # is (v_node(frame)+u).n, so the precomputed global a_int/_wL/_wR are kept
         # only for the ballistic fallback (material.moving_frame=False).
         self._moving = bool(getattr(material, "moving_frame", False))
-        # Fast INVISCID fluid model: march U with a MACROSCOPIC HLL Riemann solver on the
-        # equilibrium moment flux (no shell / reconstruction / projection / k-space).
-        self._fluid = bool(getattr(material, "fluid_model", False))
         self._cfl = float(cfl)
         if self._moving:
             fs = material
@@ -622,10 +619,6 @@ class FiniteVolume(Geometry):
             u0 = torch.zeros(self.K, 2, device=rc.device, dtype=v.dtype)
             self._U = fs.U_from_frame(mu0, Te0, u0)            # (K,4)
             self._Te = Te0                                     # frame-recovery warm start
-            # State is the UNBOUNDED shape variable delta-g = logit(f)+xi' (not f):
-            # f = fs.f_of_g(self._u) = sigma(-xi'+delta_g) in (0,1) for any real state.
-            # delta_g=0 <=> f=f0=rho0 (the uniform-equilibrium seed above).
-            self._u = torch.zeros(self.K, self.Nk, device=rc.device, dtype=v.dtype)
 
         self._stash_t, self._stash_i, self._stash_obs = [], [], []
         self._stash_terms = []   # per-frame (4, K_own, Nr*dim): [a, lin, quad, cub]
@@ -658,18 +651,6 @@ class FiniteVolume(Geometry):
         # entering only through the shell deviation).  Covers ALL boundary edges.
         self._is_wall_b = torch.as_tensor(
             [not is_c(nm) for nm in name_of], device=rc.device, dtype=torch.bool)
-        # Fluid model: per-boundary-edge reservoir chemical potential.  A voltage contact
-        # is an isotropic Fermi-Dirac reservoir at mu = E_F + dmu (drift u=0); walls
-        # reflect (mu unused).  (I_set / floating contacts fall back to mu=E_F here --
-        # the fluid path is the fast voltage-driven model; use the kinetic path for
-        # current-feedback contacts.)
-        # Set UNCONDITIONALLY (was fluid-only): both the fluid model AND the kinetic
-        # moving-frame contact inflow need the reservoir-frame chemical potential to
-        # evaluate the correct open-contact equilibrium FVS.
-        resmu = [material.E_F + float((self.contacts.get(nm) or {}).get("dmu", 0.0))
-                 for nm in name_of]
-        self._fluid_res_mu = torch.as_tensor(
-            resmu, device=rc.device, dtype=g.bn.dtype)
         # The full-f reflector's diffuse re-emit is NONLINEAR in the wall trace
         # (a genuine Fermi-Dirac at a per-face chemical potential), so it is
         # evaluated per step rather than collapsed into a precomputed per-edge
@@ -729,52 +710,32 @@ class FiniteVolume(Geometry):
         hi = (torch.maximum(uc, un.amax(1)) - uc)[:, None]    # headroom up   (>= 0)
         lo = (torch.minimum(uc, un.amin(1)) - uc)[:, None]    # headroom down (<= 0)
         D1 = torch.where(d >= 0, hi, lo)                      # same sign as d
-        tiny = torch.finfo(d.dtype).tiny
-        if getattr(self.material, "_bj_limiter", False):
-            # Barth-Jespersen: strict monotone clip phi = min(1, D1/d) -> the face value
-            # never leaves the neighbor [min,max] (discrete maximum principle, NO new
-            # extrema).  Kills the smooth-Venkatakrishnan grid-scale overshoot.  D1 and d
-            # are same-signed so D1/d >= 0; guard d ~ 0 (flat cell) -> phi = 1.
-            d_safe = torch.where(d.abs() > tiny, d, torch.ones_like(d))
-            phi = torch.where(d.abs() > tiny, (D1 / d_safe).clamp(0.0, 1.0),
-                              torch.ones_like(d)).amin(1)[:, None]
-        else:
-            # Venkatakrishnan (smooth, differentiable), capped at 1.  Denominator
-            # D1^2+D1 d+2 d^2+e can underflow to 0 at flat cells (0/0=NaN); guard -> phi=1.
-            e = self._vk_eps2
-            num = D1 * D1 + 2 * D1 * d + e
-            den = D1 * D1 + D1 * d + 2 * d * d + e
-            phi = torch.where(den > tiny, (num / den).clamp(max=1.0),
-                              torch.ones_like(d)).amin(1)[:, None]      # (n, 1, Nk)
+        e = self._vk_eps2
+        # Denominator is D1^2 + D1 d + 2 d^2 + e >= 2 d^2 > 0 for d != 0 in exact
+        # arithmetic, but in fp32 it can underflow to a subnormal/zero at locally
+        # flat cells (d a denormal-tiny roundoff with D1 == 0), giving 0/0 = NaN.
+        # Guard on the denominator being a normal float rather than on d != 0:
+        # where it isn't, the cell is flat and the limiter is 1 (no limiting).
+        num = D1 * D1 + 2 * D1 * d + e
+        den = D1 * D1 + D1 * d + 2 * d * d + e
+        phi = torch.where(
+            den > torch.finfo(d.dtype).tiny,
+            (num / den).clamp(max=1.0),
+            torch.ones_like(d),
+        ).amin(1)[:, None]                                    # (n, 1, Nk)
         return uc[:, None] + phi * d
 
     def _faces(self, u: torch.Tensor) -> torch.Tensor:
-        """Reconstructed face values, (K, n_face, m).  ONE reconstruction for everything --
-        the shape delta_g (m=Nk) AND the frame (mu,Te,u) (m=4) go through this SAME
-        Venkatakrishnan-limited operator, so the KFVS/HLLC face states are all 2nd-order
-        and mutually consistent.  Serial reconstructs every cell; under decomposition only
-        the rows this rank needs (owned + 1-ring) are filled, the rest left zero."""
+        """Reconstructed face values, (K, n_face, Nk). Serial reconstructs every
+        cell; under decomposition only the rows this rank needs (owned + 1-ring)
+        are filled, the rest left zero (their faces are never read)."""
         g = self.geom
         if self._R is None:
             return self._limited_faces(u, u[g.nbr], g.recon)
         R = self._R
-        uf = u.new_zeros(self.K, self._nf, u.shape[-1])
+        uf = u.new_zeros(self.K, self._nf, self.Nk)
         uf[R] = self._limited_faces(u[R], u[g.nbr[R]], g.recon[R])
         return uf
-
-    def _face_frames(self, mu, Te, u):
-        """Reconstruct the per-cell frame (mu,Te,u) to faces with the SAME limiter as the
-        shape (self._faces) -> (K*3, 4) [mu,Te,ux,uy].  Callers index the reconstruction
-        slots [eLF],[eRF],[bF] to get the one-sided L/R/boundary face frames the flux
-        consumes -- so the whole scheme (KFVS equilibrium+deviation, shape stream, fluid
-        HLLC) is 2nd-order in the frame, never cell-centered."""
-        q = torch.stack([mu, Te, u[..., 0], u[..., 1]], -1)      # (K,4)
-        if getattr(self.material, "_frame_1st_order", False):
-            # 1st-order: face frame = cell frame (piecewise constant), so the KFVS Psi
-            # dissipation is NOT reduced to 0 by MUSCL -> removes the moment-scheme
-            # odd-even (checkerboard) susceptibility.  Shape uf stays 2nd-order.
-            return q[:, None, :].expand(-1, self._nf, -1).reshape(-1, 4)
-        return self._faces(q).reshape(-1, 4)                     # (K*3,4)
 
     def _exterior(self, uMb: torch.Tensor, t: float) -> torch.Tensor:
         """Exterior ghost at boundary edges: reflector on walls, prescribed or
@@ -859,9 +820,8 @@ class FiniteVolume(Geometry):
     #  the deviation moment-free (moment(f)=U).
     # ==================================================================
     def _edge_speed(self, mu, Te, u, ang, eL, eR, bcell=None):
-        """Per-(edge, node) FACE-AVERAGE streaming velocity (v_node(frame_e)+u_e).n.
-        Kept ONLY for _frame_adv (the smooth grid-velocity advection); the KFVS U-march
-        and shape stream now use the per-cell OWN-frame _a_cell (no L/R averaging)."""
+        """Per-(edge, node) streaming velocity (v_node(frame_e)+u_e).n.
+        Interior: face-average the two neighbours' frames; boundary: the cell frame."""
         fs = self.material
         if bcell is None:
             mu_e = 0.5 * (mu[eL] + mu[eR]); Te_e = 0.5 * (Te[eL] + Te[eR])
@@ -874,131 +834,6 @@ class FiniteVolume(Geometry):
         udotn = (u_e * en).sum(-1)                                          # (Nedge,)
         return (vfac[:, :, None] * ang[:, None, :]
                 + udotn[:, None, None]).reshape(ang.shape[0], self.Nk)      # (Nedge,Nk)
-
-    def _a_cell(self, mu_c, Te_c, u_c, ang, en):
-        """Per-(edge, node) OWN-frame lab normal velocity  a_c(r,q) = (ħ/m*)k̄_c(r) k̂·n̂
-        + u_c·n̂, using ONE cell set's frame (NOT the ½(L+R) average).  All inputs are
-        per-edge: mu_c,Te_c (Ne,), u_c (Ne,2), ang = k̂·n̂ (Ne,Nθ), en = the per-edge
-        normal (Ne,2).  Same vfac formula as _edge_speed, indexed by the caller.  For a
-        boundary ghost pass the ghost drift u_c=u_g (wall: u−2(u·n̂)n̂; contact: u)."""
-        fs = self.material
-        eps = mu_c[:, None] + Te_c[:, None] * self._xi                       # (Ne,Nr)
-        vfac = (fs.hbar / fs.mstar) * torch.sqrt(
-            torch.clamp(2.0 * fs.mstar * eps, min=0.0)) / fs.hbar            # (Ne,Nr)
-        udotn = (u_c * en).sum(-1)                                          # (Ne,)
-        return (vfac[:, :, None] * ang[:, None, :]
-                + udotn[:, None, None]).reshape(ang.shape[0], self.Nk)      # (Ne,Nk)
-
-    def _shell_dev_moment(self, mu_c, Te_c, u_c, a_pm, df):
-        """Own-frame lab-weighted moment of ONE side's shell-deviation half-flux:
-        M^(m) = cnorm Σ_{r,q} flat_w wφ · w_c^(m) · (a_pm · 𝒥_c · δf),  the 4 lab moments
-        (n,Jx,Jy,E) the KFVS U-march books, with the lab weights evaluated in cell c's
-        OWN frame (donor frame, NOT the face average):
-          w_c = [1, ħk̄_c cosθ+m*u_x, ħk̄_c sinθ+m*u_y, (μ_c+T_e,c ξ')+ħ u_c·k̄_c ê+½m*|u_c|²].
-        a_pm = a_c⁺ (or a_c⁻) and df = f_c − f0, both (Ne,Nr,Nθ).  Returns (Ne,4)."""
-        fs = self.material
-        Nr, Nth = fs.Nr, fs.angular.N_theta
-        Jc = fs.mstar * Te_c / fs.hbar ** 2                                  # (Ne,)
-        h = a_pm * Jc[:, None, None] * df                                    # 𝒥 a^± δf  (Ne,Nr,Nth)
-        base = (fs.cnorm * fs.radial.flat_w[:, None] * fs.angular.wphi) * h  # (Ne,Nr,Nth)
-        kb = fs._kbar(mu_c, Te_c)[:, :, None]                                # (Ne,Nr,1)
-        cph, sph = torch.cos(fs.angular.theta), torch.sin(fs.angular.theta)
-        kx, ky = kb * cph, kb * sph
-        eps = (mu_c[:, None] + Te_c[:, None] * fs.radial.xi)[:, :, None]
-        ux, uy = u_c[:, 0][:, None, None], u_c[:, 1][:, None, None]
-        u2 = (u_c * u_c).sum(-1)[:, None, None]
-        return torch.stack(
-            [base.sum((-1, -2)),
-             (base * (fs.hbar * kx + fs.mstar * ux)).sum((-1, -2)),
-             (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2)),
-             (base * (eps + fs.hbar * (ux * kx + uy * ky)
-                      + 0.5 * fs.mstar * u2)).sum((-1, -2))], -1)
-
-    def _wall_ghost_dev(self, mu_bf, Te_bf, u_bf, u_g, bn,
-                        a_cp, a_gm, df_cell, df_ghost):
-        """Exact moving-measure WALL ghost-deviation (SEPARATED specular + diffuse).
-
-        Replaces the reflector's contact-frame wall ghost ``df_ghost`` (kept on contacts)
-        with  s·δf_spec + (1−s)·δf_diff  at the wall edges, chosen so the SHELL wall flux
-          _shell_dev_moment(cell, a_cp, δf_cell) + _shell_dev_moment(ghost, a_gm, δf_ghost)
-        conserves the physically-correct moments in the DRIFT (a = v·n̂ + u·n̂) measure the
-        KFVS books -- the reflector balances in the no-drift v·n̂ measure, so the moving
-        books leak tangential momentum / energy the mass-only fix ignored:
-          * mass = 0 for ANY specularity;
-          * SPECULAR (weight s): mass = tang = energy = 0 (elastic free-slip; the wall
-            pressure, i.e. NORMAL momentum, stays free);
-          * DIFFUSE  (weight 1−s): mass = 0, tang = 0 by isotropy, energy free (the
-            physical thermalization drag/heat -- NOT zeroed).
-        The analytic core Φ⁺_cell(u_bf) + Φ⁻_ghost(u_refl) already conserves mass, tang AND
-        energy exactly (Φ odd, Ψ even in u·n̂), so the entire residual is in the shell; only
-        the ghost (inflow, a_gm) branch is corrected.  Returns the full-boundary df_ghost
-        with the wall rows overwritten (contact rows untouched)."""
-        fs = self.material
-        refl = self._reflector
-        w = self._wall                                          # boundary-edge indices of walls
-        Nw = int(w.numel())
-        Nr, Nth = fs.Nr, fs.angular.N_theta
-        s = float(fs.specularity)
-        xi = fs.radial.xi                                       # (Nr,)
-        theta = fs.angular.theta                               # (Nth,)
-        # gather the wall-edge frame / geometry / one-sided speeds / interior deviation
-        muw, Tew, uw, ugw = mu_bf[w], Te_bf[w], u_bf[w], u_g[w]
-        bnw = bn[w]; nxw, nyw = bnw[:, 0], bnw[:, 1]
-        a_cpw, a_gmw = a_cp[w], a_gm[w]                         # (Nw,Nr,Nth)
-        dfcw = df_cell[w]                                       # (Nw,Nr,Nth) interior trace dev
-
-        def tang(F):                                           # tangential moment: −Jx n_y + Jy n_x
-            return -F[:, 1] * nyw + F[:, 2] * nxw
-
-        # Outflow shell moment (interior trace leaving through a_cp); shared specular+diffuse.
-        Fout4 = self._shell_dev_moment(muw, Tew, uw, a_cpw, dfcw)      # (Nw,4)
-        # ---- (1) SPECULAR: angular mirror of δf_cell about n̂ + 3-mode moving-measure balance
-        spec = fs.from_modes(refl._specular_modal(
-            fs.to_modes(dfcw.reshape(Nw, -1)))).reshape(Nw, Nr, Nth)   # R(δf_cell)
-        res4 = Fout4 + self._shell_dev_moment(muw, Tew, ugw, a_gmw, spec)   # residual (Nw,4)
-        # 3 correction modes carried by the ghost INFLOW (a_gm):
-        #   B0 = 1 (isotropic, mass), B1 = ξ' (radial, energy), B2 = sin(θ−φ_n) (tangential m=1)
-        B0 = dfcw.new_ones(Nw, Nr, Nth)
-        B1 = xi[None, :, None].expand(Nw, Nr, Nth)
-        sin_qm = (torch.sin(theta)[None, :] * nxw[:, None]            # sin(θ−φ_n), cosφ_n=n_x,
-                  - torch.cos(theta)[None, :] * nyw[:, None])         # sinφ_n=n_y (unit normal)
-        B2 = sin_qm[:, None, :].expand(Nw, Nr, Nth)
-        cols = []
-        for Bk in (B0, B1, B2):
-            Mk = self._shell_dev_moment(muw, Tew, ugw, a_gmw, Bk)     # (Nw,4)
-            cols.append(torch.stack([Mk[:, 0], tang(Mk), Mk[:, 3]], -1))   # (mass,tang,energy)
-        M = torch.stack(cols, -1)                              # (Nw,3,3): M[:,row,k]
-        rhs = -torch.stack([res4[:, 0], tang(res4), res4[:, 3]], -1)       # (Nw,3)
-        # Tiny relative ridge -> unconditionally well-posed (e.g. Nr=1 makes B1=ξ'≡0 singular).
-        ridge = 1e-14 * M.diagonal(dim1=-2, dim2=-1).abs().amax(-1).clamp_min(1e-300)
-        M = M + ridge[:, None, None] * torch.eye(3, dtype=M.dtype, device=M.device)
-        c = torch.linalg.solve(M, rhs.unsqueeze(-1)).squeeze(-1)         # (Nw,3)
-        df_spec = spec + (c[:, 0][:, None, None] * B0
-                          + c[:, 1][:, None, None] * B1
-                          + c[:, 2][:, None, None] * B2)
-        # ---- (2) DIFFUSE: isotropic FD σ(μ̃−ξ'), μ̃ set for zero moving-measure MASS flux ----
-        # Mass is LINEAR in the isotropic ghost value f_w[r]: the a_gm mass channel of
-        # _shell_dev_moment for δf=f_w[r]−f0_r is  Σ_r A_r (f_w[r]−f0_r), with
-        #   A_r = cnorm·(m* Te/ħ²)·flat_w[r]·wφ·Σ_q a_gm[r,q]   (≤ 0, monotone ⇒ bisection).
-        Jc = fs.mstar * Tew / fs.hbar ** 2                     # (Nw,)
-        A_r = (fs.cnorm * fs.angular.wphi) * (
-            Jc[:, None] * fs.radial.flat_w[None, :] * a_gmw.sum(-1))     # (Nw,Nr) ≤ 0
-        f0_r = fs.rho0.reshape(Nr, Nth)[:, 0]                  # isotropic FD per radial node
-        RHS = (A_r * f0_r[None, :]).sum(-1) - Fout4[:, 0]      # want Σ_r A_r σ(μ̃−ξ') = RHS
-        lo = dfcw.new_zeros(Nw) + refl.mu_lo                   # bracket (precomputed 0-dim)
-        hi = dfcw.new_zeros(Nw) + refl.mu_hi
-        for _ in range(50):                                    # fixed iters (compile-safe)
-            mid = 0.5 * (lo + hi)
-            h = (torch.sigmoid(mid[:, None] - xi[None, :]) * A_r).sum(-1) - RHS
-            up = h > 0.0                                       # LHS decreasing ⇒ root at larger μ̃
-            lo = torch.where(up, mid, lo)
-            hi = torch.where(up, hi, mid)
-        fw = torch.sigmoid(0.5 * (lo + hi)[:, None] - xi[None, :])       # (Nw,Nr)
-        df_diff = (fw - f0_r[None, :])[:, :, None].expand(Nw, Nr, Nth)
-        # ---- (3) combine and scatter into the full-boundary df_ghost (contacts unchanged) --
-        out = df_ghost.clone()
-        out[w] = s * df_spec + (1.0 - s) * df_diff             # torch.where(is_wall_b, ., .)
-        return out
 
     def _march_U(self, f, mu, Te, u, t, uf):
         """dU/dt from the frame-independent lab fluxes (n u, Pi, q) via a kinetic
@@ -1013,42 +848,48 @@ class FiniteVolume(Geometry):
         # pre-`* elen`), so it lives at the face midpoint.  update_stash reads these.
         self._Ff_int_dens = U.new_zeros((g.eL.shape[0], 2))
         self._Ff_bnd_dens = U.new_zeros((g.bcell.shape[0], 2))
-        # Per-boundary-edge lab MOMENTUM flux density (Jx.n^, Jy.n^) -- a diagnostic
-        # for the wall momentum balance (net tangential = -flux_Jx n_y + flux_Jy n_x).
-        self._Ff_bnd_J = U.new_zeros((g.bcell.shape[0], 2))
-        # ---- interior: genuine per-cell OWN-frame kinetic flux-vector split (KFVS) ----
-        # One faithful Boltzmann discretization; the U-flux is the exact lab moment of
-        # the SAME per-node own-frame split that streams f (see _transportG):
-        #   Ff = Phi^+_L + Phi^-_R                          analytic core/equilibrium FVS
-        #      + moment_L[a_L^+ (f_L-f0) J_L] + moment_R[a_R^- (f_R-f0) J_R]   shell dev.
-        # Phi^+_L+Phi^-_R == 1/2(Phi_L+Phi_R) - 1/2(Psi_R-Psi_L): the drifted-FD filled
-        # core is velocity-split (the v_F sound modes live there -> a central eq has no
-        # dissipation and forward-Euler blows up).  The DEVIATION is now split in EACH
-        # cell's OWN frame -- a_L^+ / a_R^- with donor-frame weights/J via
-        # _shell_dev_moment -- NOT the old face-average a_e + single where(a_e>0) upwind.
-        # Single-valued face flux booked +- => telescopes exactly (any per-cell frame);
-        # the |v.n^| dissipation vanishes for uniform data => exact lab flux there.
+        # ---- interior: kinetic flux-vector split (KFVS) -- NO Rusanov ----------
+        # One faithful Boltzmann discretization: the U-flux is the exact lab moment
+        # of the SAME per-node kinetic upwind that streams f (see _shape_rhs):
+        #   Ff = [ 1/2(Phi^eq_L+Phi^eq_R) - 1/2(Psi^eq_R-Psi^eq_L) ]      equilibrium
+        #      + cnorm Sum_q wk_e a_q (f_up - f0) w_a,e                    deviation.
+        # The EQUILIBRIUM is velocity-split (KFVS-on-f0): the v_F sound modes live in
+        # the frame variation, so a central equilibrium carries no dissipation and
+        # forward-Euler blows up (verified von-Neumann + 1D).  The kinetic |v.n^|
+        # moment Psi^eq supplies the per-characteristic dissipation (PSD, ~0.42-0.85
+        # v_F, sharper than Rusanov's blanket v_max).  The DEVIATION is the exact lab
+        # moment of the per-node upwind occupation f_up -- identical to the shape
+        # stream.  Single-valued face flux booked +- => telescopes exactly; the
+        # dissipation vanishes for uniform data => exact lab flux there.
         eLF, eRF = g.eLF, g.eRF
         Nr, Nth = fs.Nr, fs.angular.N_theta
         nx, ny = en[:, 0], en[:, 1]
-        # Reconstruct the frame to faces with the SAME limiter as the shape uf (2nd-order,
-        # mutually consistent): each cell's OWN one-sided face frame drives its half of the
-        # split (Phi^+_L / shell_L in L's face frame, Phi^-_R / shell_R in R's face frame).
-        qf = self._face_frames(mu, Te, u)                                   # (K*3,4)
-        muL, TeL, uL = qf[eLF][:, 0], qf[eLF][:, 1], qf[eLF][:, 2:4]
-        muR, TeR, uR = qf[eRF][:, 0], qf[eRF][:, 1], qf[eRF][:, 2:4]
-        aL = self._a_cell(muL, TeL, uL, self._ang_int, en)                  # (Ne,Nk) own frame L
-        aR = self._a_cell(muR, TeR, uR, self._ang_int, en)                  # (Ne,Nk) own frame R
-        aLp = aL.clamp(min=0.0).reshape(-1, Nr, Nth)                         # L outgoing a_L^+
-        aRm = aR.clamp(max=0.0).reshape(-1, Nr, Nth)                         # R incoming a_R^-
-        fL = fs.f_of_g(uf[eLF]); fR = fs.f_of_g(uf[eRF])                     # occupations sigma(g_face)
-        dfL = (fL - fs.rho0).reshape(-1, Nr, Nth)                            # core cancels
-        dfR = (fR - fs.rho0).reshape(-1, Nr, Nth)
-        Php_L, _ = fs.eq_flux_pm(muL, TeL, uL, nx, ny)                       # 1/2(Phi_L+Psi_L)
-        _, Phm_R = fs.eq_flux_pm(muR, TeR, uR, nx, ny)                       # 1/2(Phi_R-Psi_R)
-        Ff = (Php_L + Phm_R
-              + self._shell_dev_moment(muL, TeL, uL, aLp, dfL)
-              + self._shell_dev_moment(muR, TeR, uR, aRm, dfR))              # (Ne,4)
+        mu_e = 0.5 * (mu[eL] + mu[eR]); Te_e = 0.5 * (Te[eL] + Te[eR])
+        u_e = 0.5 * (u[eL] + u[eR])
+        a_e = self._edge_speed(mu, Te, u, self._ang_int, eL, eR)            # (Ne,Nk) v_lab.n^
+        # (1) equilibrium: central drifted-FD flux + KFVS-on-f0 kinetic dissipation
+        Ff = (0.5 * (fs.eq_flux(mu[eL], Te[eL], u[eL], nx, ny)
+                     + fs.eq_flux(mu[eR], Te[eR], u[eR], nx, ny))
+              - 0.5 * (fs.eq_abs_flux(mu[eR], Te[eR], u[eR], nx, ny)
+                       - fs.eq_abs_flux(mu[eL], Te[eL], u[eL], nx, ny)))     # (Ne,4)
+        # (2) deviation: exact lab moment of the per-node upwind occupation f_up
+        f_up = torch.where(a_e > 0, uf[eLF], uf[eRF])                        # (Ne,Nk)
+        dfu = (f_up - fs.rho0).reshape(-1, Nr, Nth)                          # core cancels
+        Jc = fs.mstar * Te_e / fs.hbar ** 2
+        wk = (fs.radial.flat_w[:, None] * fs.angular.wphi) * Jc[:, None, None]
+        ab = a_e.reshape(-1, Nr, Nth)
+        kb = fs._kbar(mu_e, Te_e)[:, :, None]
+        cph, sph = torch.cos(fs.angular.theta), torch.sin(fs.angular.theta)
+        kx, ky = kb * cph, kb * sph
+        eps = (mu_e[:, None] + Te_e[:, None] * fs.radial.xi)[:, :, None]
+        ux, uy = u_e[:, 0][:, None, None], u_e[:, 1][:, None, None]
+        base = fs.cnorm * wk * ab * dfu                                      # (Ne,Nr,Nth)
+        Ff = Ff + torch.stack(
+            [base.sum((-1, -2)),
+             (base * (fs.hbar * kx + fs.mstar * ux)).sum((-1, -2)),
+             (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2)),
+             (base * (eps + fs.hbar * (ux * kx + uy * ky)
+                      + 0.5 * fs.mstar * (u_e * u_e).sum(-1)[:, None, None])).sum((-1, -2))], -1)
         self._Ff_int_dens = torch.stack((Ff[:, 0], Ff[:, 3]), dim=-1)        # (Ne,2) j.n^, q.n^
         Ff = Ff * elen[:, None]                                              # (Ne,4)
         dU.index_add_(0, eL, -Ff * iA[eL, None])
@@ -1064,53 +905,45 @@ class FiniteVolume(Geometry):
         if g.bcell.numel():
             bn, blen, bc = g.bn, g.blen, g.bcell
             bnx, bny = bn[:, 0], bn[:, 1]
+            uMb = uf[g.bF]
+            uP = self._exterior(uMb, t)
+            u_bc = u[bc]
+            un_b = (u_bc * bn).sum(-1)                          # u.n^ (normal drift)
+            u_refl = u_bc - 2.0 * un_b[:, None] * bn            # specular: flip normal drift
+            u_g = torch.where(self._is_wall_b[:, None], u_refl, u_bc)   # wall / contact
+            u_e = 0.5 * (u_bc + u_g)                            # face-average drift
+            # (1) equilibrium KFVS split (cell frame vs ghost frame); at a wall the
+            # mass channel cancels analytically (eq_flux_n odd, eq_abs_flux_n even in
+            # the normal drift), so the ~80%-of-mass filled core no longer leaks.
+            EQ = (0.5 * (fs.eq_flux(mu[bc], Te[bc], u_bc, bnx, bny)
+                         + fs.eq_flux(mu[bc], Te[bc], u_g, bnx, bny))
+                  - 0.5 * (fs.eq_abs_flux(mu[bc], Te[bc], u_g, bnx, bny)
+                           - fs.eq_abs_flux(mu[bc], Te[bc], u_bc, bnx, bny)))     # (Nb,4)
+            # (2) shell deviation of the actual ghost, upwound by the face-average
+            # lab velocity a_b = v_node(frame) + u_e.n^ (the normal drift vanishes at
+            # a wall, so the reflector's own mass balance closes the deviation too).
+            a_b = self._edge_speed(mu, Te, u, self._ang_bnd, None, None, bcell=bc)
+            uedn = (u_e * bn).sum(-1)                           # u_e.n^ (0 at a wall)
+            a_b = a_b + (uedn - un_b)[:, None]                  # swap u.n^ -> u_e.n^
+            f_bnd = torch.where(a_b > 0, uMb, uP)               # outflow interior / inflow ghost
             Nr, Nth = fs.Nr, fs.angular.N_theta
-            qbf = qf[g.bF]                                      # reconstructed boundary-FACE frame
-            mu_bf, Te_bf, u_bf = qbf[:, 0], qbf[:, 1], qbf[:, 2:4]
-            un_b = (u_bf * bn).sum(-1)                          # u.n^ (normal drift)
-            u_refl = u_bf - 2.0 * un_b[:, None] * bn            # specular: flip normal drift
-            is_w = self._is_wall_b
-            # CONTACT FIX (must hold for ARBITRARY collisionality, incl. ballistic): a voltage
-            # contact's inflow ghost is the RESERVOIR-frame equilibrium (mu=E_F+dmu, Te=T, u=0)
-            # -- the SAME open BC step_fluid and the lab scheme use -- NOT the cell frame.  With
-            # the old u_g=u_bf, both half-fluxes shared (mu_bf,Te_bf) so the KFVS |v.n^|
-            # dissipation Psi cancelled at the contact, DROPPING (a) the 1/2[Psi_n(cell)-
-            # Psi_n(res)] ~ (dmu_cell-dmu) density-PINNING term (dipole floats/inverts) and
-            # (b) the boundary dissipation (odd-even/pressure-velocity checkerboard).  Walls
-            # keep the reflected cell frame (u_g=u_refl) -- their Psi stays alive.
-            res_mu = getattr(self, "_fluid_res_mu", None)
-            if res_mu is None:
-                res_mu = torch.full_like(mu_bf, fs.E_F)
-            mu_g = torch.where(is_w, mu_bf, res_mu)
-            Te_g = torch.where(is_w, Te_bf, torch.full_like(Te_bf, fs.T_temp))
-            u_g = torch.where(is_w[:, None], u_refl, torch.zeros_like(u_bf))   # contact reservoir at rest
-            f_cell = fs.f_of_g(uf[g.bF])                        # sigma(g_face)
-            f_ghost = self._exterior(f_cell, t)                 # wall reflect / contact FD (walls use it)
-            df_cell = (f_cell - fs.rho0).reshape(-1, Nr, Nth)
-            df_ghost = (f_ghost - fs.rho0).reshape(-1, Nr, Nth)
-            # (1) analytic core/equilibrium FVS: Phi^+_cell + Phi^-_ghost in the CELL vs GHOST
-            # (reservoir/reflected) frame; Psi no longer cancels at contacts -> restores the
-            # density-pinning + KFVS dissipation.  (2) shell deviation split in each own frame.
-            Php_c, _ = fs.eq_flux_pm(mu_bf, Te_bf, u_bf, bnx, bny)              # cell OUTFLOW half
-            _, Phm_g = fs.eq_flux_pm(mu_g, Te_g, u_g, bnx, bny)                 # ghost INFLOW (reservoir/wall)
-            a_cell = self._a_cell(mu_bf, Te_bf, u_bf, self._ang_bnd, bn)
-            a_ghost = self._a_cell(mu_g, Te_g, u_g, self._ang_bnd, bn)          # ghost frame
-            a_cp = a_cell.clamp(min=0.0).reshape(-1, Nr, Nth)
-            a_gm = a_ghost.clamp(max=0.0).reshape(-1, Nr, Nth)
-            # COMPLETE moving-measure WALL ghost deviation (walls only; masks internally).
-            if self._reflector is not None and self._wall.numel():
-                df_ghost = self._wall_ghost_dev(
-                    mu_bf, Te_bf, u_bf, u_g, bn, a_cp, a_gm, df_cell, df_ghost)
-            # Contact ghost = a reservoir cell at frame (E_F+dmu, T, 0) with shape f_res; its
-            # shell dev df_ghost = f_res - rho0 (from _exterior) is KEPT -- it is the ghost half
-            # of the interior-mirror equilibrium-shift and cancels the cell-outflow over-count,
-            # so the flux vanishes exactly at cell==reservoir (NO zeroing -- that was the bug).
-            Ff_b = (Php_c + Phm_g
-                    + self._shell_dev_moment(mu_bf, Te_bf, u_bf, a_cp, df_cell)
-                    + self._shell_dev_moment(mu_g, Te_g, u_g, a_gm, df_ghost))   # (Nb,4)
-            flux_n, flux_J, flux_E = Ff_b[:, 0], Ff_b[:, 1:3], Ff_b[:, 3]
+            dfb = (f_bnd - fs.rho0).reshape(-1, Nr, Nth)
+            Jc = fs.mstar * Te[bc] / fs.hbar ** 2
+            wk = (fs.radial.flat_w[:, None] * fs.angular.wphi) * Jc[:, None, None]
+            ab = a_b.reshape(-1, Nr, Nth)
+            kb = fs._kbar(mu[bc], Te[bc])[:, :, None]
+            cph, sph = torch.cos(fs.angular.theta), torch.sin(fs.angular.theta)
+            kx, ky = kb * cph, kb * sph
+            eps = (mu[bc][:, None] + Te[bc][:, None] * fs.radial.xi)[:, :, None]
+            ux, uy = u_e[:, 0][:, None, None], u_e[:, 1][:, None, None]
+            base = fs.cnorm * wk * ab * dfb
+            flux_n = EQ[:, 0] + base.sum((-1, -2))
+            flux_J = EQ[:, 1:3] + torch.stack(
+                [(base * (fs.hbar * kx + fs.mstar * ux)).sum((-1, -2)),
+                 (base * (fs.hbar * ky + fs.mstar * uy)).sum((-1, -2))], -1)
+            flux_E = EQ[:, 3] + (base * (eps + fs.hbar * (ux * kx + uy * ky)
+                                 + 0.5 * fs.mstar * (u_e ** 2).sum(-1)[:, None, None])).sum((-1, -2))
             self._Ff_bnd_dens = torch.stack((flux_n, flux_E), dim=-1)        # (Nb,2) j.n^, q.n^
-            self._Ff_bnd_J = flux_J                                          # (Nb,2) Jx.n^, Jy.n^
             dU[:, 0].index_add_(0, bc, -flux_n * blen * iA[bc])
             dU[:, 1:3].index_add_(0, bc, -flux_J * (blen * iA[bc])[:, None])
             dU[:, 3].index_add_(0, bc, -flux_E * blen * iA[bc])
@@ -1143,58 +976,36 @@ class FiniteVolume(Geometry):
         return out * g.inv_area.reshape((-1,) + (1,) * (out.dim() - 1))
 
     def _transportG(self, f, uf, Jz, mu, Te, u, xidot, phidot, glo, ghi, t):
-        """dG for a shell density G=f·𝒥: real-space own-frame KFVS split (the IDENTICAL
-        per-node split as _march_U -- so the U-flux deviation term IS the donor-frame
-        moment of this shape flux, node-exact at equal frames) + k-space grid-motion div
-        (14, material.kspace_div, conservative in f·𝒥 with finite ghosts).  f = cell
-        OCCUPATION sigma(-xi'+delta_g); uf = the reconstructed delta_g faces (mapped to
-        sigma here).  f=None -> the VOLUME field 𝒥 (f_L=f_R=1, ghost 1) for the GCL pass.
-        Half-flux  Ĝ = a_L^+ 𝒥_L f_L + a_R^- 𝒥_R f_R (split J, each own frame)."""
-        fs, g = self.material, self.geom
-        eL, eR, eLF, eRF, en, elen, iA = g.eL, g.eR, g.eLF, g.eRF, g.en, g.elen, g.inv_area
-        # Reconstruct the frame to faces (SAME limiter as the shape uf) -> own-frame velocity
-        # a AND face 𝒥 per side.  The shape (f) and volume (f=None) passes use the IDENTICAL
-        # reconstructed a,𝒥, so the real-space volume-GCL still cancels exactly; the k-space
-        # pass keeps the cell 𝒥 (passed Jz), whose GCL cancels independently.
-        qf = self._face_frames(mu, Te, u)
-        muL, TeL, uL = qf[eLF][:, 0], qf[eLF][:, 1], qf[eLF][:, 2:4]
-        muR, TeR, uR = qf[eRF][:, 0], qf[eRF][:, 1], qf[eRF][:, 2:4]
-        aL = self._a_cell(muL, TeL, uL, self._ang_int, en)
-        aR = self._a_cell(muR, TeR, uR, self._ang_int, en)
-        JzL = (fs.mstar / fs.hbar ** 2) * TeL; JzR = (fs.mstar / fs.hbar ** 2) * TeR   # face 𝒥
-        fL = fs.f_of_g(uf[eLF]) if f is not None else 1.0       # sigma(g_face) (full f)
-        fR = fs.f_of_g(uf[eRF]) if f is not None else 1.0
-        flux = (aL.clamp(min=0.0) * JzL[:, None] * fL
-                + aR.clamp(max=0.0) * JzR[:, None] * fR) * elen[:, None]
-        dG = torch.zeros(self.K, self.Nk, device=aL.device, dtype=aL.dtype)
+        """dG for a shell density G=f·𝒥: real-space div (mesh, per-edge frame velocity)
+        + k-space grid-motion div (14, material.kspace_div).  f=None -> the VOLUME
+        field 𝒥 (f≡1, boundary ghost f=1) for the GCL pass.  G_face = a·ℓ·(f𝒥)_up
+        with the UPWIND-cell 𝒥 so G and 𝒥 share every face/upwind decision (GCL)."""
+        g = self.geom
+        eL, eR, eLF, eRF, elen, iA = g.eL, g.eR, g.eLF, g.eRF, g.elen, g.inv_area
+        a_e = self._edge_speed(mu, Te, u, self._ang_int, eL, eR)
+        upL = a_e > 0
+        f_up = torch.where(upL, uf[eLF], uf[eRF]) if f is not None else 1.0
+        J_up = torch.where(upL, Jz[eL, None], Jz[eR, None])
+        flux = a_e * elen[:, None] * (f_up * J_up)
+        dG = torch.zeros(self.K, self.Nk, device=a_e.device, dtype=a_e.dtype)
         dG.index_add_(0, eL, -flux * iA[eL, None])
         dG.index_add_(0, eR, +flux * iA[eR, None])
         if g.bcell.numel():
-            bc, bn = g.bcell, g.bn
-            qbf = qf[g.bF]                                       # reconstructed boundary-face frame
-            mu_bf, Te_bf, u_bf = qbf[:, 0], qbf[:, 1], qbf[:, 2:4]
-            un_b = (u_bf * bn).sum(-1)                           # u.n^
-            is_w = self._is_wall_b
-            # CONTACT FIX (mirror _march_U): ghost inflow in the RESERVOIR frame (mu=E_F+dmu,
-            # Te=T, u=0).  In the reservoir's own frame its FD occupation IS rho0; the density
-            # difference is carried by the frame (res_mu), not the shape.  Walls reflect.
-            res_mu = getattr(self, "_fluid_res_mu", None)
-            if res_mu is None:
-                res_mu = torch.full_like(mu_bf, fs.E_F)
-            mu_g = torch.where(is_w, mu_bf, res_mu)
-            Te_g = torch.where(is_w, Te_bf, torch.full_like(Te_bf, fs.T_temp))
-            u_g = torch.where(is_w[:, None], u_bf - 2.0 * un_b[:, None] * bn, torch.zeros_like(u_bf))
-            a_cell = self._a_cell(mu_bf, Te_bf, u_bf, self._ang_bnd, bn)
-            a_ghost = self._a_cell(mu_g, Te_g, u_g, self._ang_bnd, bn)      # ghost (reservoir/wall) frame
+            bc = g.bcell
+            un_b = (u[bc] * g.bn).sum(-1)                        # u.n^
+            u_g = torch.where(self._is_wall_b[:, None],
+                              u[bc] - 2.0 * un_b[:, None] * g.bn, u[bc])   # wall reflect / contact
+            uedn = (0.5 * (u[bc] + u_g) * g.bn).sum(-1)          # u_e.n^ (0 at a wall)
+            a_b = self._edge_speed(mu, Te, u, self._ang_bnd, None, None, bcell=bc)
+            a_b = a_b + (uedn - un_b)[:, None]                   # same wall swap as _march_U:
+            #                                                     shape streams consistently w/ U-flux
             if f is not None:
-                f_cell = fs.f_of_g(uf[g.bF])
-                f_ghost = self._exterior(f_cell, t)                # wall reflect / contact = reservoir FD
+                uMb = uf[g.bF]; uP = self._exterior(uMb, t)
+                f_bnd = torch.where(a_b > 0, uMb, uP)
             else:
-                f_cell = 1.0; f_ghost = 1.0
-            Jb = ((fs.mstar / fs.hbar ** 2) * Te_bf)[:, None]   # cell 𝒥 (outflow)
-            Jb_g = ((fs.mstar / fs.hbar ** 2) * Te_g)[:, None]  # ghost 𝒥 (inflow, reservoir Te)
-            fluxb = (a_cell.clamp(min=0.0) * Jb * f_cell
-                     + a_ghost.clamp(max=0.0) * Jb_g * f_ghost) * g.blen[:, None]
+                f_bnd = 1.0
+            Jb = Jz[bc, None]
+            fluxb = a_b * g.blen[:, None] * (f_bnd * Jb)
             dG.index_add_(0, bc, -fluxb * iA[bc, None])
         Gf = (f * Jz[:, None]) if f is not None else Jz[:, None].expand(self.K, self.Nk)
         return dG + self.material.kspace_div(Gf, xidot, phidot, glo, ghi)
@@ -1239,7 +1050,7 @@ class FiniteVolume(Geometry):
         real-space + k-space CFL so the solver is self-stable at any passed dt (the
         CFL is not a caller/harness responsibility).  Each substep: recover frame ->
         KFVS U-march + BC -> full (14)+(18) shape transport + GCL -> recover post-frame
-        -> moment-free projection in g (project_g, in-simplex, no clip).  All at τ_p=∞."""
+        -> moment-free projection + Pauli.  All at τ_p=∞."""
         fs = self.material
         left = float(dt); n_sub = 0
         while left > 1e-12 * float(dt) + 1e-300:
@@ -1250,8 +1061,7 @@ class FiniteVolume(Geometry):
                 self._decomp.exchange(self._u)
                 self._decomp.exchange(self._U)          # ghost neighbours' conserved densities
             mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
-            uf = self._faces_fn(self._u).reshape(-1, self.Nk)   # reconstruct delta_g faces once
-            f = fs.f_of_g(self._u)                              # cell occupation sigma(-xi'+delta_g)
+            uf = self._faces_fn(self._u).reshape(-1, self.Nk)   # reconstruct faces once, reuse
             dU = self._march_U(self._u, mu, Te, u, t, uf)       # KFVS lab flux (rate; dt-free)
             # FULL shell transport (14) grid velocities.  ∂_t(μ,Tₑ,k_D) from the flux-form
             # U-march; (v+u)·∇(μ,Tₑ,k_D) in DIVERGENCE form via the transport's own flux
@@ -1269,187 +1079,23 @@ class FiniteVolume(Geometry):
             U_new = self._U + h * dU
             Jz = fs.mstar * Te / fs.hbar ** 2                    # 𝒥 (shell-constant per cell)
             Jlo = Jz[:, None, None].expand(self.K, 1, fs.angular.N_theta)
-            dG = self._transportG(f, uf, Jz, mu, Te, u, xidot, phidot,
+            dG = self._transportG(self._u, uf, Jz, mu, Te, u, xidot, phidot,
                                   Jlo, torch.zeros_like(Jlo), t)  # shape: core 𝒥 / tail 0
             dJv = self._transportG(None, uf, Jz, mu, Te, u, xidot, phidot,
                                    Jlo, Jlo, t)                   # volume GCL: 𝒥 both sides
-            # Conservative f𝒥-stream + GCL divide (route a): f_tr = f + h(dG - f·dJv)/𝒥,
-            # a convex combination under CFL -> f_tr stays in (0,1); read into the
-            # UNBOUNDED delta_g and re-pin the moments with project_g (structurally no clip).
-            f_tr = f + h * (dG - f * dJv) / Jz[:, None]
+            f_tr = self._u + h * (dG - self._u * dJv) / Jz[:, None]
             if not self._skip_collision:
                 # Collide the MOMENT-FREE deviation about f0 (project removes the four
-                # invariants {N,E,px,py}) so C[f0]=0; added in f-space (route a builds the
-                # occupation f_tr).  τ_p=∞ short-circuits this via _skip_collision.
-                # Collision in the EQUILIBRIUM-WEIGHTED (entropy/g) metric: the linearized
-                # e-e operator acts on delta-g = delta_f / w_eq (w_eq = f0(1-f0), the Fermi
-                # window), NOT on delta_f directly.  Applying it to delta_f under-weights the
-                # band-edge nodes (w_eq ~ 0.01 at xi'=+-6), so the transport pumps an edge
-                # node to f=0 while the bulk is damped -> rail.  col = w_eq * rho_relax(delta_f
-                # / w_eq) restores the edge; re-project flat-moment-free (conserve n,J,E).
-                w_eq = (fs.rho0 * (1.0 - fs.rho0)).clamp_min(1e-12)
-                d0 = fs.project_moment_free(f - fs.rho0, mu, Te)
-                col = w_eq * fs.rho_relax(d0 / w_eq, h)
-                f_tr = f_tr + fs.project_moment_free(col, mu, Te)
+                # invariants {N,E,px,py}) so C[f0]=0 and no invariant is damped in the
+                # sech² metric that the flat projection then fights.  τ_p=∞ untouched.
+                d0 = fs.project_moment_free(self._u - fs.rho0, mu, Te)
+                f_tr = f_tr + h * fs.rho_dot(d0, t, id(self))
             mu2, Te2, u2 = fs.recover_frame(U_new, Te_guess=Te)
-            # Moment-free projection recast in the unbounded g (in-simplex, exact
-            # consistency): replaces project_moment_free + pauli_reproject.  f_tr is read
-            # into delta_g (round-off guard only) and de-aliased FIRST (the frame basis
-            # {1,xi',k̄cosθ,k̄sinθ} is m<=1, i.e. represented, so project_g's added modes
-            # survive de-aliasing) -> project_g then re-pins moment(f)=U_new EXACTLY with
-            # f=sigma(.) in (0,1) at every iterate -- NO clip.  De-aliasing after project
-            # would perturb the moments through sigma's nonlinearity.
-            g_new = fs.project_g(self._dealias(fs.g_of_f(f_tr)), mu2, Te2, u2)
+            f_new = fs.pauli_reproject(fs.rho0 + fs.project_moment_free(f_tr - fs.rho0, mu2, Te2),
+                                       mu2, Te2)
             if self._owned_mask is not None:
                 U_new = torch.where(self._owned_mask, U_new, self._U)
-            self._U, self._u, self._Te = U_new, g_new, Te2
-            left -= h; t += h
-
-    def _hllc(self, UL, UR, FL, FR, nx, ny, uL, uR, pL, pR, csL, csR):
-        """HLLC MACROSCOPIC Riemann flux for the moment (Euler) system.  Unlike HLL it
-        keeps the MIDDLE contact/shear wave S_* -- the tangential velocity u_t and the
-        entropy jump ride the contact, so a shear layer is advected sharply instead of
-        being smeared by the acoustic dissipation (HLL's deep-subsonic central+c_s blend).
-
-        Davis acoustic bounds S_L=min(u_nL−c_L,u_nR−c_R), S_R=max(u_nL+c_L,u_nR+c_R); Toro
-        contact speed S_* = [p_R−p_L + ρ_L u_nL(S_L−u_nL) − ρ_R u_nR(S_R−u_nR)] /
-        [ρ_L(S_L−u_nL) − ρ_R(S_R−u_nR)]  (ρ=m*n, p=Eth).  Star state (in lab n,Jx,Jy,E),
-        ω_K=ρ_K(S_K−u_nK)/(S_K−S_*), u*_K = S_* n̂ + u_tK t̂:
-          U*_K = (ω_K/m*, ω_K u*_Kx, ω_K u*_Ky, ω_K[E_K/ρ_K+(S_*−u_nK)(S_*+p_K/(ρ_K(S_K−u_nK)))]).
-        F = F_L / F_L+S_L(U*_L−U_L) / F_R+S_R(U*_R−U_R) / F_R by the sign of S_L,S_*,S_R.
-        Single-valued in (L,R,n̂) ⇒ telescopes ⇒ conservative.  All (Ne,·).  Deeply subsonic
-        flows here keep the star states well-defined (ρ>0 floored); no HLL fallback needed."""
-        m = self.material.mstar
-        tx, ty = -ny, nx                                            # tangential t̂=(−ny,nx)
-        unL = uL[:, 0] * nx + uL[:, 1] * ny; unR = uR[:, 0] * nx + uR[:, 1] * ny
-        utL = uL[:, 0] * tx + uL[:, 1] * ty; utR = uR[:, 0] * tx + uR[:, 1] * ty
-        rhoL = m * UL[:, 0]; rhoR = m * UR[:, 0]                    # mass density
-        SL = torch.minimum(unL - csL, unR - csR)
-        SR = torch.maximum(unL + csL, unR + csR)
-        mL = rhoL * (SL - unL); mR = rhoR * (SR - unR)             # ρ(S−u_n): mL<0<mR
-        sgn = lambda x: torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
-        dstar = (mL - mR); dstar = torch.where(dstar.abs() > 1e-300, dstar, -1e-300 * sgn(dstar) - 1e-300)
-        Sstar = (pR - pL + unL * mL - unR * mR) / dstar
-        dL = SL - Sstar; dL = torch.where(dL.abs() > 1e-300, dL, dL - 1e-300)
-        dR = SR - Sstar; dR = torch.where(dR.abs() > 1e-300, dR, dR + 1e-300)
-        omL = mL / dL; omR = mR / dR                               # ρ*_L, ρ*_R
-        UsL = torch.stack([omL / m, omL * (Sstar * nx + utL * tx), omL * (Sstar * ny + utL * ty),
-                           omL * (UL[:, 3] / rhoL + (Sstar - unL) * (Sstar + pL / mL))], -1)
-        UsR = torch.stack([omR / m, omR * (Sstar * nx + utR * tx), omR * (Sstar * ny + utR * ty),
-                           omR * (UR[:, 3] / rhoR + (Sstar - unR) * (Sstar + pR / mR))], -1)
-        SL_, SR_, Ss_ = SL[:, None], SR[:, None], Sstar[:, None]
-        return torch.where(SL_ >= 0.0, FL,
-               torch.where(Ss_ >= 0.0, FL + SL_ * (UsL - UL),
-               torch.where(SR_ >= 0.0, FR + SR_ * (UsR - UR), FR)))
-
-    def step_fluid(self, t: float, dt: float) -> None:
-        """FAST INVISCID FLUID MODEL.  March the conserved moments U=(n,Jx,Jy,E) with an
-        HLLC (contact-resolving) macroscopic Riemann solver on the equilibrium flux F=eq_flux (f≡f0),
-        upwinding on the moment system's OWN characteristics u·n̂±c_s (c_s=v_F/√2) -- NOT
-        the kinetic KFVS.  No shell, no projection, no k-space ⇒ O(K) per step (much cheaper
-        than step_moving_frame); 2nd-order via the SAME MUSCL frame reconstruction (_face_frames)
-        the kinetic scheme uses.  Walls reflect (u→u−2(u·n̂)n̂: exact zero normal mass flux by the
-        S_L=−S_R symmetry); voltage contacts inject an FD reservoir at E_F+dmu.  τ_p momentum
-        sink honored; self-substeps to the acoustic CFL."""
-        fs, g = self.material, self.geom
-        eL, eR, eLF, eRF, en, elen, iA = g.eL, g.eR, g.eLF, g.eRF, g.en, g.elen, g.inv_area
-        nx, ny = en[:, 0], en[:, 1]
-        tip = float(getattr(fs, "tau_inv_p", 0.0))
-        left = float(dt); n_sub = 0
-        while left > 1e-12 * float(dt) + 1e-300:
-            n_sub += 1
-            if n_sub > 100000:
-                raise RuntimeError("step_fluid: CFL substep cap exceeded")
-            if self._decomp is not None:
-                self._decomp.exchange(self._U)
-            mu, Te, u = fs.recover_frame(self._U, Te_guess=self._Te)
-            cs = fs.sound_speed(mu, Te)                              # (K,) macroscopic c_s (for CFL)
-            # 2nd-order MUSCL: reconstruct the frame to faces with the SAME limiter as the
-            # kinetic scheme, then the own-frame KFVS split Phi^+_L + Phi^-_R (the SAME
-            # shear-dissipative flux the kinetic _march_U and the boundary use).
-            # NOT HLLC: HLLC resolves the contact/shear wave EXACTLY, so in the deeply
-            # subsonic frictionless limit (u<<c_s, tau_p=inf, free-slip walls) it applies
-            # ZERO tangential-momentum (vorticity) dissipation -- and here the numerical
-            # flux is the ONLY vorticity sink, so vorticity churned unbounded and the
-            # source->drain pressure gradient never organized.  The KFVS |v.n^| term
-            # (eq_abs_flux, Psi) supplies exactly that shear dissipation (Psi_Jt = m* u_t Psi_n).
-            qf = self._face_frames(mu, Te, u)                       # (K*3,4)
-            if getattr(fs, "_fluid_first_order", False):            # piecewise-constant (diagnostic)
-                muL, TeL, uL = mu[eL], Te[eL], u[eL]
-                muR, TeR, uR = mu[eR], Te[eR], u[eR]
-            else:
-                muL, TeL, uL = qf[eLF][:, 0], qf[eLF][:, 1], qf[eLF][:, 2:4]
-                muR, TeR, uR = qf[eRF][:, 0], qf[eRF][:, 1], qf[eRF][:, 2:4]
-            dU = torch.zeros_like(self._U)
-            if getattr(fs, "_fluid_use_hllc", True):
-                # HLLC contact-resolving Riemann on the moment (Euler) system -- BOUNDED,
-                # matches the classical Euler benchmark on this exact mesh.
-                UL = fs.U_from_frame(muL, TeL, uL); UR = fs.U_from_frame(muR, TeR, uR)
-                FL = fs.eq_flux(muL, TeL, uL, nx, ny); FR = fs.eq_flux(muR, TeR, uR, nx, ny)
-                Ff = self._hllc(UL, UR, FL, FR, nx, ny, uL, uR,
-                                fs.Eth_FD(muL, TeL), fs.Eth_FD(muR, TeR),
-                                fs.sound_speed(muL, TeL), fs.sound_speed(muR, TeR))
-            else:
-                # own-frame KFVS split Phi^+_L + Phi^-_R (diagnostic: UNSTABLE here)
-                Php_L, _ = fs.eq_flux_pm(muL, TeL, uL, nx, ny)      # outflow half from L
-                _, Phm_R = fs.eq_flux_pm(muR, TeR, uR, nx, ny)      # inflow half from R
-                Ff = Php_L + Phm_R                                  # (Ne,4)
-            self._Ff_int_dens = torch.stack((Ff[:, 0], Ff[:, 3]), dim=-1)   # staggered-plot cache
-            Ff = Ff * elen[:, None]
-            dU.index_add_(0, eL, -Ff * iA[eL, None])
-            dU.index_add_(0, eR, +Ff * iA[eR, None])
-            # boundary HLL: cell vs ghost frame (wall reflect / contact reservoir)
-            if g.bcell.numel():
-                bn, blen, bc = g.bn, g.blen, g.bcell
-                bnx, bny = bn[:, 0], bn[:, 1]
-                if getattr(fs, "_fluid_first_order", False):
-                    mu_c, Te_c, u_c = mu[bc], Te[bc], u[bc]
-                else:
-                    qbf = qf[g.bF]                                  # reconstructed boundary-face frame
-                    mu_c, Te_c, u_c = qbf[:, 0], qbf[:, 1], qbf[:, 2:4]
-                un_c = (u_c * bn).sum(-1)
-                u_refl = u_c - 2.0 * un_c[:, None] * bn
-                is_w = self._is_wall_b
-                # The fluid boundary uses the SAME own-frame KFVS equilibrium split the kinetic
-                # scheme uses -- outflow half Phi^+ from the INTERIOR, inflow half Phi^- from the
-                # GHOST -- so the contact CORRESPONDS to the kinetic FERMI-DIRAC reservoir (NOT an
-                # HLLC Riemann against a full reservoir state, which over-specifies and reflects):
-                #   wall    -> ghost = specular reflection (mu_c,Te_c,u_refl): Phi^+_cell + Phi^-_refl
-                #              cancels mass & energy exactly (Phi odd, Psi even in u.n^).
-                #   contact -> ghost = ISOTROPIC FERMI-DIRAC RESERVOIR AT REST (mu=E_F+dmu, T, u=0):
-                #              the reservoir injects its FD on the inflow characteristics while the
-                #              interior leaves freely on the outflow ones, carrying its momentum +
-                #              vorticity OUT of the domain -- a genuine open sink/source (relaxation).
-                Te_g = torch.where(is_w, Te_c, torch.full_like(Te_c, fs.T_temp))
-                mu_g = torch.where(is_w, mu_c, self._fluid_res_mu)
-                if getattr(fs, "_fluid_dirichlet_contact", False):
-                    # DIRICHLET (mu-pinning) contact: HLLC against a ghost that imposes the
-                    # reservoir mu (=E_F+dmu) with EXTRAPOLATED velocity (classical subsonic
-                    # pressure inlet/outlet).  Walls still reflect.  Pins the boundary density to
-                    # n(E_F+dmu) -> the drain shows the full static -dmu/E_F underdensity.
-                    u_g = torch.where(is_w[:, None], u_refl, u_c)      # contacts: extrapolate velocity
-                    Fb = self._hllc(fs.U_from_frame(mu_c, Te_c, u_c), fs.U_from_frame(mu_g, Te_g, u_g),
-                                    fs.eq_flux(mu_c, Te_c, u_c, bnx, bny), fs.eq_flux(mu_g, Te_g, u_g, bnx, bny),
-                                    bnx, bny, u_c, u_g, fs.Eth_FD(mu_c, Te_c), fs.Eth_FD(mu_g, Te_g),
-                                    fs.sound_speed(mu_c, Te_c), fs.sound_speed(mu_g, Te_g))
-                else:
-                    # transparent/open FD reservoir: drains CURRENT, does NOT pin density
-                    u_g = torch.where(is_w[:, None], u_refl, torch.zeros_like(u_c))
-                    Php_c, _ = fs.eq_flux_pm(mu_c, Te_c, u_c, bnx, bny)     # interior OUTFLOW half
-                    _, Phm_g = fs.eq_flux_pm(mu_g, Te_g, u_g, bnx, bny)     # ghost INFLOW half
-                    Fb = Php_c + Phm_g
-                self._Ff_bnd_dens = torch.stack((Fb[:, 0], Fb[:, 3]), dim=-1)
-                dU.index_add_(0, bc, -Fb * (blen * iA[bc])[:, None])
-            if tip:                                                 # τ_p sink (0 at τ_p=∞)
-                dU[:, 1:3] = dU[:, 1:3] - tip * self._U[:, 1:3]
-            smax = float((u.norm(dim=1) + cs).max())                # acoustic signal speed
-            h = min(left, self._cfl * float(self.geom.inradius.min()) / max(smax, 1e-30))
-            if not (h > 0.0 and np.isfinite(h)):
-                raise RuntimeError("step_fluid: non-finite CFL substep")
-            U_new = self._U + h * dU
-            if self._owned_mask is not None:
-                U_new = torch.where(self._owned_mask, U_new, self._U)
-            self._U, self._Te = U_new, Te
+            self._U, self._u, self._Te = U_new, self._dealias(f_new), Te2
             left -= h; t += h
 
     # ---- moving-frame diagnostics (conservation / consistency) ----
@@ -1465,7 +1111,7 @@ class FiniteVolume(Geometry):
         fs = self.material
         sl = slice(self._own_start, self._own_stop)
         mu, Te, u = fs.recover_frame(self._U[sl], Te_guess=self._Te[sl])
-        Uf = fs.moments_of_f(fs.f_of_g(self._u[sl]), mu, Te, u)   # state is delta_g -> f=sigma
+        Uf = fs.moments_of_f(self._u[sl], mu, Te, u)
         scale = self._U[sl].abs().mean(0).clamp_min(1e-300)
         res = ((Uf - self._U[sl]).abs() / scale).max(0).values
         return self.comm.allreduce(res) if self._mpi else res
@@ -1506,8 +1152,6 @@ class FiniteVolume(Geometry):
             self._decomp.exchange(self._u)
         uf = self._faces(self._u).reshape(-1, self.Nk)
         uMb = uf[self.geom.bF]
-        if self._moving:                                       # state is delta_g -> occupation
-            uMb = self.material.f_of_g(uMb)
         uup_b = torch.where(self._maskB, uMb, self._exterior(uMb, t))
         out = {}
         for c in self._contacts:

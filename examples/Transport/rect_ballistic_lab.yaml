@@ -1,0 +1,28 @@
+# Non-comoving (LAB-frame) BALLISTIC baseline on the rect-domain criss-cross mesh.
+# moving_frame unset -> lab-frame full-f FV; tau_p=tau_ee=r_c=.inf -> fully ballistic.
+# Nr=1 (Fermi surface), M_theta=1024 (fine angular), specular walls, source/drain +/-0.05.
+fermi_surface:
+  kF: 1.0
+  vF: 1.5
+  M_theta: 1024
+  Nr: 1
+  tau_p: .inf
+  tau_ee: .inf
+  r_c: .inf
+  specularity: 1.0
+
+spatial_transport:
+  mesh_file: rect-domain-tri.npz
+  compile: false          # first baseline run: eager (no one-time compile at M=1024)
+  contacts:
+    source:
+      dmu: +0.05
+    drain:
+      dmu: -0.05
+
+time_evolution:
+  t_max: 200.0
+  dt_save: 10.0
+  n_collate: 8
+
+checkpoint_out: rect_lab_out/advect_{:04d}.h5

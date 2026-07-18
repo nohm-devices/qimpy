@@ -1,0 +1,29 @@
+# MOVING-MESH (comoving) version of the rect ballistic test case.
+# Same params as the lab baseline; moving_frame + integrator MovingFrame select step_moving_frame.
+fermi_surface:
+  kF: 1.0
+  vF: 1.5
+  M_theta: 1024
+  Nr: 1
+  tau_p: .inf
+  tau_ee: .inf
+  r_c: .inf
+  specularity: 1.0
+  moving_frame: true
+
+spatial_transport:
+  mesh_file: rect-domain-tri.npz
+  compile: true           # step_moving_frame is eager-launch-bound (~10 s/step); compile is mandatory
+  contacts:
+    source:
+      dmu: +0.05
+    drain:
+      dmu: -0.05
+
+time_evolution:
+  t_max: 50.0
+  dt_save: 10.0
+  n_collate: 1
+  integrator: MovingFrame
+
+checkpoint_out: rect_mv_out/advect_{:04d}.h5

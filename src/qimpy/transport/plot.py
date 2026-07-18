@@ -366,6 +366,8 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
                          if has_faces else None)
         for fr, (i_step, t) in enumerate(zip(i_step_list, t_list)):
             n_val = obs[fr, :, fcol]                     # (K,) per-cell scalar
+            if density.get("deviation", False):
+                n_val = n_val - float(np.nanmean(n_val))
             vmax = float(np.nanmax(np.abs(n_val)))
             if not np.isfinite(vmax) or vmax == 0.0:
                 vmax = 1.0
