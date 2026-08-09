@@ -1,0 +1,33 @@
+# rect-domain driven by source/drain contacts, solved with the DG triangle-mesh
+# advection (tri_set). The mesh is supplied externally (qimpy does not mesh).
+#
+# FermiSurface-migrated version of examples/Transport/rect-domain-tri.yaml:
+# the retired `fermi_circle_modes` material was replaced by the unified
+# `fermi_surface` material. Nr=1 recovers the Fermi-circle limit (one Fermi-
+# surface state, angular Fourier modes only) = the original behavior.
+#   M -> M_theta,  tau-p/tau-ee -> tau_p/tau_ee,  kF/vF/r_c unchanged.
+# To run on the symmetric mesh, set mesh_file: rect-domain-tri-sym.npz
+fermi_surface:
+  kF: 1.0
+  vF: 1.5
+  tau_p: .inf
+  tau_ee: .inf
+  M_theta: 12
+  Nr: 1
+  r_c: 10.0
+
+tri_set:
+  mesh_file: rect-domain-tri.npz
+  order: 3
+  contacts:
+    source:
+      dmu: +0.1
+    drain:
+      dmu: -0.1
+
+time_evolution:
+  t_max: 1000.0
+  dt_save: 5.0
+  n_collate: 32
+
+checkpoint_out: animation/advect_{:04d}.h5
