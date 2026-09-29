@@ -5,6 +5,7 @@ conservation (closed-domain mass, conservative contact-current readout) and the
 full contact parity with the DG solver (fixed-voltage, floating probe, current
 source). Run directly (serial) or under pytest.
 """
+
 from __future__ import annotations
 import os
 import tempfile
@@ -17,7 +18,7 @@ from qimpy import rc
 from qimpy.mpi import ProcessGrid
 from ..material import FermiSurface
 from ._mesh import load_mesh, save_mesh
-from ._finite_volume import FiniteVolume, build_fv_geom
+from ._geometry import Geometry, build_fv_geom
 
 # ⛔ CACHE THE PROCESS GRID.  Under MPI, ProcessGrid.get_comm was a free
 # communicator split.  Upstream's torch.distributed get_group splits a real
@@ -35,7 +36,6 @@ def _cached_pg(dim_names: str, shape) -> ProcessGrid:
     return _PG_CACHE[key]
 
 
-
 # --------------------------------------------------------------------------- #
 #  mesh generators (self-contained; qimpy does not mesh -- `triangle` is used
 #  here only to produce small fixtures for the tests)
@@ -44,10 +44,12 @@ def _make_rect_mesh(grid_spacing, path, all_walls=False):
     """rect-domain [5,105]x[5,55] with source/drain contact faces (mirrors
     examples/.../rect-domain.svg); all_walls=True closes it into a cavity."""
     import triangle as tr
+
     pts = np.array([[5, 5], [105, 5], [105, 55], [5, 55]], float)
     seg = np.array([[0, 1], [1, 2], [2, 3], [3, 0]])
-    m = tr.triangulate({"vertices": pts, "segments": seg},
-                       f"pq30a{grid_spacing ** 2:g}")
+    m = tr.triangulate(
+        {"vertices": pts, "segments": seg}, f"pq30a{grid_spacing ** 2:g}"
+    )
     V, T = m["vertices"], m["triangles"]
     ec: Counter = Counter()
     for t in T:
@@ -89,8 +91,14 @@ def _make_periodic_rect(n, L, path):
         be += [[idx(i, 0), idx(i + 1, 0)], [idx(i, n), idx(i + 1, n)]]
     for j in range(n):
         be += [[idx(0, j), idx(0, j + 1)], [idx(n, j), idx(n, j + 1)]]
-    save_mesh(path, V, np.array(T), np.array(be), ["periodic"] * len(be),
-              lattice=[[L, 0.0], [0.0, L]])
+    save_mesh(
+        path,
+        V,
+        np.array(T),
+        np.array(be),
+        ["periodic"] * len(be),
+        lattice=[[L, 0.0], [0.0, L]],
+    )
     return path
 
 
@@ -118,11 +126,15 @@ def _make_strip_mesh(nx, ny, Lx, Ly, alpha_deg, path):
             T += [[a_, b_, c_], [a_, c_, d_]]
     be, bm = [], []
     for i in range(nx):
-        be.append([idx(i, 0), idx(i + 1, 0)]); bm.append("wall")
-        be.append([idx(i, ny), idx(i + 1, ny)]); bm.append("wall")
+        be.append([idx(i, 0), idx(i + 1, 0)])
+        bm.append("wall")
+        be.append([idx(i, ny), idx(i + 1, ny)])
+        bm.append("wall")
     for j in range(ny):
-        be.append([idx(0, j), idx(0, j + 1)]); bm.append("periodic")
-        be.append([idx(nx, j), idx(nx, j + 1)]); bm.append("periodic")
+        be.append([idx(0, j), idx(0, j + 1)])
+        bm.append("periodic")
+        be.append([idx(nx, j), idx(nx, j + 1)])
+        bm.append("periodic")
     save_mesh(path, V, np.array(T), np.array(be), bm, lattice=[[Lx * c, Lx * s]])
     return path
 
@@ -132,6 +144,7 @@ def _make_disk_mesh(R, n_seg, max_area, path, center=(50.0, 30.0)):
     segments, every boundary edge a reflective wall. The boundary normals span
     all orientations, so it exercises the wall reflector at arbitrary angles."""
     import triangle as tr
+
     th = np.linspace(0.0, 2 * np.pi, n_seg, endpoint=False)
     pts = np.column_stack([center[0] + R * np.cos(th), center[1] + R * np.sin(th)])
     seg = np.column_stack([np.arange(n_seg), (np.arange(n_seg) + 1) % n_seg])
@@ -155,7 +168,7 @@ def _make_line_mesh(nx, path, Lx=1.0, ends=("source", "drain")):
     x = np.linspace(0.0, Lx, nx + 1)
     V = np.column_stack([x, np.zeros(nx + 1)])
     cells = np.column_stack([np.arange(nx), np.arange(1, nx + 1)])
-    be = np.array([[0, 0], [nx, nx]], int)                # ends as degenerate (v,v)
+    be = np.array([[0, 0], [nx, nx]], int)  # ends as degenerate (v,v)
     save_mesh(path, V, cells, be, list(ends))
     return path
 
@@ -165,12 +178,22 @@ def _build_fv(contacts, *, mesh_path=None, gs=12.0, vF=1.5, M=8, **mat_kw):
     tmp = tempfile.mkdtemp()
     path = mesh_path or _make_rect_mesh(gs, os.path.join(tmp, "rect.npz"))
     pg = _cached_pg("rk", (1, 1))
-    kw = dict(kF=1.0, vF=vF, M_theta=M, Nr=1, T=1.0,
-              tau_p=np.inf, tau_ee=np.inf, r_c=np.inf, specularity=1.0)
+    kw = dict(
+        kF=1.0,
+        vF=vF,
+        M_theta=M,
+        Nr=1,
+        T=1.0,
+        tau_p=np.inf,
+        tau_ee=np.inf,
+        r_c=np.inf,
+        specularity=1.0,
+    )
     kw.update(mat_kw)
     material = FermiSurface(process_grid=pg, **kw)
-    geom = FiniteVolume(material=material, mesh_file=path, contacts=contacts,
-                 process_grid=pg)
+    geom = Geometry(
+        material=material, mesh_file=path, contacts=contacts, process_grid=pg
+    )
     return geom, material
 
 
@@ -196,8 +219,8 @@ def _obs_weights(material, t=0.0):
     """(3, Nk) weights [n, jx, jy]: the staggered-output refactor reduced
     get_observables to the density row; rebuild the current weights from it and
     the transport velocity (j = int f v)."""
-    nw = material.get_observables(t)[0]                       # (Nk,)
-    v = material.transport_velocity                           # (Nk, 2)
+    nw = material.get_observables(t)[0]  # (Nk,)
+    v = material.transport_velocity  # (Nk, 2)
     return torch.stack([nw, nw * v[:, 0], nw * v[:, 1]])
 
 
@@ -220,7 +243,7 @@ def test_lsq_gradient_is_exact_on_linear_fields() -> None:
     dev = g.recon.device
     grad = torch.tensor([0.37, -1.21], dtype=torch.float64, device=dev)
     cen = torch.from_numpy(g.centroid_np).to(dev)
-    u = (cen @ grad)[:, None]                            # (K, 1) linear field
+    u = (cen @ grad)[:, None]  # (K, 1) linear field
     d = torch.einsum("kfg,kgc->kfc", g.recon, u[g.nbr] - u[:, None])  # (K,3,1)
     d_exact = torch.einsum("kfx,x->kf", _face_offsets(g).to(dev), grad)
     assert float((d[..., 0] - d_exact).abs().max()) < 1e-11
@@ -259,7 +282,7 @@ def test_closed_domain_conserves_mass() -> None:
     tmp = tempfile.mkdtemp()
     path = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"), all_walls=True)
     geom, _ = _build_fv({}, mesh_path=path)
-    geom._u = torch.randn(geom.K, geom.Nk, device=rc.device)   # arbitrary state
+    geom._u = torch.randn(geom.K, geom.Nk, device=rc.device)  # arbitrary state
     assert abs(_mass_rate(geom)) < 1e-9
 
 
@@ -306,7 +329,7 @@ def test_floating_contact_reads_uniform_potential() -> None:
     geom, _ = _build_fv({"source": {"dmu": 0.1}, "drain": {"floating": True}})
     for V0 in (0.05, -0.1, 0.2):
         geom._u = torch.full((geom.K, geom.Nk), float(V0), device=rc.device)
-        geom.contact_currents(0.0)                       # solves the feedback level
+        geom.contact_currents(0.0)  # solves the feedback level
         assert abs(geom.contact_potentials()["drain"] - V0) < 1e-12
 
 
@@ -326,13 +349,15 @@ def test_current_source_delivers_prescribed_current() -> None:
     I_target = 0.05
     geom, _ = _build_fv(
         {"source": {"I_set": -I_target}, "drain": {"I_set": +I_target}},
-        tau_p=15.0, tau_ee=8.0)
+        tau_p=15.0,
+        tau_ee=8.0,
+    )
     _step(geom, 40)
     I = geom.contact_currents(0.0)
     assert abs(I["source"] + I_target) < 1e-10, I["source"]
     assert abs(I["drain"] - I_target) < 1e-10, I["drain"]
     V = geom.contact_potentials()
-    assert V["source"] > V["drain"]                      # injector sits at higher mu
+    assert V["source"] > V["drain"]  # injector sits at higher mu
 
 
 def test_current_source_polarity_reverses_with_sign() -> None:
@@ -340,7 +365,8 @@ def test_current_source_polarity_reverses_with_sign() -> None:
     torch.set_default_dtype(torch.float64)
     gp, _ = _build_fv({"source": {"I_set": -0.02}, "drain": {"I_set": +0.02}})
     gn, _ = _build_fv({"source": {"I_set": +0.02}, "drain": {"I_set": -0.02}})
-    _step(gp, 40); _step(gn, 40)
+    _step(gp, 40)
+    _step(gn, 40)
     Ip, In = gp.contact_currents(0.0), gn.contact_currents(0.0)
     Vp, Vn = gp.contact_potentials(), gn.contact_potentials()
     assert abs(Ip["source"] + In["source"]) < 1e-10
@@ -364,8 +390,8 @@ def test_reflective_walls_conserve_mass_long_time() -> None:
     geom, mat = _build_fv({}, mesh_path=path)
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
-    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0 ** 2))   # (K,)
-    geom._u = blob[:, None].repeat(1, geom.Nk)                      # isotropic = density
+    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0**2))  # (K,)
+    geom._u = blob[:, None].repeat(1, geom.Nk)  # isotropic = density
     m0 = _integral(geom, mat, 0)
     _step(geom, _steps_for(geom, 30.0))
     assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
@@ -393,14 +419,21 @@ def test_cartesian_reflective_walls_conserve_mass() -> None:
     path = _make_rect_mesh(10.0, os.path.join(tmp, "rect.npz"), all_walls=True)
     pg = _cached_pg("rk", (1, 1))
     material = FermiSurface(
-        process_grid=pg, kF=1.0, vF=1.5, M_theta=8, Nr=1, T=1.0,
-        tau_p=np.inf, tau_ee=np.inf, specularity=1.0,
-        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32))
-    geom = FiniteVolume(material=material, mesh_file=path, contacts={},
-                        process_grid=pg)
+        process_grid=pg,
+        kF=1.0,
+        vF=1.5,
+        M_theta=8,
+        Nr=1,
+        T=1.0,
+        tau_p=np.inf,
+        tau_ee=np.inf,
+        specularity=1.0,
+        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32),
+    )
+    geom = Geometry(material=material, mesh_file=path, contacts={}, process_grid=pg)
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
-    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0 ** 2))
+    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0**2))
     geom._u = blob[:, None].repeat(1, geom.Nk)
     w = material.representation.get_density_weight()
     mass = lambda: float((geom.geom.area[:, None] * geom._u * w[None]).sum())
@@ -430,9 +463,18 @@ def test_cartesian_wall_energy_and_pressure() -> None:
     torch.set_default_dtype(torch.float64)
     pg = _cached_pg("rk", (1, 1))
     material = FermiSurface(
-        process_grid=pg, kF=7.5e-3, vF=0.11194, M_theta=32, Nr=6, T=1.3301e-5,
-        xi_max=6.0, tau_p=np.inf, tau_ee=np.inf, specularity=1.0,
-        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0))
+        process_grid=pg,
+        kF=7.5e-3,
+        vF=0.11194,
+        M_theta=32,
+        Nr=6,
+        T=1.3301e-5,
+        xi_max=6.0,
+        tau_p=np.inf,
+        tau_ee=np.inf,
+        specularity=1.0,
+        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0),
+    )
     rep = material.representation
     th = torch.linspace(0.0, 2 * np.pi, 17, device=rc.device)[:-1]
     n = torch.stack([th.cos(), th.sin()], -1)
@@ -442,16 +484,22 @@ def test_cartesian_wall_energy_and_pressure() -> None:
     vn = (v[None] * n[:, None]).sum(-1)
     t_hat = torch.stack([-n[:, 1], n[:, 0]], -1)
     vt = (v[None] * t_hat[:, None]).sum(-1) / vmax
-    e_c = (((rep.k ** 2).sum(-1) / (2 * rep.m_star) - rep.mu)
-           / (rep.xi_max * rep.T_temp))[None].expand_as(vt)
+    e_c = (
+        ((rep.k**2).sum(-1) / (2 * rep.m_star) - rep.mu) / (rep.xi_max * rep.T_temp)
+    )[None].expand_as(vt)
     w_in, w_out = vn.abs() * (vn < 0), vn.abs() * (vn > 0)
     kD = 0.03 * torch.tensor([1.0, 0.3], device=rc.device)
     eps = ((rep.k - kD) ** 2).sum(-1) / (2 * rep.m_star)
-    u = (torch.special.expit(-(eps - rep.mu) / rep.T_temp)
-         - rep._f0_lab)[None].repeat(n.shape[0], 1)
+    u = (torch.special.expit(-(eps - rep.mu) / rep.T_temp) - rep._f0_lab)[None].repeat(
+        n.shape[0], 1
+    )
     out = refl(u[None])[0]
-    for name, wgt in (("particle", torch.ones_like(vt)), ("tangential", vt),
-                      ("energy", e_c), ("pressure", vn.abs() / vmax)):
+    for name, wgt in (
+        ("particle", torch.ones_like(vt)),
+        ("tangential", vt),
+        ("energy", e_c),
+        ("pressure", vn.abs() / vmax),
+    ):
         lhs = (w_in * wgt * out).sum(-1)
         rhs = (w_out * wgt * u).sum(-1)
         scale = (w_out * wgt.abs() * u.abs()).sum(-1).clamp(min=1e-300)
@@ -482,9 +530,17 @@ def test_cartesian_wall_specularity() -> None:
     n = torch.stack([th.cos(), th.sin()], -1)
     for s in (0.0, 0.5, 1.0):
         material = FermiSurface(
-            process_grid=pg, kF=1.0, vF=1.5, M_theta=8, Nr=1, T=1.0,
-            tau_p=np.inf, tau_ee=np.inf, specularity=s,
-            cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32))
+            process_grid=pg,
+            kF=1.0,
+            vF=1.5,
+            M_theta=8,
+            Nr=1,
+            T=1.0,
+            tau_p=np.inf,
+            tau_ee=np.inf,
+            specularity=s,
+            cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32),
+        )
         rep = material.representation
         refl = material.get_reflector(n)
         v = material.transport_velocity
@@ -494,8 +550,9 @@ def test_cartesian_wall_specularity() -> None:
         w_in, w_out = vn.abs() * (vn < 0), vn.abs() * (vn > 0)
         kD = 0.03 * torch.tensor([1.0, 0.3], device=rc.device)
         eps = ((rep.k - kD) ** 2).sum(-1) / (2 * rep.m_star)
-        u = (torch.special.expit(-(eps - rep.mu) / rep.T_temp)
-             - rep._f0_lab)[None].repeat(n.shape[0], 1)
+        u = (torch.special.expit(-(eps - rep.mu) / rep.T_temp) - rep._f0_lab)[
+            None
+        ].repeat(n.shape[0], 1)
         out = refl(u[None])[0]
         for wgt, tgt in ((torch.ones_like(vt), 1.0), (vt, s)):
             lhs = (w_in * wgt * out).sum(-1)
@@ -511,7 +568,7 @@ def test_cartesian_wall_specularity() -> None:
         if bool(good.any()):
             ratio = r2[good] / s2[good]
             assert float((ratio - s).abs().max()) < 1e-10, (s, float(ratio.max()))
-        if s == 0.0:                       # the refill must be the Maxwell law
+        if s == 0.0:  # the refill must be the Maxwell law
             # ⛔ The Maxwell law for a DEGENERATE gas is not "flat in k".
             # A diffuse wall re-emits electrons thermalised to the wall, at a
             # mu_w fixed by particle-flux balance, so what it returns is
@@ -530,8 +587,8 @@ def test_cartesian_wall_specularity() -> None:
             # reaching f = -2.04e-6 where the physical occupancy is 1.5e-17.
             # What is constant is the RATIO to the envelope.
             fw = torch.special.expit(
-                -((rep.k ** 2).sum(-1) / (2 * rep.m_star) - rep.mu)
-                / rep.T_temp)
+                -((rep.k**2).sum(-1) / (2 * rep.m_star) - rep.mu) / rep.T_temp
+            )
             envelope = fw * (1.0 - fw)
             envelope = envelope / envelope.max()
             for e in range(n.shape[0]):
@@ -544,8 +601,9 @@ def test_cartesian_wall_specularity() -> None:
             for e in range(n.shape[0]):
                 far = (w_in[e] > 0) & (envelope < 1e-20)
                 if bool(far.any()):
-                    assert float(out[e][far].abs().max()) < 1e-20, \
-                        float(out[e][far].abs().max())
+                    assert float(out[e][far].abs().max()) < 1e-20, float(
+                        out[e][far].abs().max()
+                    )
 
 
 def test_cartesian_wall_conserves_flux_and_shear() -> None:
@@ -561,9 +619,17 @@ def test_cartesian_wall_conserves_flux_and_shear() -> None:
     torch.set_default_dtype(torch.float64)
     pg = _cached_pg("rk", (1, 1))
     material = FermiSurface(
-        process_grid=pg, kF=1.0, vF=1.5, M_theta=8, Nr=1, T=1.0,
-        tau_p=np.inf, tau_ee=np.inf, specularity=1.0,
-        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32))
+        process_grid=pg,
+        kF=1.0,
+        vF=1.5,
+        M_theta=8,
+        Nr=1,
+        T=1.0,
+        tau_p=np.inf,
+        tau_ee=np.inf,
+        specularity=1.0,
+        cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=32),
+    )
     rep = material.representation
     th = torch.linspace(0.0, 2 * np.pi, 17, device=rc.device)[:-1]  # all angles
     n = torch.stack([th.cos(), th.sin()], -1)
@@ -578,12 +644,14 @@ def test_cartesian_wall_conserves_flux_and_shear() -> None:
     # is the only one with a non-degenerate tangential moment)
     kD = 0.03 * torch.tensor([1.0, 0.3], device=rc.device)
     eps = ((rep.k - kD) ** 2).sum(-1) / (2 * rep.m_star)
-    drift = (torch.special.expit(-(eps - rep.mu) / rep.T_temp) - rep._f0_lab)
-    for u in (torch.rand(n.shape[0], rep.k.shape[0], device=rc.device),
-              torch.ones(n.shape[0], rep.k.shape[0], device=rc.device),
-              drift[None].repeat(n.shape[0], 1)):
+    drift = torch.special.expit(-(eps - rep.mu) / rep.T_temp) - rep._f0_lab
+    for u in (
+        torch.rand(n.shape[0], rep.k.shape[0], device=rc.device),
+        torch.ones(n.shape[0], rep.k.shape[0], device=rc.device),
+        drift[None].repeat(n.shape[0], 1),
+    ):
         out = refl(u[None])[0]
-        for wgt in (torch.ones_like(vt), vt):           # particle, then shear
+        for wgt in (torch.ones_like(vt), vt):  # particle, then shear
             lhs = (w_in * wgt * out).sum(-1)
             rhs = (w_out * wgt * u).sum(-1)
             # Normalise by the ABSOLUTE-value integral, not by |rhs|: for an
@@ -591,8 +659,9 @@ def test_cartesian_wall_conserves_flux_and_shear() -> None:
             # dividing by it compares roundoff with roundoff (this test read 1.5
             # for a residual of 1.7e-13 before the scale was fixed).
             scale = (w_out * wgt.abs() * u.abs()).sum(-1).max().clamp(min=1e-300)
-            assert float((lhs - rhs).abs().max() / scale) < 1e-12, \
-                float((lhs - rhs).abs().max() / scale)
+            assert float((lhs - rhs).abs().max() / scale) < 1e-12, float(
+                (lhs - rhs).abs().max() / scale
+            )
     # and it must stay LINEAR: _setup_boundary caches it as a dense matrix by
     # pushing the Nk basis vectors through, which assumes additivity.
     a = torch.rand(n.shape[0], rep.k.shape[0], device=rc.device)
@@ -607,17 +676,18 @@ def test_oblique_wall_conserves_tangential_momentum() -> None:
     specular reflection. Holds to round-off with the (D,T) reflector; the older
     single-D scheme drifts ~1e-4 here -- this is the discriminating test."""
     torch.set_default_dtype(torch.float64)
-    alpha = 23.7                                       # oblique: not 0/45/90 deg
-    a = np.deg2rad(alpha); ca, sa = float(np.cos(a)), float(np.sin(a))
+    alpha = 23.7  # oblique: not 0/45/90 deg
+    a = np.deg2rad(alpha)
+    ca, sa = float(np.cos(a)), float(np.sin(a))
     Lx, Ly = 40.0, 20.0
     tmp = tempfile.mkdtemp()
     mesh = _make_strip_mesh(8, 4, Lx, Ly, alpha, os.path.join(tmp, "strip.npz"))
     geom, mat = _build_fv({}, mesh_path=mesh)
     cen = geom.geom.centroid_np
     d_perp = -sa * cen[:, 0] + ca * cen[:, 1] - 0.5 * Ly
-    blob = np.exp(-(d_perp ** 2) / (2 * 2.0 ** 2))                  # (K,)
-    theta = mat.angular.theta.detach().cpu().numpy()               # (Nk,)
-    u0 = 1.0 * blob[:, None] + 0.3 * np.cos(theta - a)[None, :]     # density + drift
+    blob = np.exp(-(d_perp**2) / (2 * 2.0**2))  # (K,)
+    theta = mat.angular.theta.detach().cpu().numpy()  # (Nk,)
+    u0 = 1.0 * blob[:, None] + 0.3 * np.cos(theta - a)[None, :]  # density + drift
     geom._u = torch.as_tensor(u0, device=rc.device, dtype=torch.float64)
     n0 = _integral(geom, mat, 0)
     J0 = ca * _integral(geom, mat, 1) + sa * _integral(geom, mat, 2)
@@ -650,8 +720,9 @@ def test_biased_contacts_balance_at_steady_state() -> None:
     checked here is the *relative* imbalance |I_s + I_d| / |I_s|. Stepped with
     collisions, since a ballistic cavity rings rather than settling."""
     torch.set_default_dtype(torch.float64)
-    geom, _ = _build_fv({"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}},
-                        tau_p=15.0, tau_ee=8.0)
+    geom, _ = _build_fv(
+        {"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}}, tau_p=15.0, tau_ee=8.0
+    )
     _step(geom, _steps_for(geom, 600.0))
     I = geom.contact_currents(0.0)
     assert abs(I["source"]) > 1e-3, "no current flowing"
@@ -671,7 +742,7 @@ def test_curved_mass_conservation() -> None:
     geom, mat = _build_fv({}, mesh_path=path)
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([50.0, 30.0], dtype=torch.float64, device=rc.device)
-    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 5.0 ** 2))
+    blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 5.0**2))
     geom._u = blob[:, None].repeat(1, geom.Nk)
     m0 = _integral(geom, mat, 0)
     _step(geom, _steps_for(geom, 30.0))
@@ -691,26 +762,40 @@ def _decomp_worker() -> None:
     torch.set_default_dtype(torch.float64)
     pg = _cached_pg("rk", None)
     pg.provide_n_tasks("k", 1)
-    mat = FermiSurface(kF=1.0, vF=1.5, M_theta=8, Nr=1, T=1.0,
-                       tau_p=15.0, tau_ee=8.0, r_c=np.inf, specularity=1.0,
-                       process_grid=pg)
-    geom = FiniteVolume(material=mat, mesh_file=os.environ["FV_MPI_MESH"],
-                  contacts={"source": {"dmu": 0.1}, "drain": {"floating": True}},
-                  process_grid=pg)
+    mat = FermiSurface(
+        kF=1.0,
+        vF=1.5,
+        M_theta=8,
+        Nr=1,
+        T=1.0,
+        tau_p=15.0,
+        tau_ee=8.0,
+        r_c=np.inf,
+        specularity=1.0,
+        process_grid=pg,
+    )
+    geom = Geometry(
+        material=mat,
+        mesh_file=os.environ["FV_MPI_MESH"],
+        contacts={"source": {"dmu": 0.1}, "drain": {"floating": True}},
+        process_grid=pg,
+    )
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     geom._u = torch.zeros(geom.K, geom.Nk, device=rc.device)
-    geom._u[:, 0] = 0.01 * (1.0 + cen[:, 0] / 100.0 + cen[:, 1] / 50.0)  # partition-invariant
+    geom._u[:, 0] = 0.01 * (
+        1.0 + cen[:, 0] / 100.0 + cen[:, 1] / 50.0
+    )  # partition-invariant
     dt = 0.5 * geom.dt_max
     for _ in range(30):
         r0 = geom.rho
         geom.rho = r0 + dt * geom.rho_dot(r0 + 0.5 * dt * geom.rho_dot(r0, 0.0), 0.0)
-    owned = geom._u[geom._own_start:geom._own_stop].detach().cpu().numpy()
+    owned = geom._u[geom._own_start : geom._own_stop].detach().cpu().numpy()
     parts = rc.comm.gather(owned, root=0)
     if rc.comm.rank == 0:
-        full = np.concatenate(parts, axis=0)            # renumbered order
+        full = np.concatenate(parts, axis=0)  # renumbered order
         u = np.empty_like(full)
         if geom._perm is not None:
-            u[geom._perm] = full                        # back to input order
+            u[geom._perm] = full  # back to input order
         else:
             u = full
         np.save(os.environ["FV_MPI_OUT"], u)
@@ -724,9 +809,10 @@ def test_1d_line_mesh_ballistic_is_antisymmetric() -> None:
     torch.set_default_dtype(torch.float64)
     tmp = tempfile.mkdtemp()
     mesh = _make_line_mesh(40, os.path.join(tmp, "line.npz"))
-    geom, mat = _build_fv({"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}},
-                          mesh_path=mesh)
-    assert geom._nf == 2                                   # interval cells -> 2 faces
+    geom, mat = _build_fv(
+        {"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}}, mesh_path=mesh
+    )
+    assert geom._nf == 2  # interval cells -> 2 faces
     _step(geom, _steps_for(geom, 20.0))
     x = geom.geom.centroid_np[:, 0]
     obs = torch.einsum("oc,kc->ko", _obs_weights(mat), geom._u)
@@ -746,6 +832,7 @@ def test_decomp_matches_serial() -> None:
     mpirun -n 2) and compares; needs mpirun + pymetis."""
     import subprocess
     import sys
+
     tmp = tempfile.mkdtemp()
     mesh = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"))
     mod = "qimpy.transport.geometry.test_finite_volume"
@@ -758,9 +845,11 @@ def test_decomp_matches_serial() -> None:
     # with EADDRINUSE.  That makes the failure ORDER-DEPENDENT: run this test
     # alone and it passes, run the suite and it dies -- which is exactly how it
     # slipped through a full-suite run that reported 145 passed.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE",
-                        "LOCAL_RANK")}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE", "LOCAL_RANK")
+    }
     env["FV_MPI_MESH"] = mesh
 
     # ⛔ NCCL REFUSES TWO RANKS ON ONE GPU ("invalid usage", NCCLUtils.cpp:77),
@@ -773,37 +862,61 @@ def test_decomp_matches_serial() -> None:
     if torch.cuda.device_count() < 2:
         env["BACKEND"] = "gloo"
         env["CUDA_VISIBLE_DEVICES"] = ""
-    subprocess.run([sys.executable, "-m", mod], check=True, env=dict(env, FV_MPI_OUT=f1))
-    subprocess.run(["mpirun", "-n", "2", sys.executable, "-m", mod], check=True,
-                   env=dict(env, FV_MPI_OUT=f2))
+    subprocess.run(
+        [sys.executable, "-m", mod], check=True, env=dict(env, FV_MPI_OUT=f1)
+    )
+    subprocess.run(
+        ["mpirun", "-n", "2", sys.executable, "-m", mod],
+        check=True,
+        env=dict(env, FV_MPI_OUT=f2),
+    )
     u1, u2 = np.load(f1), np.load(f2)
     assert np.allclose(u1, u2, atol=1e-12, rtol=0), float(np.abs(u1 - u2).max())
 
 
 if __name__ == "__main__":
-    if os.environ.get("FV_MPI_OUT"):           # subprocess worker for the test above
+    if os.environ.get("FV_MPI_OUT"):  # subprocess worker for the test above
         _decomp_worker()
         raise SystemExit
     rc.init()
-    test_lsq_gradient_is_exact_on_linear_fields(); print("lsq_gradient_exact: PASS")
-    test_periodic_lattice_promotes_all_boundary_edges(); print("periodic_promote: PASS")
-    test_closed_domain_conserves_mass(); print("closed_domain_mass: PASS")
-    test_contact_current_readout_is_conservative(); print("contact_readout_conservative: PASS")
-    test_floating_contact_carries_no_current(); print("floating_zero_current: PASS")
-    test_floating_contact_reads_uniform_potential(); print("floating_reads_potential: PASS")
-    test_current_source_zero_equals_floating(); print("current_source_zero: PASS")
-    test_current_source_delivers_prescribed_current(); print("current_source_delivers: PASS")
-    test_current_source_polarity_reverses_with_sign(); print("current_source_polarity: PASS")
-    test_reflective_walls_conserve_mass_long_time(); print("reflective_mass_long_time: PASS")
-    test_cartesian_reflective_walls_conserve_mass(); print("cartesian_wall_mass: PASS")
-    test_cartesian_wall_conserves_flux_and_shear(); print("cartesian_wall_flux_shear: PASS")
-    test_cartesian_wall_specularity(); print("cartesian_wall_specularity: PASS")
-    test_cartesian_wall_energy_and_pressure(); print("cartesian_wall_energy_pressure: PASS")
-    test_oblique_wall_conserves_tangential_momentum(); print("oblique_wall_tang_momentum: PASS")
-    test_contact_driven_state_is_bounded(); print("contact_driven_bounded: PASS")
-    test_biased_contacts_balance_at_steady_state(); print("biased_balance: PASS")
-    test_curved_mass_conservation(); print("curved_mass_conservation: PASS")
-    test_decomp_matches_serial(); print("decomp_matches_serial: PASS")
+    test_lsq_gradient_is_exact_on_linear_fields()
+    print("lsq_gradient_exact: PASS")
+    test_periodic_lattice_promotes_all_boundary_edges()
+    print("periodic_promote: PASS")
+    test_closed_domain_conserves_mass()
+    print("closed_domain_mass: PASS")
+    test_contact_current_readout_is_conservative()
+    print("contact_readout_conservative: PASS")
+    test_floating_contact_carries_no_current()
+    print("floating_zero_current: PASS")
+    test_floating_contact_reads_uniform_potential()
+    print("floating_reads_potential: PASS")
+    test_current_source_zero_equals_floating()
+    print("current_source_zero: PASS")
+    test_current_source_delivers_prescribed_current()
+    print("current_source_delivers: PASS")
+    test_current_source_polarity_reverses_with_sign()
+    print("current_source_polarity: PASS")
+    test_reflective_walls_conserve_mass_long_time()
+    print("reflective_mass_long_time: PASS")
+    test_cartesian_reflective_walls_conserve_mass()
+    print("cartesian_wall_mass: PASS")
+    test_cartesian_wall_conserves_flux_and_shear()
+    print("cartesian_wall_flux_shear: PASS")
+    test_cartesian_wall_specularity()
+    print("cartesian_wall_specularity: PASS")
+    test_cartesian_wall_energy_and_pressure()
+    print("cartesian_wall_energy_pressure: PASS")
+    test_oblique_wall_conserves_tangential_momentum()
+    print("oblique_wall_tang_momentum: PASS")
+    test_contact_driven_state_is_bounded()
+    print("contact_driven_bounded: PASS")
+    test_biased_contacts_balance_at_steady_state()
+    print("biased_balance: PASS")
+    test_curved_mass_conservation()
+    print("curved_mass_conservation: PASS")
+    test_decomp_matches_serial()
+    print("decomp_matches_serial: PASS")
     print("ALL PASS")
 
 
@@ -834,9 +947,18 @@ def test_cartesian_wall_preserves_occupancy_bounds() -> None:
     torch.set_default_dtype(torch.float64)
     pg = _cached_pg("rk", (1, 1))
     material = FermiSurface(
-        process_grid=pg, kF=7.5e-3, vF=0.11194, M_theta=32, Nr=6, T=1.3301e-5,
-        xi_max=6.0, tau_p=np.inf, tau_ee=np.inf, specularity=1.0,
-        cartesian=dict(annulus_xi=0.0, te_fac_max=6.0))
+        process_grid=pg,
+        kF=7.5e-3,
+        vF=0.11194,
+        M_theta=32,
+        Nr=6,
+        T=1.3301e-5,
+        xi_max=6.0,
+        tau_p=np.inf,
+        tau_ee=np.inf,
+        specularity=1.0,
+        cartesian=dict(annulus_xi=0.0, te_fac_max=6.0),
+    )
     rep = material.representation
     f0 = rep._f0_lab
     th = torch.linspace(0.0, 2 * np.pi, 17, device=rc.device)[:-1]
@@ -888,9 +1010,18 @@ def test_diffuse_wall_alpha_threshold() -> None:
 
     def reflect(s, te_fac):
         material = FermiSurface(
-            process_grid=pg, kF=7.5e-3, vF=0.11194, M_theta=32, Nr=6,
-            T=1.3301e-5, xi_max=6.0, tau_p=np.inf, tau_ee=np.inf,
-            specularity=s, cartesian=dict(annulus_xi=0.0, te_fac_max=6.0))
+            process_grid=pg,
+            kF=7.5e-3,
+            vF=0.11194,
+            M_theta=32,
+            Nr=6,
+            T=1.3301e-5,
+            xi_max=6.0,
+            tau_p=np.inf,
+            tau_ee=np.inf,
+            specularity=s,
+            cartesian=dict(annulus_xi=0.0, te_fac_max=6.0),
+        )
         rep = material.representation
         f0 = rep._f0_lab
         th = torch.linspace(0.0, 2 * np.pi, 17, device=rc.device)[:-1]
@@ -905,12 +1036,12 @@ def test_diffuse_wall_alpha_threshold() -> None:
         alpha = float((out[:, sel] / shell[sel]).abs().max())
         return f0[None] + out, alpha
 
-    for te_fac in (1.0, 2.0, 4.0):                 # below the threshold
+    for te_fac in (1.0, 2.0, 4.0):  # below the threshold
         f, alpha = reflect(0.0, te_fac)
         assert alpha < 1.0, (te_fac, alpha)
         assert float(f.min()) > -1e-14, (te_fac, float(f.min()))
         assert float(f.max()) < 1.0 + 1e-12, (te_fac, float(f.max()))
-    f, alpha = reflect(0.0, 5.6)                   # above it
+    f, alpha = reflect(0.0, 5.6)  # above it
     assert alpha > 1.0, alpha
     assert float(f.max()) > 1.0, float(f.max())
     # a specular wall never engages the refill at all

@@ -1,11 +1,10 @@
 from typing import Optional, Sequence, Union
 
-from qimpy import rc, log, TreeNode
-from qimpy.rc import MPI
+from qimpy import log, TreeNode
 from qimpy.io import CheckpointPath, Checkpoint, CheckpointContext
 from qimpy.mpi import ProcessGrid
 from qimpy.profiler import stopwatch
-from .geometry import Geometry, FiniteVolume
+from .geometry import Geometry
 from .material import Material, FermiSurface
 from .material.ab_initio import AbInitio
 from .material.single_band import SingleBand
@@ -23,7 +22,7 @@ class Transport(TreeNode):
         ab_initio: Optional[Union[AbInitio, dict]] = None,
         fermi_surface: Optional[Union[FermiSurface, dict]] = None,
         single_band: Optional[Union[SingleBand, dict]] = None,
-        spatial_transport: Optional[Union[FiniteVolume, dict]] = None,
+        geometry: Optional[Union[Geometry, dict]] = None,
         time_evolution: Optional[Union[TimeEvolution, dict]] = None,
         checkpoint: Optional[str] = None,
         checkpoint_out: Optional[str] = None,
@@ -45,10 +44,10 @@ class Transport(TreeNode):
         single_band
             :yaml:`Single-band model material for energy-resolved charge transport.`
             Exactly one supported material type must be specified.
-        spatial_transport
-            :yaml:`Cell-centered finite-volume spatial transport on an external
-            mesh (triangles in 2D, line segments in 1D).`
-            Exactly one supported geometry type must be specified.
+        geometry
+            :yaml:`Geometry specification for spatial transport.`
+            Specifies a cell-centered finite-volume transport on a mesh consisting
+            of triangles in 2D and line segments in 1D.
         time_evolution
             :yaml:`Time integration options.`
         checkpoint
@@ -63,9 +62,7 @@ class Transport(TreeNode):
             auto-determined based on number of tasks available to split along them.
             Default: all process grid dimensions are auto-determined."""
         super().__init__()
-        self.process_grid = ProcessGrid(
-            "rk", process_grid_shape
-        )
+        self.process_grid = ProcessGrid("rk", process_grid_shape)
         self.process_grid.provide_n_tasks("k", 1)  # prefer r-split if unspecified
         # Set in and out checkpoints:
         checkpoint_in = CheckpointPath()
@@ -93,17 +90,13 @@ class Transport(TreeNode):
             ),
             have_default=False,
         )
-        self.add_child_one_of(
+        self.add_child(
             "geometry",
+            Geometry,
+            geometry,
             checkpoint_in,
-            TreeNode.ChildOptions(
-                "spatial_transport",
-                FiniteVolume,
-                spatial_transport,
-                material=self.material,
-                process_grid=self.process_grid,
-            ),
-            have_default=False,
+            material=self.material,
+            process_grid=self.process_grid,
         )
         self.add_child(
             "time_evolution",

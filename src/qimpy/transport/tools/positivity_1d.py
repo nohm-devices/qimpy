@@ -34,6 +34,7 @@ the same quantity that reads [-1.66e-2, 1.026] on the production mixer.
 ⛔ 1e3 STEPS MINIMUM.  A 40-step run showed no violation on a case that is badly
 unbounded by 1e4 steps; the growth is slow and early cleanliness proves nothing.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -47,16 +48,30 @@ import torch
 from qimpy import rc
 from qimpy.mpi import ProcessGrid
 from qimpy.transport.material import FermiSurface
-from qimpy.transport.geometry import FiniteVolume
+from qimpy.transport.geometry import Geometry
 from qimpy.transport.geometry._mesh import save_mesh
 
 torch.set_default_dtype(torch.float64)
 
 # production mixer material, so the answer transfers to the runs we care about
-CFG = dict(kF=7.5e-3, vF=0.11194, M_theta=32, Nr=6, T=1.3301e-5, xi_max=6.0,
-           tau_p=float("inf"), specularity=1.0,
-           cartesian=dict(annulus_xi=0.0, te_fac_max=6.0, kD_max=1.2e-3,
-                          dmu_max=1.2e-4, k_max=0.0132557160008, n_k=56))
+CFG = dict(
+    kF=7.5e-3,
+    vF=0.11194,
+    M_theta=32,
+    Nr=6,
+    T=1.3301e-5,
+    xi_max=6.0,
+    tau_p=float("inf"),
+    specularity=1.0,
+    cartesian=dict(
+        annulus_xi=0.0,
+        te_fac_max=6.0,
+        kD_max=1.2e-3,
+        dmu_max=1.2e-4,
+        k_max=0.0132557160008,
+        n_k=56,
+    ),
+)
 DMU = 5.37e-5
 
 
@@ -75,10 +90,16 @@ def build(nx: int):
     mat = FermiSurface(process_grid=pg, **CFG)
     tmp = tempfile.mkdtemp()
     mesh = uniform_line(nx, os.path.join(tmp, "line.npz"))
-    geom = FiniteVolume(
-        material=mat, mesh_file=mesh, process_grid=pg, compile=False,
-        contacts={"source": {"dmu": DMU, "nonlinear": True},
-                  "drain": {"dmu": -DMU, "nonlinear": True}})
+    geom = Geometry(
+        material=mat,
+        mesh_file=mesh,
+        process_grid=pg,
+        compile=False,
+        contacts={
+            "source": {"dmu": DMU, "nonlinear": True},
+            "drain": {"dmu": -DMU, "nonlinear": True},
+        },
+    )
     return geom, mat
 
 
@@ -106,8 +127,15 @@ def run(nx: int, scheme: str, cfl: float, steps: int) -> dict:
     for s in range(steps):
         u = advance(geom, u, dt, scheme)
         if not torch.isfinite(u).all():
-            return dict(nx=nx, scheme=scheme, cfl=cfl, steps=s, diverged=True,
-                        min_f=float("nan"), max_f=float("nan"))
+            return dict(
+                nx=nx,
+                scheme=scheme,
+                cfl=cfl,
+                steps=s,
+                diverged=True,
+                min_f=float("nan"),
+                max_f=float("nan"),
+            )
         if (s + 1) % 25 == 0 or s == steps - 1:
             f = f0 + u
             mn, mx = float(f.min()), float(f.max())
@@ -122,11 +150,22 @@ def run(nx: int, scheme: str, cfl: float, steps: int) -> dict:
     f = f0 + u
     n_lo = int((f < 0.0).sum())
     n_hi = int((f > 1.0).sum())
-    return dict(nx=nx, scheme=scheme, cfl=cfl, steps=steps, diverged=False,
-                min_f=lo, max_f=hi, over=hi - 1.0,
-                n_below_0=n_lo, n_above_1=n_hi, n_total=int(f.numel()),
-                first_min_step=lo_step, first_max_step=hi_step,
-                bounded=bool(lo >= -1e-14 and hi <= 1 + 1e-14))
+    return dict(
+        nx=nx,
+        scheme=scheme,
+        cfl=cfl,
+        steps=steps,
+        diverged=False,
+        min_f=lo,
+        max_f=hi,
+        over=hi - 1.0,
+        n_below_0=n_lo,
+        n_above_1=n_hi,
+        n_total=int(f.numel()),
+        first_min_step=lo_step,
+        first_max_step=hi_step,
+        bounded=bool(lo >= -1e-14 and hi <= 1 + 1e-14),
+    )
 
 
 def main() -> None:
@@ -138,20 +177,27 @@ def main() -> None:
     rc.init()
     out = []
     print(f"  uniform 1D, nx={a.nx}, {a.steps} steps, production mixer material")
-    print(f"  {'scheme':>8} {'CFL':>6} {'min f':>13} {'max f - 1':>13} "
-          f"{'#<0':>7} {'#>1':>7}  bounded")
+    print(
+        f"  {'scheme':>8} {'CFL':>6} {'min f':>13} {'max f - 1':>13} "
+        f"{'#<0':>7} {'#>1':>7}  bounded"
+    )
     for scheme in ("RK2", "SSPRK3"):
         for cfl in (0.9, 0.5, 0.25, 0.1, 0.05):
             r = run(a.nx, scheme, cfl, a.steps)
             out.append(r)
             if r["diverged"]:
-                print(f"  {scheme:>8} {cfl:>6.2f}   DIVERGED at step {r['steps']}",
-                      flush=True)
+                print(
+                    f"  {scheme:>8} {cfl:>6.2f}   DIVERGED at step {r['steps']}",
+                    flush=True,
+                )
                 continue
             tag = "yes" if r["bounded"] else "NO"
-            print(f"  {scheme:>8} {cfl:>6.2f} {r['min_f']:>13.3e} "
-                  f"{r['over']:>13.3e} {r['n_below_0']:>7d} {r['n_above_1']:>7d}"
-                  f"  {tag}", flush=True)
+            print(
+                f"  {scheme:>8} {cfl:>6.2f} {r['min_f']:>13.3e} "
+                f"{r['over']:>13.3e} {r['n_below_0']:>7d} {r['n_above_1']:>7d}"
+                f"  {tag}",
+                flush=True,
+            )
     with open(a.out, "w") as fh:
         json.dump(out, fh, indent=1)
 
