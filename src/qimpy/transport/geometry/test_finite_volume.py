@@ -17,8 +17,8 @@ import torch
 from qimpy import rc
 from qimpy.mpi import ProcessGrid
 from ..material import FermiSurface
-from ._mesh import load_mesh, save_mesh
-from ._geometry import Geometry, build_fv_geom
+from ._mesh import load_mesh, save_mesh, build_fv_geom
+from ._geometry import Geometry
 
 # ⛔ CACHE THE PROCESS GRID.  Under MPI, ProcessGrid.get_comm was a free
 # communicator split.  Upstream's torch.distributed get_group splits a real
