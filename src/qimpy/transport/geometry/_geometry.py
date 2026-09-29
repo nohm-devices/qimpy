@@ -32,7 +32,7 @@ from qimpy import rc, log, TreeNode
 from qimpy.io import CheckpointPath, InvalidInputException, CheckpointContext
 from qimpy.mpi import ProcessGrid, all_reduce_scalars
 from ..material import Material
-from ._mesh import load_mesh, build_fv_geom
+from ._mesh import Mesh, build_fv_geom
 
 
 # --------------------------------------------------------------------------- #
@@ -62,8 +62,7 @@ def _dual_graph(EToV) -> list[list[int]]:
 def _coordinate_part(mesh, nparts: int) -> np.ndarray:
     """Fallback partition (no METIS): sort cells along the longer axis into
     equal-count blocks. Correct but with poorer locality on branchy meshes."""
-    V = np.stack([mesh.VX, mesh.VY], axis=1)
-    cen = V[np.asarray(mesh.EToV, int)].mean(axis=1)
+    cen = mesh.vertices[np.asarray(mesh.triangles, int)].mean(axis=1)
     # ⛔ NumPy 2.0 removed ndarray.ptp; the free function still exists.
     # This one line broke EVERY multi-rank run -- the decomposition could
     # not even be built -- so the halo exchange had never executed under
@@ -85,7 +84,7 @@ def partition(mesh, group: "dist.ProcessGroup") -> tuple[np.ndarray, np.ndarray]
     so every rank agrees exactly; falls back to a coordinate sort if pymetis is
     not installed.
     """
-    K = len(mesh.EToV)
+    K = len(mesh.triangles)
     nparts = group.size()
     if nparts == 1:
         return np.arange(K), np.array([0, K], int)
@@ -94,7 +93,7 @@ def partition(mesh, group: "dist.ProcessGroup") -> tuple[np.ndarray, np.ndarray]
         try:
             import pymetis
 
-            _, p = pymetis.part_graph(nparts, adjacency=_dual_graph(mesh.EToV))
+            _, p = pymetis.part_graph(nparts, adjacency=_dual_graph(mesh.triangles))
             part = np.asarray(p, np.int32)
         except ImportError:
             part = _coordinate_part(mesh, nparts)
@@ -281,14 +280,14 @@ class Geometry(TreeNode):
         self.save_terms = save_terms
         self._vk_eps2 = float(vk_eps2)
 
-        self.mesh = load_mesh(mesh_file)
+        self.mesh = Mesh.load(mesh_file)
         self._mpi = self.group.size() > 1
         if self._mpi:
             # METIS min-cut partition, renumbered so each rank owns a contiguous
             # block (compact halos + direct checkpoint slices). Keep the
             # permutation so the renumbered solution maps back to the input order.
             self._perm, bounds = partition(self.mesh, self.group)
-            self.mesh.EToV = np.asarray(self.mesh.EToV, int)[self._perm]
+            self.mesh.triangles = np.asarray(self.mesh.triangles, int)[self._perm]
         else:
             self._perm, bounds = None, None
         g = build_fv_geom(self.mesh, dtype=material.transport_velocity.dtype)

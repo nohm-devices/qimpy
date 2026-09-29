@@ -39,56 +39,55 @@ from qimpy import rc
 
 
 @dataclass
-class MeshResult:
+class Mesh:
     """The mesh as :class:`FiniteVolume` consumes it (output of :func:`load_mesh`)."""
 
-    VX: np.ndarray
-    VY: np.ndarray
-    EToV: np.ndarray
+    vertices: np.ndarray
+    triangles: np.ndarray
     edge_marker: dict  # sorted (vi, vj) -> marker id (>0)
     marker_names: list  # id -> name (id 0 reserved/unused)
     projectors: dict  # id -> curve-projection fn, or None (straight)
     cell_regions: Optional[np.ndarray] = None  # (K,) str, '' = no region
     _lattice: Optional[list] = None
 
+    @staticmethod
+    def load(path: str) -> Mesh:
+        """Read from file (see module docstring for the format)."""
+        d = np.load(path, allow_pickle=True)
+        vertices = np.asarray(d["vertices"], float)
+        triangles = np.asarray(d["triangles"], int)
 
-def load_mesh(path: str) -> MeshResult:
-    """Read an external triangle mesh (see module docstring for the format)."""
-    d = np.load(path, allow_pickle=True)
-    V = np.asarray(d["vertices"], float)
-    EToV = np.asarray(d["triangles"], int)
-    VX = V[:, 0].copy()
-    VY = V[:, 1].copy()
+        edge_marker: dict = {}
+        marker_names = ["_"]  # id 0 reserved
+        if "boundary_edges" in d and "boundary_markers" in d:
+            be = np.asarray(d["boundary_edges"], int)
+            bn = [str(x) for x in np.asarray(d["boundary_markers"]).ravel()]
+            name_id: dict = {}
+            for (a, b), name in zip(be, bn):
+                if name not in name_id:
+                    name_id[name] = len(marker_names)
+                    marker_names.append(name)
+                edge_marker[tuple(sorted((int(a), int(b))))] = name_id[name]
+        projectors = {i: None for i in range(len(marker_names))}
 
-    edge_marker: dict = {}
-    marker_names = ["_"]  # id 0 reserved
-    if "boundary_edges" in d and "boundary_markers" in d:
-        be = np.asarray(d["boundary_edges"], int)
-        bn = [str(x) for x in np.asarray(d["boundary_markers"]).ravel()]
-        name_id: dict = {}
-        for (a, b), name in zip(be, bn):
-            if name not in name_id:
-                name_id[name] = len(marker_names)
-                marker_names.append(name)
-            edge_marker[tuple(sorted((int(a), int(b))))] = name_id[name]
-    projectors = {i: None for i in range(len(marker_names))}
-
-    cell_regions = None
-    if "cell_regions" in d:
-        cell_regions = np.asarray(
-            [str(x) for x in np.asarray(d["cell_regions"]).ravel()], dtype=object
-        )
-        if len(cell_regions) != len(EToV):
-            raise ValueError(
-                f"cell_regions has {len(cell_regions)} entries for "
-                f"{len(EToV)} triangles in {path}"
+        cell_regions = None
+        if "cell_regions" in d:
+            cell_regions = np.asarray(
+                [str(x) for x in np.asarray(d["cell_regions"]).ravel()], dtype=object
             )
-    mesh = MeshResult(VX, VY, EToV, edge_marker, marker_names, projectors, cell_regions)
-    if "lattice" in d:
-        lat = np.asarray(d["lattice"], float)
-        if lat.size:
-            mesh._lattice = [row.copy() for row in lat]
-    return mesh
+            if len(cell_regions) != len(triangles):
+                raise ValueError(
+                    f"cell_regions has {len(cell_regions)} entries for "
+                    f"{len(triangles)} triangles in {path}"
+                )
+        mesh = Mesh(
+            vertices, triangles, edge_marker, marker_names, projectors, cell_regions
+        )
+        if "lattice" in d:
+            lat = np.asarray(d["lattice"], float)
+            if lat.size:
+                mesh._lattice = [row.copy() for row in lat]
+        return mesh
 
 
 def save_mesh(
@@ -166,10 +165,10 @@ def build_fv_geom(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     Dispatches on cell type: 3 vertices/cell -> 2D triangles, 2 vertices/cell ->
     a 1D line mesh (interval cells; see :func:`_build_fv_geom_1d`).
     """
-    tri = np.asarray(mesh.EToV, dtype=int)
+    tri = np.asarray(mesh.triangles, dtype=int)
     if tri.shape[1] == 2:
         return _build_fv_geom_1d(mesh, dtype=dtype)
-    V = np.stack([mesh.VX, mesh.VY], axis=1).astype(float)
+    V = mesh.vertices
     K = len(tri)
     p = V[tri]  # (K, 3, 2)
     e1, e2 = p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]
@@ -319,8 +318,8 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     face (the domain ends), whose marker is looked up as ``(v, v)``.  The material
     is untouched -- velocities stay 2D; only ``v_x = v.n`` streams along the line.
     """
-    V = np.stack([mesh.VX, mesh.VY], axis=1).astype(float)  # (Nv, 2), VY ~ 0
-    seg = np.asarray(mesh.EToV, dtype=int)  # (K, 2): [v_left, v_right]
+    V = mesh.vertices
+    seg = np.asarray(mesh.triangles, dtype=int)  # (K, 2): [v_left, v_right]
     K = len(seg)
     p = V[seg]  # (K, 2, 2): endpoints
     centroid = p.mean(axis=1)  # (K, 2)
