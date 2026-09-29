@@ -15,6 +15,7 @@ Same trick as outputs/test_kick_logic.py: ast-extract the real functions from
 the repo file and drive them with a stub `collision_dot`, so the code under
 test is the exact text that will be deployed -- not a paraphrase.
 """
+
 import ast
 import os
 import sys
@@ -27,8 +28,9 @@ import h5py
 # ⛔ ..: this script lives in transport/tools/, the file it ast-parses is in
 # transport/.  A sibling-directory join silently pointed at a nonexistent path
 # after the move.
-SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                   "_time_evolution.py")
+SRC = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_time_evolution.py"
+)
 tree = ast.parse(open(SRC).read())
 
 WANT_FN = {"_amax", "_patches", "_clone", "_amax_where"}
@@ -47,10 +49,20 @@ class _Log:
 
 
 log = _Log()
-class Geometry: pass
-class TensorList(list): pass
-ns = {"torch": torch, "np": np, "h5py": h5py, "os": os, "log": log,
-      "Geometry": Geometry, "TensorList": TensorList}
+
+
+class Geometry:
+    pass
+
+
+ns = {
+    "torch": torch,
+    "np": np,
+    "h5py": h5py,
+    "os": os,
+    "log": log,
+    "Geometry": Geometry,
+}
 exec("from __future__ import annotations", ns)
 
 for node in tree.body:
@@ -85,6 +97,7 @@ class Geom:
 
 class TE:
     """Stub TimeEvolution carrying only what _collision_kick touches."""
+
     _RHO_ATOL = ns["_RHO_ATOL"]
     _MAX_SUBSTEPS = ns["_MAX_SUBSTEPS"]
     _WARN_SUBSTEPS = ns["_WARN_SUBSTEPS"]
@@ -172,14 +185,14 @@ if d3:
         check("has substep_history", "substep_history" in fp)
         check("i_step recorded", int(fp.attrs["i_step"]) == 182519)
         ent = fp["rho_entry/patch0"][()]
-        check("rho_entry is the ENTRY state (0.9), not the blown-up one",
-              np.allclose(ent, 0.9))
-        check("rho at failure exceeds rho_max",
-              float(fp["rho"].attrs["amax"]) > 1.0)
+        check(
+            "rho_entry is the ENTRY state (0.9), not the blown-up one",
+            np.allclose(ent, 0.9),
+        )
+        check("rho at failure exceeds rho_max", float(fp["rho"].attrs["amax"]) > 1.0)
         hist = fp["substep_history"][()]
         check("history has 5 columns", hist.shape[1] == 5)
-        check("history rate column rises",
-              hist[-1, 3] >= hist[0, 3])
+        check("history rate column rises", hist[-1, 3] >= hist[0, 3])
         check("amax_index recorded", len(fp["rho"].attrs["amax_index"]) == 2)
 
 # ---------------------------------------------------------------- 4. substep cap
@@ -210,11 +223,11 @@ if d4cap:
     with h5py.File(os.path.join(tmp, d4cap[0]), "r") as fp:
         check("reason=max_substeps", fp.attrs["reason"] == "max_substeps")
         check("n_sub at cap", int(fp.attrs["n_sub"]) > TE._MAX_SUBSTEPS)
-        check("history capped in length",
-              fp["substep_history"].shape[0] == int(fp.attrs["n_sub"]))
+        check(
+            "history capped in length",
+            fp["substep_history"].shape[0] == int(fp.attrs["n_sub"]),
+        )
 
-# ---------------------------------------------------------------- 5. TensorList
-print("\n[5] multi-patch TensorList path")
 os.environ["QIMPY_COLLISION_DUMP"] = os.path.join(tmp, "d5")
 
 
@@ -230,22 +243,28 @@ class TL(list):
 
 
 te = TE(s_max=0.02, rho_max=1.0)
-start = TL([torch.full((2, 2), 0.5, dtype=torch.float64),
-            torch.full((3,), 0.95, dtype=torch.float64)])
+start = TL(
+    [
+        torch.full((2, 2), 0.5, dtype=torch.float64),
+        torch.full((3,), 0.95, dtype=torch.float64),
+    ]
+)
 g = Geom(start, lambda r: TL(grow(x) for x in r))
 raised = None
 try:
     te._collision_kick(g, 2.44e4)
 except RuntimeError as e:
     raised = str(e)
-check("raised on TensorList", raised is not None)
 d5 = sorted(f for f in os.listdir(tmp) if f.startswith("d5"))
 if d5:
     with h5py.File(os.path.join(tmp, d5[0]), "r") as fp:
-        check("both patches dumped",
-              "rho_entry/patch0" in fp and "rho_entry/patch1" in fp)
-        check("amax located in patch 1 (the 0.95 one)",
-              int(fp["rho_entry"].attrs["amax_patch"]) == 1)
+        check(
+            "both patches dumped", "rho_entry/patch0" in fp and "rho_entry/patch1" in fp
+        )
+        check(
+            "amax located in patch 1 (the 0.95 one)",
+            int(fp["rho_entry"].attrs["amax_patch"]) == 1,
+        )
 
 # ---------------------------------------------------------------- 6. dump never masks
 print("\n[6] an unwritable dump path must NOT mask the RuntimeError")
@@ -258,8 +277,10 @@ try:
 except RuntimeError as e:
     raised = str(e)
 check("still raised the physics error", raised is not None and "max|rho|" in raised)
-check("warned about the failed write",
-      any(lvl == "warning" and "FAILED to write" in m for lvl, m in log.lines))
+check(
+    "warned about the failed write",
+    any(lvl == "warning" and "FAILED to write" in m for lvl, m in log.lines),
+)
 
 print("\n" + ("ALL PASS" if not fails else f"FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

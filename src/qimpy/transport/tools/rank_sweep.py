@@ -28,11 +28,11 @@ A short run diverges immediately if the exchange is wrong.
 reductions, so agreement is to a tolerance (default 1e-10 relative); anything
 larger than that is a real defect, not reordering.
 """
+
 from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 import numpy as np
 import torch
@@ -40,14 +40,28 @@ import torch.distributed as dist
 
 from qimpy import rc
 from qimpy.transport import Transport
-from qimpy.transport.geometry import TensorList
 
 torch.set_default_dtype(torch.float64)
 
-CFG_FS = dict(kF=7.5e-3, vF=0.11194, M_theta=32, Nr=6, T=1.3301e-5, xi_max=6.0,
-              tau_p=float("inf"), specularity=1.0, residual_damping=False,
-              cartesian=dict(annulus_xi=0.0, te_fac_max=6.0, kD_max=1.2e-3,
-                             dmu_max=1.2e-4, k_max=0.0132557160008, n_k=56))
+CFG_FS = dict(
+    kF=7.5e-3,
+    vF=0.11194,
+    M_theta=32,
+    Nr=6,
+    T=1.3301e-5,
+    xi_max=6.0,
+    tau_p=float("inf"),
+    specularity=1.0,
+    residual_damping=False,
+    cartesian=dict(
+        annulus_xi=0.0,
+        te_fac_max=6.0,
+        kD_max=1.2e-3,
+        dmu_max=1.2e-4,
+        k_max=0.0132557160008,
+        n_k=56,
+    ),
+)
 DMU = 5.37e-5
 
 
@@ -57,10 +71,11 @@ def make_mesh(base: str, kind: str, out: str) -> str:
     mk = d["boundary_markers"]
     if kind == "asis":
         return base
-    if kind == "allcontact":       # no reflector anywhere
+    if kind == "allcontact":  # no reflector anywhere
         d["boundary_markers"] = np.array(
-            ["source" if (i % 2 == 0) else "drain" for i in range(len(mk))])
-    elif kind == "cavity":         # every boundary a wall: closed system
+            ["source" if (i % 2 == 0) else "drain" for i in range(len(mk))]
+        )
+    elif kind == "cavity":  # every boundary a wall: closed system
         d["boundary_markers"] = np.array(["wall"] * len(mk))
     else:
         raise KeyError(kind)
@@ -74,8 +89,11 @@ def _stage(msg: str) -> None:
     # hides exactly the asymmetric-deadlock case we are hunting.
     if os.environ.get("STAGE"):
         import socket
-        print(f"  [stage] {socket.gethostname()} r{os.environ.get('OMPI_COMM_WORLD_RANK','?')} {msg}",
-              flush=True)
+
+        print(
+            f"  [stage] {socket.gethostname()} r{os.environ.get('OMPI_COMM_WORLD_RANK', '?')} {msg}",
+            flush=True,
+        )
 
 
 def run(mesh: str, steps: int, n_k: int) -> dict:
@@ -89,30 +107,37 @@ def run(mesh: str, steps: int, n_k: int) -> dict:
         contacts["source"] = {"dmu": DMU, "nonlinear": True}
     if "drain" in names:
         contacts["drain"] = {"dmu": -DMU, "nonlinear": True}
-    _stage('before Transport')
+    _stage("before Transport")
     t = Transport(
         fermi_surface=fs,
-        spatial_transport=dict(mesh_file=mesh, compile=False, save_rho=True,
-                               contacts=contacts),
-        time_evolution=dict(t_max=1e30, dt_save=1e30, n_collate=1))
-    _stage('Transport built')
+        spatial_transport=dict(
+            mesh_file=mesh, compile=False, save_rho=True, contacts=contacts
+        ),
+        time_evolution=dict(t_max=1e30, dt_save=1e30, n_collate=1),
+    )
+    _stage("Transport built")
     g = t.geometry
-    assert float(t.material.rho_dot(
-        torch.randn(4, g.Nk, device=rc.device), 0.0, 0).abs().max()) == 0.0, \
-        "material is not ballistic"
+    assert (
+        float(
+            t.material.rho_dot(torch.randn(4, g.Nk, device=rc.device), 0.0, 0)
+            .abs()
+            .max()
+        )
+        == 0.0
+    ), "material is not ballistic"
     f0 = t.material.representation._f0_lab[None, :]
     u = g.rho[0].clone()
     dt = float(g.dt_max)
-    _stage(f'stepping {steps} (K={g.K} own={g._own_stop-g._own_start})')
+    _stage(f"stepping {steps} (K={g.K} own={g._own_stop - g._own_start})")
     for _ in range(steps):
-        uh = u + (0.5 * dt) * g.rho_dot(TensorList([u]), 0.0)[0]
-        u = u + dt * g.rho_dot(TensorList([uh]), 0.5 * dt)[0]
+        uh = u + (0.5 * dt) * g.rho_dot(u, 0.0)
+        u = u + dt * g.rho_dot(uh, 0.5 * dt)
     # ⛔ geometry.rho is the FULL (K, Nk) array INCLUDING the halo copies of
     # other ranks' cells -- not the owned slice.  Writing it back through a
     # [_own_start:_own_stop] slice fails (896 vs 1792); copy the whole thing.
     g._u.copy_(u)
 
-    _stage('stepped')
+    _stage("stepped")
     f = f0 + u
     # ⛔ but REDUCE over owned cells only: every rank holds halo duplicates of
     # its neighbours' cells, so summing the full array double-counts them and
@@ -127,23 +152,31 @@ def run(mesh: str, steps: int, n_k: int) -> dict:
     # of an equivalence test dies on AttributeError and silently compares
     # nothing.
     grp = getattr(g, "group", None)
-    if grp is not None:                                   # merged tree
+    if grp is not None:  # merged tree
         n_ranks = grp.size()
         if g._mpi:
             dist.all_reduce(n_ch, group=grp)
             dist.all_reduce(loc, op=dist.ReduceOp.MIN, group=grp)
-    else:                                                 # pre-merge tree
+    else:  # pre-merge tree
         from qimpy import MPI
         from qimpy.mpi import BufferView
+
         comm = g.comm
         n_ranks = comm.size
         if g._mpi:
             comm.Allreduce(MPI.IN_PLACE, BufferView(n_ch))
             comm.Allreduce(MPI.IN_PLACE, BufferView(loc), op=MPI.MIN)
-    out = dict(dt_max=dt, min_f=float(loc[0]), max_f=float(-loc[1]),
-               n_ch_sum=float(n_ch.sum()), n_ch_absmax=float(n_ch.abs().max()),
-               K=int(g.K), Nk=int(g.Nk), ranks=n_ranks)
-    _stage('reduced')
+    out = dict(
+        dt_max=dt,
+        min_f=float(loc[0]),
+        max_f=float(-loc[1]),
+        n_ch_sum=float(n_ch.sum()),
+        n_ch_absmax=float(n_ch.abs().max()),
+        K=int(g.K),
+        Nk=int(g.Nk),
+        ranks=n_ranks,
+    )
+    _stage("reduced")
     try:
         out["currents"] = {k: float(v) for k, v in g.contact_currents(0.0).items()}
     except Exception as e:

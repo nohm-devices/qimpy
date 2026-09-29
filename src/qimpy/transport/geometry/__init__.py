@@ -1,7 +1,3 @@
-__all__ = (
-    "TensorList",
-    "Geometry",
-)
+__all__ = ("Geometry",)
 
-from ._tensor_list import TensorList
 from ._geometry import Geometry

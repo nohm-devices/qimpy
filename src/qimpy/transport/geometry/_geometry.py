@@ -32,7 +32,6 @@ from qimpy import rc, log, TreeNode
 from qimpy.io import CheckpointPath, InvalidInputException, CheckpointContext
 from qimpy.mpi import ProcessGrid, all_reduce_scalars
 from ..material import Material
-from . import TensorList
 from ._mesh import load_mesh, build_fv_geom
 
 
@@ -952,21 +951,20 @@ class Geometry(TreeNode):
             return u
         return u - (u @ self._dl_A) @ self._dl_B.T
 
-    def rho_dot(self, rho: TensorList, t: float) -> TensorList:
-        u = rho[0]
+    def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         if self._decomp is not None:
-            self._decomp.exchange(u)  # fill halo ghost rows
-        out = self._srhs_fn(u, t)  # de-alias + spatial RHS (fused)
+            self._decomp.exchange(rho)  # fill halo ghost rows
+        out = self._srhs_fn(rho, t)  # de-alias + spatial RHS (fused)
         if self.collision_enabled and not self._skip_collision:  # ballistic: exactly 0
             # collision = from_modes(-rates * to_modes(.)); its to_modes already
             # annihilates the ghost, so the raw (un-de-aliased) u is exact here.
             lo, hi = self._own_start, self._own_stop
-            out[lo:hi] = out[lo:hi] + self.material.rho_dot(u[lo:hi], t, id(self))
+            out[lo:hi] = out[lo:hi] + self.material.rho_dot(rho[lo:hi], t, id(self))
         if self._owned_mask is not None:
             out = out * self._owned_mask
-        return TensorList([out])
+        return out
 
-    def collision_dot(self, rho: TensorList) -> TensorList:
+    def collision_dot(self, rho: torch.Tensor) -> torch.Tensor:
         """The material collision term ALONE, with no spatial RHS.
 
         Used by operator splitting (``collision_interval > 1``).  The collision
@@ -974,22 +972,21 @@ class Geometry(TreeNode):
         exchange, and no de-aliasing either -- the representation's
         ``to_modes`` already annihilates the rank-r ghost.
         """
-        u = rho[0]
-        out = torch.zeros_like(u)
+        out = torch.zeros_like(rho)
         if not self._skip_collision:
             lo, hi = self._own_start, self._own_stop
-            out[lo:hi] = self.material.rho_dot(u[lo:hi], 0.0, id(self))
+            out[lo:hi] = self.material.rho_dot(rho[lo:hi], 0.0, id(self))
         if self._owned_mask is not None:
             out = out * self._owned_mask
-        return TensorList([out])
+        return out
 
     @property
-    def rho(self) -> TensorList:
-        return TensorList([self._u])
+    def rho(self) -> torch.Tensor:
+        return self._u
 
     @rho.setter
-    def rho(self, rho_new: TensorList) -> None:
-        self._u = self._dealias(rho_new[0])
+    def rho(self, rho_new: torch.Tensor) -> None:
+        self._u = self._dealias(rho_new)
 
     @property
     def density(self) -> torch.Tensor:

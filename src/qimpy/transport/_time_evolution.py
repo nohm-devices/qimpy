@@ -11,43 +11,7 @@ from scipy import optimize
 import qimpy
 from qimpy import TreeNode, log, rc
 from qimpy.io import CheckpointPath, CheckpointContext, InvalidInputException
-from .geometry import Geometry, TensorList
-
-
-def _amax(x) -> float:
-    """max |.| over a TensorList (or a bare Tensor). Forces one sync."""
-    if torch.is_tensor(x):
-        return float(x.abs().max())
-    return max((float(xi.abs().max()) for xi in x), default=0.0)
-
-
-def _patches(x) -> list:
-    """View a TensorList (or bare Tensor) as a list of patch tensors."""
-    return [x] if torch.is_tensor(x) else list(x)
-
-
-def _clone(x):
-    """Deep copy of a TensorList (or bare Tensor), preserving the type."""
-    if torch.is_tensor(x):
-        return x.detach().clone()
-    return type(x)(xi.detach().clone() for xi in x)
-
-
-def _amax_where(x) -> tuple[float, int, tuple]:
-    """(max|.|, patch index, unraveled index) -- WHERE the extremum sits.
-
-    The whole point of the divergence dump: a scalar max says the state blew
-    up, this says which cell did.  Only called on the dump path, so the extra
-    argmax never costs anything in the substep loop.
-    """
-    best = (-1.0, -1, ())
-    for ip, xi in enumerate(_patches(x)):
-        a = xi.abs()
-        flat = int(a.argmax())
-        val = float(a.reshape(-1)[flat])
-        if val > best[0]:
-            best = (val, ip, tuple(int(j) for j in np.unravel_index(flat, a.shape)))
-    return best
+from .geometry import Geometry
 
 
 class TimeEvolution(TreeNode):
@@ -61,7 +25,9 @@ class TimeEvolution(TreeNode):
     save_interval: int  #: Save results every so many steps
     n_collate: int  #: Collect these many save steps into a single checkpoint
     integrator: str  #: Time-step style used for integration
-    collision_interval: int  #: Strang-split the collision over this many streaming steps
+    collision_interval: (
+        int  #: Strang-split the collision over this many streaming steps
+    )
     collision_fuse: bool  #: merge adjacent half-kicks across windows (2x fewer applies)
     collision_s_max: float  #: Adaptive-substep bound on the measured collision rate
     collision_rho_max: float  #: Abort if the collision kick leaves max|rho| above this
@@ -168,7 +134,7 @@ class TimeEvolution(TreeNode):
             # the residual scale ill-defined.
             self.warmup_steps = int(self.steady_state.get("warmup_steps", 0))
             self.integrator = self.steady_state.get("integrator", "RK2")
-            self.collision_interval = 1        # root-finding: no splitting
+            self.collision_interval = 1  # root-finding: no splitting
             self.collision_fuse = False
             self.collision_s_max = 0.0
             self.collision_rho_max = float(collision_rho_max)
@@ -188,7 +154,7 @@ class TimeEvolution(TreeNode):
                         "Specify dt explicitly, because dt_max is not available"
                     )
                 dt = dt_max
-                log.info(f"Setting time step dt = {dt_max = :.4g}")
+                log.info(f"Setting time step dt = dt_max = {dt_max:.4g}")
             elif dt > dt_max:
                 if i_step:
                     # Continuing from a checkpoint whose dt is no longer valid for
@@ -196,19 +162,20 @@ class TimeEvolution(TreeNode):
                     # so the explicit-CFL limit dt_max ~ 1/(N+1)^2 tightened). The
                     # restored dt is a stale continuation default, so reduce it to
                     # the new dt_max automatically rather than failing.
-                    log.info(f"Reducing restored time step dt = {dt:.4g} to "
-                             f"{dt_max = :.4g} for the current discretization")
+                    log.info(
+                        f"Reducing restored time step dt = {dt:.4g} to "
+                        f"dt_max = {dt_max=:.4g} for the current discretization"
+                    )
                     dt = dt_max
                 else:
-                    raise InvalidInputException(
-                        f"{dt = } must be smaller than {dt_max = }")
+                    raise InvalidInputException(f"{dt=} must be less than {dt_max=}")
             self.dt = float(dt)
             self.n_steps = max(1, int(np.round(t_max / self.dt)))
             self.save_interval = max(1, int(np.round(dt_save / self.dt)))
             self.n_collate = int(n_collate)
             self.integrator = integrator
             if integrator not in {"RK2", "RK4", "SSPRK3"}:
-                raise InvalidInputException(f"Unrecognized {integrator = }")
+                raise InvalidInputException(f"Unrecognized {integrator=}")
             self.collision_interval = max(1, int(collision_interval))
             self.collision_fuse = bool(collision_fuse)
             self.collision_s_max = float(collision_s_max)
@@ -222,20 +189,27 @@ class TimeEvolution(TreeNode):
                     # save interval up so saves land there.
                     old = self.save_interval
                     self.save_interval = ((old + N - 1) // N) * N
-                    log.info(f"save_interval {old} -> {self.save_interval}"
-                             f" (multiple of collision_interval {N}, so"
-                             f" checkpoints land on window boundaries)")
+                    log.info(
+                        f"save_interval {old} -> {self.save_interval}"
+                        f" (multiple of collision_interval {N}, so"
+                        f" checkpoints land on window boundaries)"
+                    )
                 log.info(
                     f"Strang-splitting the collision every {N} steps"
                     f" (dt_coll = {N * self.dt:.4g}),"
                     f" {'FUSED' if self.collision_fuse else 'unfused'}"
-                    f" -> {2 if self.collision_fuse else 4} applies per window")
+                    f" -> {2 if self.collision_fuse else 4} applies per window"
+                )
             if self.collision_s_max > 0.0:
-                log.info(f"Adaptive collision substepping: s <= "
-                         f"{self.collision_s_max:g} (measured per substep)")
+                log.info(
+                    f"Adaptive collision substepping: s <= "
+                    f"{self.collision_s_max:g} (measured per substep)"
+                )
             if self.collision_rho_max > 0.0:
-                log.info(f"Collision validity gate: max|rho| <= "
-                         f"{self.collision_rho_max:g}")
+                log.info(
+                    f"Collision validity gate: max|rho| <= "
+                    f"{self.collision_rho_max:g}"
+                )
 
     def time_step(self, geometry: Geometry) -> None:
         """Advance one step of dt.
@@ -263,7 +237,8 @@ class TimeEvolution(TreeNode):
             if not hasattr(geometry, "collision_dot"):
                 raise InvalidInputException(
                     "collision_interval > 1 needs a geometry implementing"
-                    " collision_dot (finite_volume)")
+                    " collision_dot (finite_volume)"
+                )
             dt_half = 0.5 * N * self.dt
             j = self.i_step % N
             if self.collision_fuse:
@@ -300,8 +275,11 @@ class TimeEvolution(TreeNode):
         stashed observables -- otherwise the snapshot is short by half a
         collision sub-step.
         """
-        if self.collision_interval > 1 and self.collision_fuse \
-                and getattr(self, "_half_pending", False):
+        if (
+            self.collision_interval > 1
+            and self.collision_fuse
+            and getattr(self, "_half_pending", False)
+        ):
             self._collision_kick(geometry, 0.5 * self.collision_interval * self.dt)
             self._half_pending = False
 
@@ -371,7 +349,7 @@ class TimeEvolution(TreeNode):
         # no multi-hour march.  One device-side copy per kick (kicks are every
         # collision_interval steps and the state is small next to the e-e
         # vertices), so the cost is noise against the 4 applies per window.
-        rho_entry = _clone(rho)
+        rho_entry = rho.detach().clone()
         hist: list[tuple[int, float, float, float, float]] = []
         while t_left > 0.0:
             n_sub += 1
@@ -379,8 +357,8 @@ class TimeEvolution(TreeNode):
             # maxima of |k1| and |rho| may sit in different cells, which only
             # makes h more conservative -- and it matches the quantity the
             # instability was diagnosed with.
-            a_rho = _amax(rho)
-            a_k1 = _amax(k1)
+            a_rho = rho.abs().max().item()
+            a_k1 = k1.abs().max().item()
             rate = 0.5 * a_k1 / max(a_rho, self._RHO_ATOL)
             h = t_left if rate <= 0.0 else min(t_left, s_max / rate)
             hist.append((n_sub, a_rho, a_k1, rate, h))
@@ -391,30 +369,37 @@ class TimeEvolution(TreeNode):
             # already synced for the rate above, so this costs nothing.
             if self.collision_rho_max > 0.0 and not (a_rho <= self.collision_rho_max):
                 self._dump_collision_state(
-                    "rho_max", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub)
+                    "rho_max", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub
+                )
                 raise RuntimeError(
                     f"collision kick at step {self.i_step} reached "
                     f"max|rho| = {a_rho:.6e} at substep {n_sub}, above "
                     f"collision_rho_max = {self.collision_rho_max:g}. rho is "
                     "the deviation df about f0, so |df| <= 1 identically: the "
-                    "state is no longer physical.")
+                    "state is no longer physical."
+                )
             if n_sub > self._MAX_SUBSTEPS:
                 self._dump_collision_state(
-                    "max_substeps", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub)
+                    "max_substeps", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub
+                )
                 raise RuntimeError(
                     f"collision kick at step {self.i_step} still needs "
                     f"substeps after {self._MAX_SUBSTEPS}: the collision rate "
                     "is diverging, not merely stiff. Inspect the state rather "
-                    "than raising the substep cap.")
+                    "than raising the substep cap."
+                )
             # One early snapshot, long before the cap, so a run that recovers
             # still leaves evidence of what a hard kick looked like.
             if n_sub == self._WARN_SUBSTEPS and not getattr(self, "_warned_sub", False):
                 self._warned_sub = True
-                log.info(f"Collision substeps passed {self._WARN_SUBSTEPS} at step "
-                         f"{self.i_step} (rate {rate:.6e}, max|rho| {a_rho:.6e}) "
-                         "-- dumping state")
+                log.info(
+                    f"Collision substeps passed {self._WARN_SUBSTEPS} at step "
+                    f"{self.i_step} (rate {rate:.6e}, max|rho| {a_rho:.6e}) "
+                    "-- dumping state"
+                )
                 self._dump_collision_state(
-                    "warn", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub)
+                    "warn", rho_entry, rho, k1, hist, dt_coll, t_left, n_sub
+                )
             k2 = geometry.collision_dot(rho + (0.5 * h) * k1)
             rho = rho + h * k2
             t_left -= h  # h is min(t_left, .), so the last substep lands exactly
@@ -427,25 +412,28 @@ class TimeEvolution(TreeNode):
         # until it crosses, and the run that died went 1,2,1,2,... then >4096
         # with nothing in between.
         if n_sub != getattr(self, "_n_sub_last", 0) or n_sub >= self._LOUD_SUBSTEPS:
-            log.info(f"Collision substeps: {n_sub} (dt_coll = {dt_coll:.4g}, "
-                     f"step {self.i_step}, max rate {max(r[3] for r in hist):.4e})")
+            log.info(
+                f"Collision substeps: {n_sub} (dt_coll = {dt_coll:.4g}, "
+                f"step {self.i_step}, max rate {max(r[3] for r in hist):.4e})"
+            )
             self._n_sub_last = n_sub
 
     def _check_collision_rho(self, rho, rho_entry=None) -> None:
         """Trip on an unphysical state as soon as the kick produces one."""
         if self.collision_rho_max > 0.0:
-            a = _amax(rho)
+            a = rho.abs().max().item()
             if not (a <= self.collision_rho_max):  # also catches NaN
                 self._dump_collision_state(
-                    "rho_max_post", rho_entry, rho, None, [], float("nan"),
-                    0.0, -1)
+                    "rho_max_post", rho_entry, rho, None, [], float("nan"), 0.0, -1
+                )
                 raise RuntimeError(
                     f"collision kick at step {self.i_step} left "
                     f"max|rho| = {a:.6e}, above collision_rho_max = "
                     f"{self.collision_rho_max:g}. rho is the deviation df "
                     "about f0, so |df| <= 1 identically: the state is no "
                     "longer physical. Reduce collision_s_max (or "
-                    "collision_interval) rather than raising this bound.")
+                    "collision_interval) rather than raising this bound."
+                )
 
     def _dump_collision_state(
         self, reason, rho_entry, rho_now, k1_now, hist, dt_coll, t_left, n_sub
@@ -480,26 +468,28 @@ class TimeEvolution(TreeNode):
                 fp.attrs["collision_rho_max"] = float(self.collision_rho_max)
                 fp.attrs["collision_interval"] = int(self.collision_interval)
                 fp.attrs["collision_fuse"] = bool(self.collision_fuse)
-                for name, x in (("rho_entry", rho_entry),
-                                ("rho", rho_now), ("k1", k1_now)):
+                for name, x in (
+                    ("rho_entry", rho_entry),
+                    ("rho", rho_now),
+                    ("k1", k1_now),
+                ):
                     if x is None:
                         continue
                     g = fp.create_group(name)
-                    for ip, xi in enumerate(_patches(x)):
-                        g.create_dataset(f"patch{ip}",
-                                         data=xi.detach().cpu().numpy())
-                    val, ip, idx = _amax_where(x)
-                    g.attrs["amax"] = val
-                    g.attrs["amax_patch"] = ip
-                    g.attrs["amax_index"] = np.asarray(idx, dtype=np.int64)
+                    g.create_dataset("patch", data=x.detach().cpu().numpy())
+                    index_max = np.unravel_index(x.abs().argmax(), x.shape)
+                    g.attrs["amax"] = abs(x[index_max].item())
+                    g.attrs["amax_index"] = index_max
                 if hist:
                     # (substep, max|rho|, max|k1|, rate, h) -- the only place
                     # the runaway is visible, since the substep COUNT is a
                     # ceil and stays flat until the rate crosses an integer.
-                    fp.create_dataset("substep_history",
-                                      data=np.asarray(hist, dtype=np.float64))
-                    fp["substep_history"].attrs["columns"] = \
-                        "n_sub,amax_rho,amax_k1,rate,h"
+                    fp.create_dataset(
+                        "substep_history", data=np.asarray(hist, dtype=np.float64)
+                    )
+                    fp["substep_history"].attrs[
+                        "columns"
+                    ] = "n_sub,amax_rho,amax_k1,rate,h"
             log.info(f"Collision divergence dump written to {path}")
         except Exception as exc:  # never mask the real error
             log.warning(f"FAILED to write collision divergence dump {path}: {exc}")
@@ -524,9 +514,9 @@ class TimeEvolution(TreeNode):
             # forward-Euler steps.
             rho1 = rho0 + dt * geometry.rho_dot(rho0, t)
             rho2 = 0.75 * rho0 + 0.25 * (rho1 + dt * geometry.rho_dot(rho1, t + dt))
-            geometry.rho = ((1.0 / 3.0) * rho0
-                            + (2.0 / 3.0) * (rho2 + dt * geometry.rho_dot(
-                                rho2, t + 0.5 * dt)))
+            geometry.rho = (1.0 / 3.0) * rho0 + (2.0 / 3.0) * (
+                rho2 + dt * geometry.rho_dot(rho2, t + 0.5 * dt)
+            )
         else:
             raise KeyError(f"Unrecognized integrator = {self.integrator}")
 
@@ -540,12 +530,12 @@ class TimeEvolution(TreeNode):
         equilibrium-initialized state, optionally warm-started from a raw state
         saved by an earlier run with ``save_rho: true``.
         """
-        rho_shape = geometry.rho[0].shape  # (n_cells, n_channels)
+        rho_shape = geometry.rho.shape  # (n_cells, n_channels)
         if self.rho0_path:
             with h5py.File(self.rho0_path, "r") as cp:
                 rho_f = np.array(cp["/geometry"]["rho"])
                 t_f = cp["/time_evolution"].attrs["t"]
-            rho_f = torch.from_numpy(rho_f).to(rc.device, geometry.rho[0].dtype)
+            rho_f = torch.from_numpy(rho_f).to(rc.device, geometry.rho.dtype)
             material = transport.material
             if isinstance(material, qimpy.transport.material.ab_initio.AbInitio):
                 # Rotate each cell's saved interaction-picture density into the
@@ -556,14 +546,16 @@ class TimeEvolution(TreeNode):
                     -1, (material.nk_mine, material.n_bands, material.n_bands)
                 )
                 rho_f = ph.pack(ph.unpack(rho_f) * phase).flatten(-3, -1)
-            geometry.rho = TensorList([rho_f.reshape(rho_shape)])
+            geometry.rho = rho_f.reshape(rho_shape)
 
         # Develop a nonzero seed from the contacts when cold-starting from an
         # empty field (otherwise the residual has no characteristic scale).
         if self.warmup_steps and not self.rho0_path:
             self.dt = float(geometry.dt_max)
-            log.info(f"Steady-state warm-up: {self.warmup_steps} steps "
-                     f"at dt = {self.dt:.4g}")
+            log.info(
+                f"Steady-state warm-up: {self.warmup_steps} steps "
+                f"at dt = {self.dt:.4g}"
+            )
             for _ in range(self.warmup_steps):
                 self.time_step(geometry)
 
@@ -588,9 +580,9 @@ class TimeEvolution(TreeNode):
             options={"disp": True, "nit": self.nit},
         )
         log.info(optimizer)
-        log.info(f"{steady_state_root_fn.n_calls = }")
-        geometry.rho = TensorList(
-            [torch.from_numpy(optimizer.x * RHO_SCALE).to(rc.device).reshape(rho_shape)]
+        log.info(f"{steady_state_root_fn.n_calls=}")
+        geometry.rho = (
+            torch.from_numpy(optimizer.x * RHO_SCALE).to(rc.device).reshape(rho_shape)
         )
 
     def run(self, transport: qimpy.transport.Transport) -> None:
@@ -660,7 +652,9 @@ class TimeEvolution(TreeNode):
 @dataclass
 class SteadyStateRootFunction:
     geometry: Geometry
-    rho_shape: tuple  #: shape of the per-domain finite-volume state (n_cells, n_channels)
+    rho_shape: (
+        tuple  #: shape of the per-domain finite-volume state (n_cells, n_channels)
+    )
     RHO_SCALE: float = 1.0e-7
     T_SCALE: float = 1.0e4
     nit: int = 0
@@ -668,9 +662,10 @@ class SteadyStateRootFunction:
     n_calls: int = 0
     iter: int = 0
 
-    def _rho(self, x: np.ndarray) -> TensorList:
-        v = torch.from_numpy(x * self.RHO_SCALE).to(rc.device).reshape(self.rho_shape)
-        return TensorList([v])
+    def _rho(self, x: np.ndarray) -> torch.Tensor:
+        return (
+            torch.from_numpy(x * self.RHO_SCALE).to(rc.device).reshape(self.rho_shape)
+        )
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         rho_dot = self.geometry.rho_dot(self._rho(x), t=0.0)

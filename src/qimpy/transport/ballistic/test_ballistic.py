@@ -11,6 +11,7 @@ The method of characteristics shares no machinery with the FV solver -- no
 cells, no k-grid, no time step, no reconstruction, no limiter, no wall closure
 -- so agreement between them is real evidence, not a tautology.
 """
+
 from __future__ import annotations
 
 import os
@@ -33,8 +34,13 @@ CHANNEL = dict(kF=7.5e-3, vF=0.11194, T=1.3301e-5)
 DMU = 5.37e-5
 
 
-def _channel_mesh(path: str, length: float = 40.0, width: float = 10.0,
-                  h: float = 3.0, all_walls: bool = False) -> str:
+def _channel_mesh(
+    path: str,
+    length: float = 40.0,
+    width: float = 10.0,
+    h: float = 3.0,
+    all_walls: bool = False,
+) -> str:
     """Straight rectangular channel: source at x=0, drain at x=length.
 
     A channel is the one geometry whose ballistic conductance is analytic, so
@@ -164,8 +170,8 @@ def test_current_is_antisymmetric_and_conserved() -> None:
         Is, ts = fwd.contact_current("source", **kw)
         Id, _ = fwd.contact_current("drain", **kw)
         Ir, _ = rev.contact_current("source", **kw)
-        assert abs(Is + Id) < 2e-2 * abs(Is), (Is, Id)      # balance
-        assert abs(Is + Ir) < 2e-2 * abs(Is), (Is, Ir)      # antisymmetry
+        assert abs(Is + Id) < 2e-2 * abs(Is), (Is, Id)  # balance
+        assert abs(Is + Ir) < 2e-2 * abs(Is), (Is, Ir)  # antisymmetry
         assert ts < 0.5, f"unresolved fraction {ts} too high to conclude"
 
 
@@ -185,8 +191,7 @@ def test_current_grows_with_channel_width() -> None:
         Is = []
         for w in (8.0, 16.0):
             mesh = _channel_mesh(os.path.join(td, f"w{w}.npz"), width=w, h=2.5)
-            b = Ballistic(mesh, contacts={"source": DMU, "drain": -DMU},
-                          **CHANNEL)
+            b = Ballistic(mesh, contacts={"source": DMU, "drain": -DMU}, **CHANNEL)
             Is.append(abs(b.contact_current("source", **kw)[0]))
         ratio = Is[1] / Is[0]
         assert 1.5 < ratio < 2.6, (Is, ratio)
@@ -210,13 +215,13 @@ def test_closed_cavity_is_entirely_unresolved() -> None:
         cid, _ = b.trace_back(
             p[:, None, :].expand(n, len(th), 2).reshape(-1, 2).contiguous(),
             v[None].expand(n, len(th), 2).reshape(-1, 2).contiguous(),
-            max_bounce=64)
+            max_bounce=64,
+        )
         assert int((cid != 0).sum()) == 0, "a ray escaped a closed cavity"
 
 
 @pytest.mark.parametrize(
-    "n_ang, n_edge, max_bounce, n_k, M_th, Nr_, h_, blocks, steady, "
-    "trap_max, tol",
+    "n_ang, n_edge, max_bounce, n_k, M_th, Nr_, h_, blocks, steady, " "trap_max, tol",
     [
         # Default: laptop-sized, CPU-only.  ⛔ THE REFERENCE WAS NEVER THE
         # EXPENSIVE HALF -- dropping n_ang 2048 -> 256 alone still left ~6 min
@@ -225,18 +230,39 @@ def test_closed_cavity_is_entirely_unresolved() -> None:
         # with it.  Still a real constraint: 25% cannot hide the 4x wall bug
         # this suite previously missed.  But the reference is NOT converged
         # here, so a pass means "nothing is grossly broken", not agreement.
-        pytest.param(256, 8, 200, 16, 16, 2, 8.0, 20, 1e-3, 0.40, 0.25,
-                     id="smoke"),
+        pytest.param(256, 8, 200, 16, 16, 2, 8.0, 20, 1e-3, 0.40, 0.25, id="smoke"),
         # Converged: the real cross-check.  ~15 s on an A100 and ~7 min on a
         # CPU, which is why it is behind the `validate` marker.
-        pytest.param(2048, 24, 3200, 48, 32, 4, 3.0, 60, 1e-4, 0.25, 0.10,
-                     id="converged", marks=pytest.mark.validate),
+        pytest.param(
+            2048,
+            24,
+            3200,
+            48,
+            32,
+            4,
+            3.0,
+            60,
+            1e-4,
+            0.25,
+            0.10,
+            id="converged",
+            marks=pytest.mark.validate,
+        ),
     ],
 )
 @pytest.mark.timeout(1800)
 def test_finite_volume_matches_exact_ballistic(
-    n_ang: int, n_edge: int, max_bounce: int, n_k: int, M_th: int, Nr_: int,
-    h_: float, blocks: int, steady: float, trap_max: float, tol: float,
+    n_ang: int,
+    n_edge: int,
+    max_bounce: int,
+    n_k: int,
+    M_th: int,
+    Nr_: int,
+    h_: float,
+    blocks: int,
+    steady: float,
+    trap_max: float,
+    tol: float,
 ) -> None:
     """★ THE CROSS-CHECK: FV must reproduce the exact ballistic current.
 
@@ -255,36 +281,45 @@ def test_finite_volume_matches_exact_ballistic(
     """
     torch.set_default_dtype(torch.float64)
     from .. import Transport
-    from ..geometry import TensorList
 
     with tempfile.TemporaryDirectory() as td:
-        mesh = _channel_mesh(os.path.join(td, "c.npz"), length=30.0,
-                             width=12.0, h=h_)
-        exact = Ballistic(mesh, contacts={"source": DMU, "drain": -DMU},
-                          **CHANNEL)
+        mesh = _channel_mesh(os.path.join(td, "c.npz"), length=30.0, width=12.0, h=h_)
+        exact = Ballistic(mesh, contacts={"source": DMU, "drain": -DMU}, **CHANNEL)
         # ⛔ n_ang must be high enough to be converged: on the production
         # mixer 1024 reads 2.8% low and is not even monotone (9.6908 / 9.5130 /
         # 9.7649 / 9.7863 at 512/1024/2048/4096).  A cross-check against an
         # unconverged reference is worse than no cross-check -- which is
         # exactly why the cheap case above is labelled `smoke` and given a
         # tolerance it cannot mistake for agreement.
-        I_exact, trap = exact.contact_current("source", n_ang=n_ang,
-                                              n_edge=n_edge,
-                                              max_bounce=max_bounce)
-        assert trap < trap_max, (
-            f"unresolved {trap}: reference too weak to test FV")
+        I_exact, trap = exact.contact_current(
+            "source", n_ang=n_ang, n_edge=n_edge, max_bounce=max_bounce
+        )
+        assert trap < trap_max, f"unresolved {trap}: reference too weak to test FV"
 
         t = Transport(
             fermi_surface=dict(
-                kF=CHANNEL["kF"], vF=CHANNEL["vF"], M_theta=M_th, Nr=Nr_,
-                T=CHANNEL["T"], xi_max=6.0, tau_p=np.inf, specularity=1.0,
+                kF=CHANNEL["kF"],
+                vF=CHANNEL["vF"],
+                M_theta=M_th,
+                Nr=Nr_,
+                T=CHANNEL["T"],
+                xi_max=6.0,
+                tau_p=np.inf,
+                specularity=1.0,
                 residual_damping=False,
-                cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=n_k)),
+                cartesian=dict(annulus_xi=0.0, te_fac_max=2.0, n_k=n_k),
+            ),
             spatial_transport=dict(
-                mesh_file=mesh, compile=False, save_rho=True,
-                contacts={"source": {"dmu": DMU, "nonlinear": True},
-                          "drain": {"dmu": -DMU, "nonlinear": True}}),
-            time_evolution=dict(t_max=1e30, dt_save=1e30, n_collate=1))
+                mesh_file=mesh,
+                compile=False,
+                save_rho=True,
+                contacts={
+                    "source": {"dmu": DMU, "nonlinear": True},
+                    "drain": {"dmu": -DMU, "nonlinear": True},
+                },
+            ),
+            time_evolution=dict(t_max=1e30, dt_save=1e30, n_collate=1),
+        )
         g = t.geometry
         u = g.rho[0].clone()
         dt = float(g.dt_max)
@@ -295,8 +330,8 @@ def test_finite_volume_matches_exact_ballistic(
         converged = False
         for block in range(blocks):
             for _ in range(50):
-                uh = u + (0.5 * dt) * g.rho_dot(TensorList([u]), 0.0)[0]
-                u = u + dt * g.rho_dot(TensorList([uh]), 0.5 * dt)[0]
+                uh = u + (0.5 * dt) * g.rho_dot(u, 0.0)
+                u = u + dt * g.rho_dot(uh, 0.5 * dt)
             g._u.copy_(u)
             I_fv = g.contact_currents(0.0)["source"]
             # ⛔ MATCH THE STEADINESS CRITERION TO THE COMPARISON TOLERANCE.
@@ -315,8 +350,10 @@ def test_finite_volume_matches_exact_ballistic(
         # the convergence is asserted rather than assumed.
         assert converged, (
             f"FV current still moving after {blocks} blocks; "
-            f"raise `blocks` rather than trusting this number")
+            f"raise `blocks` rather than trusting this number"
+        )
         rel = abs(I_fv - I_exact) / abs(I_exact)
         assert rel < tol, (
             f"FV {I_fv:.6e} vs exact {I_exact:.6e} = {100 * rel:.2f}% apart "
-            f"(unresolved {trap:.3f}, {block + 1} blocks)")
+            f"(unresolved {trap:.3f}, {block + 1} blocks)"
+        )
