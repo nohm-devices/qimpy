@@ -12,7 +12,8 @@ fermi_surface:
   r_c: 10.0
 
 geometry:
-  mesh_file: rect-domain-tri.npz
+  mesh:
+    file: rect-domain-mesh.h5
   compile: true
   contacts:
     source:

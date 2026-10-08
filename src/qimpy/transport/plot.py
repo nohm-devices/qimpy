@@ -9,7 +9,7 @@ import numpy as np
 
 from qimpy import rc, log, io
 from qimpy.profiler import StopWatch
-from qimpy.io import log_config, Checkpoint
+from qimpy.io import log_config, Checkpoint, CheckpointPath
 
 # Checkpoint time is in Hartree atomic units; 1 a.u. = ℏ/E_h s.
 _PS_PER_AU_TIME = 2.4188843265857e-5
@@ -132,11 +132,9 @@ def fv_contact_mask(
         s = str(marker).strip().lower()
         return (s in names) if names is not None else (str(marker) != "wall")
 
-    markers = [str(m) for m in boundary_markers]
+    markers = [str(m) for m in boundary_markers] + ["wall"]
     # Primary: match by unordered vertex-id pair.
-    label = {
-        frozenset((int(a), int(b))): m for (a, b), m in zip(boundary_edges, markers)
-    }
+    label = {frozenset((int(a), int(b))): markers[m] for (a, b, m) in boundary_edges}
     labels = np.array(
         [label.get(frozenset((int(u), int(v))), "wall") for u, v in bkeys], dtype=object
     )
@@ -356,18 +354,19 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
     edge equals the stored face flux ``F_e/len_e`` (see ``_rt0_assembly``) -- no
     cell averaging or reconstruction.  Each rank renders its strided subset of
     frames, so post-processing scales like the solve."""
-    import os
     import matplotlib.tri as mtri
     from matplotlib.collections import LineCollection
 
     cmap = density.get("cmap", "bwr")
     with Checkpoint(file_list[0]) as cp:
         g = cp["/geometry"]
-        verts = np.array(g["mesh_vertices"])  # (Nv, 2)
-        tris = np.array(g["mesh_triangles"])  # (K, 3)
-        mesh_file = g.attrs.get("mesh_file", b"")
+        verts = np.array(g["mesh/vertices"])  # (Nv, 2)
+        tris = np.array(g["mesh/cells"])[:, :-1]  # (K, 3)
+        boundary_edges = np.array(g["mesh/edges"])
+        boundary_names = CheckpointPath(cp, "/geometry/mesh").read_str_list(
+            "boundary_names"
+        )
         contact_names = _read_contact_names(g)  # authoritative set or None
-    mesh_file = mesh_file.decode() if isinstance(mesh_file, bytes) else str(mesh_file)
     triang = mtri.Triangulation(verts[:, 0], verts[:, 1], tris)
     edges = fv_edge_geometry(verts, tris)  # face (edge) geometry, once
     bmid = edges["bsegs"].mean(axis=1)  # (Nb, 2) edge midpoints
@@ -376,23 +375,14 @@ def run_finite_volume(file_list, mine, output, density, streamlines, dpi) -> Non
         verts[:, 0].max() - verts[:, 0].min(), verts[:, 1].max() - verts[:, 1].min()
     )
     # Contact edges (gold) vs walls (black), from the mesh's own markers.
-    contact = np.zeros(len(edges["bkeys"]), dtype=bool)
-    contact_labels = np.full(len(edges["bkeys"]), "wall", dtype=object)
-    base = os.path.basename(mesh_file) if mesh_file else ""
-    here = os.path.dirname(os.path.abspath(file_list[0]))
-    for cand in ([mesh_file, os.path.join(here, base), base] if mesh_file else []):
-        if cand and os.path.exists(cand):
-            mz = np.load(cand, allow_pickle=True)  # trusted: our own mesh
-            if "boundary_edges" in mz and "boundary_markers" in mz:
-                contact, contact_labels = fv_contact_mask(
-                    edges["bkeys"],
-                    mz["boundary_edges"],
-                    mz["boundary_markers"],
-                    contact_names=contact_names,
-                    bmid=bmid,
-                    mesh_vertices=mz["vertices"] if "vertices" in mz else None,
-                )
-            break
+    contact, contact_labels = fv_contact_mask(
+        edges["bkeys"],
+        boundary_edges,
+        boundary_names,
+        contact_names=contact_names,
+        bmid=bmid,
+        mesh_vertices=verts,
+    )
     # One text anchor per connected contact pad, just outside its own edge.
     contact_text = fv_contact_annotations(
         edges["bkeys"],

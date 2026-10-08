@@ -40,6 +40,7 @@ class Mesh(TreeNode):
 
     def save(self, cp: CheckpointPath) -> list[str]:
         """Save within h5 file and return names of saved variables."""
+        cp.attrs["file"] = self.file
         saved_list = [
             cp.write("vertices", self.vertices),
             cp.write("cells", self.cells),
@@ -149,13 +150,14 @@ def build_fv_geom(mesh: Mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
             )
             edge_map.setdefault(key, []).append((k, f))
     interior, boundary = [], []
+    edge_marker = {(v1, v2): m for v1, v2, m in mesh.edges}
     for key, hits in edge_map.items():
         if len(hits) == 2:
             (kL, fL), (kR, fR) = hits
             interior.append((kL, fL, kR, fR))
         else:
             ((k, f),) = hits
-            boundary.append((k, f, mesh.edge_marker.get(key, 0)))
+            boundary.append((k, f, edge_marker.get(key, 0)))
     interior = np.array(interior, int).reshape(-1, 4)
     boundary = np.array(boundary, int).reshape(-1, 3)
 
@@ -252,7 +254,7 @@ def build_fv_geom(mesh: Mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         bmark=t(bmark, long=True),
         bn=t(fnrm[bk, bf]),
         blen=t(flen[bk, bf]),
-        marker_names=list(mesh.marker_names),
+        marker_names=mesh.boundary_names,
         nbr=t(nbr, long=True),
         recon=t(recon),
     )
