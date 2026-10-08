@@ -26,4 +26,5 @@ time_evolution:
   dt_save: 100.0
   n_collate: 32
 
+checkpoint: null
 checkpoint_out: animation/advect_{:04d}.h5

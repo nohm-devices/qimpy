@@ -72,6 +72,70 @@ class Mesh(TreeNode):
         mesh.lattice_vectors = None
         return mesh
 
+    @staticmethod
+    def make_rect(
+        Lx: float,
+        Ly: float,
+        Nx: int,
+        Ny: int,
+        contacts: dict[str, tuple[float, float, float]],
+    ) -> Mesh:
+        """Make a mesh of an `Lx` x `Ly` region, divided into `Nx` x `Ny` tiles.
+        Each rectangular tile contains four triangular cells to the center.
+        Specify `contacts` mapped from the name to a circle (x0, y0, r):
+        the region of the boundary within the circle is associated to each contact."""
+        mesh = Mesh(file="")
+
+        # Construct vertices for body-centered rectangular mesh:
+        ix = np.arange(Nx + 1)
+        iy = np.arange(Ny + 1)
+        i_mesh = np.stack(np.meshgrid(ix, iy, indexing="ij"))  # 2 x (Nx+1) x (Ny+1)
+        h = np.array([Lx / Nx, Ly / Ny])  # grid spacings
+        corners = i_mesh.reshape(2, -1).T * h
+        centers = (i_mesh[:, :-1, :-1] + 0.5).reshape(2, -1).T * h
+        mesh.vertices = np.vstack((corners, centers))
+
+        # Construct corresponding cells
+        i_corners = i_mesh[0] * (Ny + 1) + i_mesh[1]  # vertex indices for corners
+        i_centers = len(corners) + i_mesh[0, :-1, :-1] * Ny + i_mesh[1, :-1, :-1]
+        i00 = i_corners[:-1, :-1]
+        i01 = i_corners[:-1, 1:]
+        i10 = i_corners[1:, :-1]
+        i11 = i_corners[1:, 1:]
+        null = np.full_like(i11, -1)
+        mesh.cells = np.stack(
+            (
+                np.stack((i00, i10, i_centers, null), axis=-1),
+                np.stack((i10, i11, i_centers, null), axis=-1),
+                np.stack((i11, i01, i_centers, null), axis=-1),
+                np.stack((i01, i00, i_centers, null), axis=-1),
+            ),
+            axis=1,
+        ).reshape(-1, 4)
+        mesh.region_names = []
+
+        # Add boundaries and label contacts:
+        null_x = np.full(Nx, -1)
+        null_y = np.full(Ny, -1)
+        mesh.edges = np.concatenate(
+            (
+                np.stack((i_corners[:-1, 0], i_corners[1:, 0], null_x), axis=-1),
+                np.stack((i_corners[:-1, -1], i_corners[1:, -1], null_x), axis=-1),
+                np.stack((i_corners[0, :-1], i_corners[0, 1:], null_y), axis=-1),
+                np.stack((i_corners[-1, :-1], i_corners[-1, 1:], null_y), axis=-1),
+            ),
+            axis=0,
+        )
+        edge_centers = mesh.vertices[mesh.edges[:, :-1]].mean(axis=1)
+        mesh.boundary_names = []
+        for i_contact, (contact_name, (x0, y0, r)) in enumerate(contacts.items()):
+            mesh.boundary_names.append(contact_name)
+            within = np.linalg.norm(edge_centers - (x0, y0), axis=1) <= r
+            mesh.edges[within, -1] = i_contact
+
+        mesh.lattice_vectors = None
+        return mesh
+
 
 _FACE = np.array([[0, 1], [1, 2], [2, 0]])  # local vertex pairs of the 3 faces (CCW)
 
