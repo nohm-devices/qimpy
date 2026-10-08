@@ -1,121 +1,75 @@
-"""Triangle-mesh container and external-mesh I/O for the FVM solver.
-
-qimpy does NOT generate meshes. The triangle mesh is produced by external
-tooling (e.g. Shewchuk's `triangle`, gmsh, or a hand-written generator) and
-supplied to ``FiniteVolume`` as a file. This module defines the in-memory container
-that ``FiniteVolume`` consumes (``MeshResult``) and the loader/saver for the external
-mesh format.
-
-External mesh format (NumPy ``.npz``)
--------------------------------------
-    vertices          (Nv, 2) float   node coordinates
-    triangles         (K, 3)  int     triangle connectivity (CCW)
-    boundary_edges    (Nb, 2) int     vertex-index pairs on the physical boundary
-    boundary_markers  (Nb,)   str     marker name per boundary edge; a name that
-                                       matches a key in the ``contacts`` dict is a
-                                       contact, anything else (e.g. 'wall') reflects
-    lattice           (nL, 2) float   OPTIONAL periodic displacement vectors
-    cell_regions      (K,)    str     OPTIONAL per-cell named region, '' = none.
-                                       Named cell sets the solver can average an
-                                       observable over -- e.g. the outer end of
-                                       each arm, which is what a probe voltage
-                                       IS.  These are geometry, so they are
-                                       defined here by the mesh generator rather
-                                       than as coordinate boxes in a run config,
-                                       where they would silently select the
-                                       wrong cells on a different mesh.
-
-Only ``vertices`` and ``triangles`` are strictly required; without boundary
-markers every physical face defaults to a reflective wall.
-"""
-
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
 import numpy as np
 import torch
 
-from qimpy import rc
+from qimpy import rc, TreeNode
+from qimpy.io import Checkpoint, CheckpointPath, CheckpointContext
 
 
-@dataclass
-class Mesh:
-    """The mesh as :class:`FiniteVolume` consumes it (output of :func:`load_mesh`)."""
+class Mesh(TreeNode):
+    """Definition of mesh geometry (2D or 1D)"""
 
-    vertices: np.ndarray
-    triangles: np.ndarray
-    edge_marker: dict  # sorted (vi, vj) -> marker id (>0)
-    marker_names: list  # id -> name (id 0 reserved/unused)
-    projectors: dict  # id -> curve-projection fn, or None (straight)
-    cell_regions: Optional[np.ndarray] = None  # (K,) str, '' = no region
-    _lattice: Optional[list] = None
+    file: str  #: File name (h5) that mesh was loaded from
+    vertices: np.ndarray  #: vertex coordinates (Nv, 2)
+    cells: np.ndarray  #: vertex indices and region ID in cells: (Nc, 3 if 1D else 4)
+    edges: np.ndarray  #: sorted vertex indices and ID of boundary edges: (Ne, 3)
+    region_names: list[str]  #: names of interior regions (for cell IDs >= 0)
+    boundary_names: list[str]  #: names of boundary regions (for edge IDs >= 0)
+    lattice_vectors: np.ndarray | None  #: lattice vectors in rows if periodic
+
+    def __init__(
+        self, *, file: str, checkpoint_in: CheckpointPath = CheckpointPath()
+    ) -> None:
+        super().__init__()
+        self.file = file
+        if checkpoint_in:
+            self.load(checkpoint_in)
+        elif file:
+            with Checkpoint(file) as mesh_file:
+                self.load(CheckpointPath(mesh_file, ""))
+        # else: leave empty to initialize externally (used by the mesh make functions)
+
+    def load(self, cp: CheckpointPath) -> None:
+        self.vertices = cp.read_np("vertices")
+        self.cells = cp.read_np("cells")
+        self.edges = cp.read_np("edges")
+        self.region_names = cp.read_str_list("region_names")
+        self.boundary_names = cp.read_str_list("boundary_names")
+        self.lattice_vectors = cp.read_optional_np("lattice_vectors")
+
+    def save(self, cp: CheckpointPath) -> list[str]:
+        """Save within h5 file and return names of saved variables."""
+        saved_list = [
+            cp.write("vertices", self.vertices),
+            cp.write("cells", self.cells),
+            cp.write("edges", self.edges),
+            cp.write_str("region_names", ",".join(self.region_names)),
+            cp.write_str("boundary_names", ",".join(self.boundary_names)),
+        ]
+        if self.lattice_vectors is not None:
+            saved_list.append(cp.write("lattice_vectors", self.lattice_vectors))
+        return saved_list
+
+    def _save_checkpoint(
+        self, cp_path: CheckpointPath, context: CheckpointContext
+    ) -> list[str]:
+        return self.save(cp_path)
 
     @staticmethod
-    def load(path: str) -> Mesh:
-        """Read from file (see module docstring for the format)."""
-        d = np.load(path, allow_pickle=True)
-        vertices = np.asarray(d["vertices"], float)
-        triangles = np.asarray(d["triangles"], int)
-
-        edge_marker: dict = {}
-        marker_names = ["_"]  # id 0 reserved
-        if "boundary_edges" in d and "boundary_markers" in d:
-            be = np.asarray(d["boundary_edges"], int)
-            bn = [str(x) for x in np.asarray(d["boundary_markers"]).ravel()]
-            name_id: dict = {}
-            for (a, b), name in zip(be, bn):
-                if name not in name_id:
-                    name_id[name] = len(marker_names)
-                    marker_names.append(name)
-                edge_marker[tuple(sorted((int(a), int(b))))] = name_id[name]
-        projectors = {i: None for i in range(len(marker_names))}
-
-        cell_regions = None
-        if "cell_regions" in d:
-            cell_regions = np.asarray(
-                [str(x) for x in np.asarray(d["cell_regions"]).ravel()], dtype=object
-            )
-            if len(cell_regions) != len(triangles):
-                raise ValueError(
-                    f"cell_regions has {len(cell_regions)} entries for "
-                    f"{len(triangles)} triangles in {path}"
-                )
-        mesh = Mesh(
-            vertices, triangles, edge_marker, marker_names, projectors, cell_regions
+    def make1D(L: float, N: int) -> Mesh:
+        """Make a 1D mesh of length `L` with `N` intervals.
+        Left and right ends are labeled 'source' and 'drain' respectively."""
+        mesh = Mesh(file="")
+        mesh.vertices = np.column_stack((np.linspace(0, L, N + 1), np.zeros(N + 1)))
+        mesh.cells = np.column_stack(
+            (np.arange(N), np.arange(1, N + 1), np.full(N, -1))
         )
-        if "lattice" in d:
-            lat = np.asarray(d["lattice"], float)
-            if lat.size:
-                mesh._lattice = [row.copy() for row in lat]
+        mesh.edges = np.array([[0, 0, 0], [N, N, 1]])
+        mesh.region_names = []
+        mesh.boundary_names = ["source", "drain"]
+        mesh.lattice_vectors = None
         return mesh
-
-
-def save_mesh(
-    path: str,
-    vertices,
-    triangles,
-    boundary_edges=None,
-    boundary_markers=None,
-    lattice=None,
-    cell_regions=None,
-) -> None:
-    """Write an external triangle mesh in the format :func:`load_mesh` reads.
-
-    Convenience for external mesh generators; qimpy itself never calls this
-    during a run. ``boundary_edges``/``boundary_markers`` tag physical faces
-    (a name matching a contact key becomes that contact; others reflect).
-    """
-    out = dict(
-        vertices=np.asarray(vertices, float), triangles=np.asarray(triangles, int)
-    )
-    if boundary_edges is not None:
-        out["boundary_edges"] = np.asarray(boundary_edges, int)
-        out["boundary_markers"] = np.asarray(boundary_markers, dtype=object)
-    if lattice is not None:
-        out["lattice"] = np.asarray(lattice, float)
-    if cell_regions is not None:
-        out["cell_regions"] = np.asarray(cell_regions, dtype=object)
-    np.savez(path, **out)
 
 
 _FACE = np.array([[0, 1], [1, 2], [2, 0]])  # local vertex pairs of the 3 faces (CCW)
@@ -159,13 +113,13 @@ class FVGeom:
     recon: torch.Tensor  # (K, 3, Nmax) face-increment op: d_face = recon @ (u_nbr - u)
 
 
-def build_fv_geom(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
+def build_fv_geom(mesh: Mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     """Build the FV geometry from a loaded mesh (``_mesh.MeshResult``).
 
     Dispatches on cell type: 3 vertices/cell -> 2D triangles, 2 vertices/cell ->
     a 1D line mesh (interval cells; see :func:`_build_fv_geom_1d`).
     """
-    tri = np.asarray(mesh.triangles, dtype=int)
+    tri = mesh.cells[:, :-1]
     if tri.shape[1] == 2:
         return _build_fv_geom_1d(mesh, dtype=dtype)
     V = mesh.vertices
@@ -304,7 +258,7 @@ def build_fv_geom(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     )
 
 
-def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
+def _build_fv_geom_1d(mesh: Mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     """Build the FV geometry for a 1D line mesh: interval cells on a line.
 
     Each cell is an interval with two endpoint "faces" (local face 0 = left
@@ -319,7 +273,7 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     is untouched -- velocities stay 2D; only ``v_x = v.n`` streams along the line.
     """
     V = mesh.vertices
-    seg = np.asarray(mesh.triangles, dtype=int)  # (K, 2): [v_left, v_right]
+    seg = mesh.cells[:, :-1]
     K = len(seg)
     p = V[seg]  # (K, 2, 2): endpoints
     centroid = p.mean(axis=1)  # (K, 2)
@@ -336,6 +290,7 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
     flen = np.ones((K, 2))  # point face: unit measure
 
     # Interior / boundary by shared-vertex dedup.
+    edge_marker = {(v1, v2): m for v1, v2, m in mesh.edges}
     vmap: dict[int, list[tuple[int, int]]] = {}
     for k in range(K):
         for f in range(2):
@@ -347,7 +302,7 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
             interior.append((kL, fL, kR, fR))
         else:
             ((k, f),) = hits
-            boundary.append((k, f, mesh.edge_marker.get((v, v), 0)))
+            boundary.append((k, f, edge_marker.get((v, v), 0)))
     interior = np.array(interior, int).reshape(-1, 4)
     boundary = np.array(boundary, int).reshape(-1, 3)
     kL, fL, kR, fR = interior.T if len(interior) else (np.empty(0, int),) * 4
@@ -400,7 +355,7 @@ def _build_fv_geom_1d(mesh, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         bmark=t(bmark, long=True),
         bn=t(fnrm[bk, bf]),
         blen=t(flen[bk, bf]),
-        marker_names=list(mesh.marker_names),
+        marker_names=mesh.boundary_names,
         nbr=t(nbr, long=True),
         recon=t(recon),
     )

@@ -8,27 +8,17 @@ Fermi surface stays 2D, and only v_x = v.n streams along the line.
 
     python make_1d_mesh.py --nx 64 --out line.npz
 """
+
 import argparse
-import numpy as np
-from qimpy.transport.geometry._mesh import save_mesh
 
-
-def make(nx, path, Lx=1.0):
-    x = np.linspace(0.0, Lx, nx + 1)
-    vertices = np.column_stack([x, np.zeros(nx + 1)])          # (nx+1, 2), y = 0
-    cells = np.column_stack([np.arange(nx), np.arange(1, nx + 1)])  # (nx, 2) intervals
-    # Boundary "faces" are the two end vertices, tagged as degenerate (v, v) edges:
-    boundary = np.array([[0, 0], [nx, nx]], int)
-    markers = ["source", "drain"]
-    save_mesh(path, vertices, cells, boundary, markers)
-    print(f"wrote {path}: {nx} interval cells on [0,{Lx}], "
-          f"source (x=0) / drain (x={Lx})")
-
+from qimpy.transport.geometry import Mesh
+from qimpy.io import Checkpoint, CheckpointPath
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--nx", type=int, default=64)
     ap.add_argument("--Lx", type=float, default=1.0)
-    ap.add_argument("--out", type=str, default="line.npz")
+    ap.add_argument("--out", type=str, default="line.h5")
     a = ap.parse_args()
-    make(a.nx, a.out, a.Lx)
+    with Checkpoint(a.out, writable=True) as cp:
+        Mesh.make1D(a.Lx, a.nx).save(CheckpointPath(cp))

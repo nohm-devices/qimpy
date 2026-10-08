@@ -62,20 +62,15 @@ def _dual_graph(EToV) -> list[list[int]]:
 def _coordinate_part(mesh, nparts: int) -> np.ndarray:
     """Fallback partition (no METIS): sort cells along the longer axis into
     equal-count blocks. Correct but with poorer locality on branchy meshes."""
-    cen = mesh.vertices[np.asarray(mesh.triangles, int)].mean(axis=1)
-    # ⛔ NumPy 2.0 removed ndarray.ptp; the free function still exists.
-    # This one line broke EVERY multi-rank run -- the decomposition could
-    # not even be built -- so the halo exchange had never executed under
-    # any numpy >= 2, and test_decomp_matches_serial failed on the
-    # pristine tree for the same reason.
-    axis = 0 if np.ptp(cen[:, 0]) >= np.ptp(cen[:, 1]) else 1
-    order = np.argsort(cen[:, axis], kind="stable")
+    centroids = mesh.vertices[mesh.cells[:, :-1]].mean(axis=1)
+    axis = np.ptp(centroids, axis=0).argmin()
+    order = np.argsort(centroids[:, axis], kind="stable")
     part = np.empty(len(order), np.int32)
     part[order] = np.minimum((np.arange(len(order)) * nparts) // len(order), nparts - 1)
     return part
 
 
-def partition(mesh, group: "dist.ProcessGroup") -> tuple[np.ndarray, np.ndarray]:
+def partition(mesh, group: dist.ProcessGroup) -> tuple[np.ndarray, np.ndarray]:
     """Renumber cells into contiguous per-rank blocks.
 
     Returns ``(perm, bounds)``: applying ``EToV[perm]`` places rank ``r``'s cells
@@ -84,24 +79,22 @@ def partition(mesh, group: "dist.ProcessGroup") -> tuple[np.ndarray, np.ndarray]
     so every rank agrees exactly; falls back to a coordinate sort if pymetis is
     not installed.
     """
-    K = len(mesh.triangles)
+    K = len(mesh.cells)
     nparts = group.size()
     if nparts == 1:
         return np.arange(K), np.array([0, K], int)
-    part = None
+    part = np.arange(K, dtype=np.int32)
     if dist.get_rank(group) == 0:
         try:
             import pymetis
 
-            _, p = pymetis.part_graph(nparts, adjacency=_dual_graph(mesh.triangles))
+            _, p = pymetis.part_graph(nparts, adjacency=_dual_graph(mesh.cells[:, :-1]))
             part = np.asarray(p, np.int32)
         except ImportError:
             part = _coordinate_part(mesh, nparts)
-    # ⛔ dist has no bcast for python objects that returns a value; use the
-    # object-list form and read element 0 back out.
-    box = [part]
-    dist.broadcast_object_list(box, src=0, group=group)
-    part = box[0]
+    part_t = torch.from_numpy(part).to(rc.device)
+    dist.broadcast(part_t, src=0, group=group)
+    part = part_t.to(rc.cpu).numpy()
     perm = np.argsort(part, kind="stable")  # group cells by rank
     bounds = np.concatenate([[0], np.cumsum(np.bincount(part, minlength=nparts))])
     return perm, bounds.astype(int)
@@ -238,7 +231,7 @@ class Geometry(TreeNode):
         self,
         *,
         material: Material,
-        mesh_file: str,
+        mesh: Mesh | dict | None = None,
         contacts: dict[str, Optional[dict]],
         cfl: float = 0.4,
         vk_eps2: float = 0.0,
@@ -253,8 +246,8 @@ class Geometry(TreeNode):
         """
         Parameters
         ----------
-        mesh_file
-            :yaml:`Path to an external triangle mesh (.npz) to solve on.`
+        mesh
+            :yaml:`Specification of 2D or 1D mesh geometry for transport.`
         contacts
             :yaml:`Dictionary of contact names to parameters (match mesh markers).`
             Each value selects the contact kind: ``{dmu, vD}`` a fixed
@@ -273,21 +266,20 @@ class Geometry(TreeNode):
         """
         TreeNode.__init__(self)
         self.material = material
+        self.add_child("mesh", Mesh, mesh, checkpoint_in)
         self.group = process_grid.get_group("r")
-        self.mesh_file = mesh_file
         self.contacts = contacts
         self.save_rho = save_rho
         self.save_terms = save_terms
         self._vk_eps2 = float(vk_eps2)
 
-        self.mesh = Mesh.load(mesh_file)
         self._mpi = self.group.size() > 1
         if self._mpi:
             # METIS min-cut partition, renumbered so each rank owns a contiguous
             # block (compact halos + direct checkpoint slices). Keep the
             # permutation so the renumbered solution maps back to the input order.
             self._perm, bounds = partition(self.mesh, self.group)
-            self.mesh.triangles = np.asarray(self.mesh.triangles, int)[self._perm]
+            self.mesh.cells = self.mesh.cells[self._perm]
         else:
             self._perm, bounds = None, None
         g = build_fv_geom(self.mesh, dtype=material.transport_velocity.dtype)
@@ -1115,12 +1107,7 @@ class Geometry(TreeNode):
         # NOTE: checkpoint attrs are fed back as constructor kwargs on restart
         # (qimpy convention: attrs == constructor params), so only real
         # constructor arguments may be written here.
-        cp_path.attrs["mesh_file"] = self.mesh_file
         saved = [
-            cp_path.write("mesh_vertices", torch.from_numpy(g.vertices_np)),
-            cp_path.write(
-                "mesh_triangles", torch.from_numpy(g.triangles_np.astype(np.int64))
-            ),
             cp_path.write("cell_centroid", torch.from_numpy(g.centroid_np)),
             "fv_observables",
         ]

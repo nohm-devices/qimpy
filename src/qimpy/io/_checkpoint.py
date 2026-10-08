@@ -55,8 +55,9 @@ class Checkpoint(h5py.File):
             if rc.is_head:
                 super().__init__(filename_open, mode)
             else:
-                super().__init__(filename_open, mode, driver="core",
-                                 backing_store=False)
+                super().__init__(
+                    filename_open, mode, driver="core", backing_store=False
+                )
         else:
             super().__init__(filename_open, mode, driver="mpio", comm=rc.comm)
         mode_name = "writing:" if writable else "reading"
@@ -92,8 +93,11 @@ class Checkpoint(h5py.File):
             payloads = rc.comm.gather((tuple(offset), data.to(rc.cpu).numpy()), root=0)
             if rc.is_head:
                 for off, arr in payloads:
-                    dset[tuple(slice(off[i], off[i] + s) for i, s in
-                               enumerate(arr.shape))] = arr
+                    dset[
+                        tuple(
+                            slice(off[i], off[i] + s) for i, s in enumerate(arr.shape)
+                        )
+                    ] = arr
             return
         index = tuple(
             slice(offset[i], offset[i] + s_i) for i, s_i in enumerate(data.shape)
@@ -115,12 +119,19 @@ class Checkpoint(h5py.File):
         return torch.from_numpy(dset[index]).to(rc.device)
 
     def create_dataset_real(
-        self, path: str, shape: tuple[int, ...], dtype: torch.dtype = torch.float64
+        self,
+        path: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype | np.dtype = torch.float64,
     ) -> Any:
         """Create a dataset at `path` suitable for a real array of size `shape`.
         Additionally, `dtype` is translated
         from torch to numpy for convenience."""
-        return self.create_dataset(path, shape=shape, dtype=rc.np_type[dtype])
+        return self.create_dataset(
+            path,
+            shape=shape,
+            dtype=(rc.np_type[dtype] if isinstance(dtype, torch.dtype) else dtype),
+        )
 
     def create_dataset_complex(
         self, path: str, shape: tuple[int, ...], dtype: torch.dtype = torch.complex128
@@ -214,7 +225,7 @@ class CheckpointPath(NamedTuple):
             "/".join((self.path, name)), shape, dtype, **kwargs
         )
 
-    def write(self, name: str, data: torch.Tensor) -> str:
+    def write(self, name: str, data: torch.Tensor | np.ndarray) -> str:
         """Write `data` available on all processes to `name` within current path.
         This is convenient for small tensors that are not split over MPI.
         For complex data, pass a real view that has a final dimension of length 2.
@@ -224,7 +235,9 @@ class CheckpointPath(NamedTuple):
         assert checkpoint is not None
         dset = checkpoint.create_dataset_real(path, data.shape, data.dtype)
         if rc.is_head:
-            dset[...] = data.to(rc.cpu).numpy()
+            dset[...] = (
+                data.to(rc.cpu).numpy() if isinstance(data, torch.Tensor) else data
+            )
         return name
 
     def read(self, name: str, report: bool = True) -> torch.Tensor:
@@ -237,10 +250,27 @@ class CheckpointPath(NamedTuple):
         dset = checkpoint[path]
         return torch.from_numpy(dset[...]).to(rc.device)
 
+    def read_np(self, name: str, report: bool = True) -> np.ndarray:
+        """Read entire dataset from `name`, reporting to log if `report`."""
+        checkpoint, path = self.relative(name)
+        assert checkpoint is not None
+        assert path in checkpoint
+        if report:
+            log.info(f"Loading {name}")
+        dset = checkpoint[path]
+        return np.array(dset)
+
     def read_optional(self, name: str, report: bool = True) -> torch.Tensor | None:
         """Handle optional dataset with `read`, returning None if not found."""
         try:
             return self.read(name, report)
+        except AssertionError:
+            return None
+
+    def read_optional_np(self, name: str, report: bool = True) -> np.ndarray | None:
+        """Handle optional dataset with `read`, returning None if not found."""
+        try:
+            return self.read_np(name, report)
         except AssertionError:
             return None
 
@@ -259,6 +289,12 @@ class CheckpointPath(NamedTuple):
         checkpoint, path = self.relative(name)
         assert checkpoint is not None
         return str(np.bytes_(checkpoint[path]).decode())
+
+    def read_str_list(self, name: str, sep: str = ",") -> list[str]:
+        """Read list of regular strings tokenized from single byte string in checkpoint.
+        This handles the edge case of an empty list (whereas str.split returns [''])."""
+        result = self.read_str(name)
+        return result.split(sep) if result else list[str]()
 
     def __getitem__(self, key) -> Any:
         checkpoint, path = self.relative(key)
