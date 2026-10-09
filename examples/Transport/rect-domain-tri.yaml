@@ -1,7 +1,3 @@
-# rect-domain driven by source/drain contacts, solved with the finite-volume
-# triangle-mesh transport (spatial_transport). The mesh is supplied externally (qimpy does
-# not mesh); generate it first with:
-#     python make_rect_mesh.py --out rect-domain-tri.npz
 fermi_surface:
   kF: 1.0
   vF: 1.5
@@ -13,8 +9,15 @@ fermi_surface:
 
 geometry:
   mesh:
-    file: rect-domain-mesh.h5
-  compile: true
+    rect:
+      Lx: 100.0
+      Ly: 50.0
+      Nx: 32
+      Ny: 16
+      contacts:
+        source: [5.0, 50.0, 5.0]
+        drain: [5.0, 0.0, 5.0]
+  compile: no
   contacts:
     source:
       dmu: +0.1

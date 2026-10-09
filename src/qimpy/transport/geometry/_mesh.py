@@ -10,7 +10,7 @@ from qimpy.io import Checkpoint, CheckpointPath, CheckpointContext
 class Mesh(TreeNode):
     """Definition of mesh geometry (2D or 1D)"""
 
-    file: str  #: File name (h5) that mesh was loaded from
+    source: File | Line | Rect  #: Method by which mesh is constructed
     vertices: np.ndarray  #: vertex coordinates (Nv, 2)
     cells: np.ndarray  #: vertex indices and region ID in cells: (Nc, 3 if 1D else 4)
     edges: np.ndarray  #: sorted vertex indices and ID of boundary edges: (Ne, 3)
@@ -19,16 +19,39 @@ class Mesh(TreeNode):
     lattice_vectors: np.ndarray | None  #: lattice vectors in rows if periodic
 
     def __init__(
-        self, *, file: str, checkpoint_in: CheckpointPath = CheckpointPath()
+        self,
+        *,
+        file: File | dict | None = None,
+        line: Line | dict | None = None,
+        rect: Rect | dict | None = None,
+        checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
+        """
+        Initialize mesh geometry.
+
+        Parameters
+        ----------
+        file
+            :yaml:`Load mesh from HDF5 file.`
+            Only one source for the mesh must be specified.
+        line
+            :yaml:`Construct uniform mesh for a 1D domain.`
+            Only one source for the mesh must be specified.
+        rect
+            :yaml:`Construct triangular mesh for a 2D rectangular domain.`
+            Only one source for the mesh must be specified.
+        """
         super().__init__()
-        self.file = file
+        self.add_child_one_of(
+            "source",
+            checkpoint_in,
+            TreeNode.ChildOptions("file", Mesh.File, file, mesh=self),
+            TreeNode.ChildOptions("line", Mesh.Line, line, mesh=self),
+            TreeNode.ChildOptions("file", Mesh.Rect, rect, mesh=self),
+            have_default=False,
+        )
         if checkpoint_in:
             self.load(checkpoint_in)
-        elif file:
-            with Checkpoint(file) as mesh_file:
-                self.load(CheckpointPath(mesh_file, ""))
-        # else: leave empty to initialize externally (used by the mesh make functions)
 
     def load(self, cp: CheckpointPath) -> None:
         self.vertices = cp.read_np("vertices")
@@ -40,7 +63,6 @@ class Mesh(TreeNode):
 
     def save(self, cp: CheckpointPath) -> list[str]:
         """Save within h5 file and return names of saved variables."""
-        cp.attrs["file"] = self.file
         saved_list = [
             cp.write("vertices", self.vertices),
             cp.write("cells", self.cells),
@@ -57,84 +79,169 @@ class Mesh(TreeNode):
     ) -> list[str]:
         return self.save(cp_path)
 
-    @staticmethod
-    def make1D(L: float, N: int) -> Mesh:
-        """Make a 1D mesh of length `L` with `N` intervals.
-        Left and right ends are labeled 'source' and 'drain' respectively."""
-        mesh = Mesh(file="")
-        mesh.vertices = np.column_stack((np.linspace(0, L, N + 1), np.zeros(N + 1)))
-        mesh.cells = np.column_stack(
-            (np.arange(N), np.arange(1, N + 1), np.full(N, -1))
-        )
-        mesh.edges = np.array([[0, 0, 0], [N, N, 1]])
-        mesh.region_names = []
-        mesh.boundary_names = ["source", "drain"]
-        mesh.lattice_vectors = None
-        return mesh
+    class File(TreeNode):
+        def __init__(
+            self,
+            *,
+            name: str,
+            mesh: Mesh,
+            checkpoint_in: CheckpointPath = CheckpointPath(),
+        ) -> None:
+            """Load mesh from file.
 
-    @staticmethod
-    def make_rect(
-        Lx: float,
-        Ly: float,
-        Nx: int,
-        Ny: int,
-        contacts: dict[str, tuple[float, float, float]],
-    ) -> Mesh:
-        """Make a mesh of an `Lx` x `Ly` region, divided into `Nx` x `Ny` tiles.
-        Each rectangular tile contains four triangular cells to the center.
-        Specify `contacts` mapped from the name to a circle (x0, y0, r):
-        the region of the boundary within the circle is associated to each contact."""
-        mesh = Mesh(file="")
+            Parameters
+            ----------
+            name
+                :yaml:`Filename of HDF5 file to load mesh from.`
+            """
+            super().__init__()
+            self.name = name
+            if checkpoint_in:
+                return  # data will be loaded from checkpoint instead
+            with Checkpoint(name) as mesh_file:
+                mesh.load(CheckpointPath(mesh_file, ""))
 
-        # Construct vertices for body-centered rectangular mesh:
-        ix = np.arange(Nx + 1)
-        iy = np.arange(Ny + 1)
-        i_mesh = np.stack(np.meshgrid(ix, iy, indexing="ij"))  # 2 x (Nx+1) x (Ny+1)
-        h = np.array([Lx / Nx, Ly / Ny])  # grid spacings
-        corners = i_mesh.reshape(2, -1).T * h
-        centers = (i_mesh[:, :-1, :-1] + 0.5).reshape(2, -1).T * h
-        mesh.vertices = np.vstack((corners, centers))
+        def _save_checkpoint(
+            self, cp_path: CheckpointPath, context: CheckpointContext
+        ) -> list[str]:
+            cp_path.attrs["name"] = self.name
+            return list(cp_path.attrs.keys())
 
-        # Construct corresponding cells
-        i_corners = i_mesh[0] * (Ny + 1) + i_mesh[1]  # vertex indices for corners
-        i_centers = len(corners) + i_mesh[0, :-1, :-1] * Ny + i_mesh[1, :-1, :-1]
-        i00 = i_corners[:-1, :-1]
-        i01 = i_corners[:-1, 1:]
-        i10 = i_corners[1:, :-1]
-        i11 = i_corners[1:, 1:]
-        null = np.full_like(i11, -1)
-        mesh.cells = np.stack(
-            (
-                np.stack((i00, i10, i_centers, null), axis=-1),
-                np.stack((i10, i11, i_centers, null), axis=-1),
-                np.stack((i11, i01, i_centers, null), axis=-1),
-                np.stack((i01, i00, i_centers, null), axis=-1),
-            ),
-            axis=1,
-        ).reshape(-1, 4)
-        mesh.region_names = []
+    class Line(TreeNode):
+        def __init__(
+            self,
+            *,
+            L: float,
+            N: int,
+            mesh: Mesh,
+            checkpoint_in: CheckpointPath = CheckpointPath(),
+        ) -> None:
+            """Make a 1D mesh with 'source' and 'drain' contacts at the ends.
 
-        # Add boundaries and label contacts:
-        null_x = np.full(Nx, -1)
-        null_y = np.full(Ny, -1)
-        mesh.edges = np.concatenate(
-            (
-                np.stack((i_corners[:-1, 0], i_corners[1:, 0], null_x), axis=-1),
-                np.stack((i_corners[:-1, -1], i_corners[1:, -1], null_x), axis=-1),
-                np.stack((i_corners[0, :-1], i_corners[0, 1:], null_y), axis=-1),
-                np.stack((i_corners[-1, :-1], i_corners[-1, 1:], null_y), axis=-1),
-            ),
-            axis=0,
-        )
-        edge_centers = mesh.vertices[mesh.edges[:, :-1]].mean(axis=1)
-        mesh.boundary_names = []
-        for i_contact, (contact_name, (x0, y0, r)) in enumerate(contacts.items()):
-            mesh.boundary_names.append(contact_name)
-            within = np.linalg.norm(edge_centers - (x0, y0), axis=1) <= r
-            mesh.edges[within, -1] = i_contact
+            Parameters
+            ----------
+            L
+                :yaml:`Length of the 1D domain.`
+            N
+                :yaml:`Number of intervals to divide the domain into.`
+            """
+            super().__init__()
+            self.L = L
+            self.N = N
+            if checkpoint_in:
+                return  # data will be loaded from checkpoint instead
+            mesh.vertices = np.column_stack((np.linspace(0, L, N + 1), np.zeros(N + 1)))
+            mesh.cells = np.column_stack(
+                (np.arange(N), np.arange(1, N + 1), np.full(N, -1))
+            )
+            mesh.edges = np.array([[0, 0, 0], [N, N, 1]])
+            mesh.region_names = []
+            mesh.boundary_names = ["source", "drain"]
+            mesh.lattice_vectors = None
 
-        mesh.lattice_vectors = None
-        return mesh
+        def _save_checkpoint(
+            self, cp_path: CheckpointPath, context: CheckpointContext
+        ) -> list[str]:
+            cp_path.attrs["L"] = self.L
+            cp_path.attrs["N"] = self.N
+            return list(cp_path.attrs.keys())
+
+    class Rect(TreeNode):
+        def __init__(
+            self,
+            *,
+            Lx: float,
+            Ly: float,
+            Nx: int,
+            Ny: int,
+            contacts: dict[str, tuple[float, float, float]],
+            mesh: Mesh,
+            checkpoint_in: CheckpointPath = CheckpointPath(),
+        ) -> None:
+            """Make a 2D rectangular domain with a body-centered rectangular mesh.
+            The overall rectangle is divided into rectanglular tiles in each direction,
+            and each tile is divided into four triangular cells using its center.
+
+            Parameters
+            ----------
+            Lx
+                :yaml:`Length of the first dimensinon of rectangular domain.`
+            Ly
+                :yaml:`Length of the second dimensinon of rectangular domain.`
+            Nx
+                :yaml:`Number of intervals to divide the first dimension into.`
+            Ny
+                :yaml:`Number of intervals to divide the second dimension into.`
+            contacts
+                :yaml:`Named regions on the rectangle boundary to use as contacts.`
+                Each name is associated with a circle (x0, y0, r): any edges on the
+                boundary with center within this circle is associated to that name.
+            """
+            super().__init__()
+            self.Lx = Lx
+            self.Ly = Ly
+            self.Nx = Nx
+            self.Ny = Ny
+            if checkpoint_in:
+                return  # data will be loaded from checkpoint instead
+
+            # Construct vertices for body-centered rectangular mesh:
+            ix = np.arange(Nx + 1)
+            iy = np.arange(Ny + 1)
+            i_mesh = np.stack(np.meshgrid(ix, iy, indexing="ij"))  # 2 x (Nx+1) x (Ny+1)
+            h = np.array([Lx / Nx, Ly / Ny])  # grid spacings
+            corners = i_mesh.reshape(2, -1).T * h
+            centers = (i_mesh[:, :-1, :-1] + 0.5).reshape(2, -1).T * h
+            mesh.vertices = np.vstack((corners, centers))
+
+            # Construct corresponding cells
+            i_corners = i_mesh[0] * (Ny + 1) + i_mesh[1]  # vertex indices for corners
+            i_centers = len(corners) + i_mesh[0, :-1, :-1] * Ny + i_mesh[1, :-1, :-1]
+            i00 = i_corners[:-1, :-1]
+            i01 = i_corners[:-1, 1:]
+            i10 = i_corners[1:, :-1]
+            i11 = i_corners[1:, 1:]
+            null = np.full_like(i11, -1)
+            mesh.cells = np.stack(
+                (
+                    np.stack((i00, i10, i_centers, null), axis=-1),
+                    np.stack((i10, i11, i_centers, null), axis=-1),
+                    np.stack((i11, i01, i_centers, null), axis=-1),
+                    np.stack((i01, i00, i_centers, null), axis=-1),
+                ),
+                axis=1,
+            ).reshape(-1, 4)
+            mesh.region_names = []
+
+            # Add boundaries and label contacts:
+            null_x = np.full(Nx, -1)
+            null_y = np.full(Ny, -1)
+            mesh.edges = np.concatenate(
+                (
+                    np.stack((i_corners[:-1, 0], i_corners[1:, 0], null_x), axis=-1),
+                    np.stack((i_corners[:-1, -1], i_corners[1:, -1], null_x), axis=-1),
+                    np.stack((i_corners[0, :-1], i_corners[0, 1:], null_y), axis=-1),
+                    np.stack((i_corners[-1, :-1], i_corners[-1, 1:], null_y), axis=-1),
+                ),
+                axis=0,
+            )
+            edge_centers = mesh.vertices[mesh.edges[:, :-1]].mean(axis=1)
+            mesh.boundary_names = []
+            for i_contact, (contact_name, (x0, y0, r)) in enumerate(contacts.items()):
+                mesh.boundary_names.append(contact_name)
+                within = np.linalg.norm(edge_centers - (x0, y0), axis=1) <= r
+                mesh.edges[within, -1] = i_contact
+
+            mesh.lattice_vectors = None
+
+        def _save_checkpoint(
+            self, cp_path: CheckpointPath, context: CheckpointContext
+        ) -> list[str]:
+            cp_path.attrs["Lx"] = self.Lx
+            cp_path.attrs["Ly"] = self.Ly
+            cp_path.attrs["Nx"] = self.Nx
+            cp_path.attrs["Ny"] = self.Ny
+            return list(cp_path.attrs.keys())
 
 
 _FACE = np.array([[0, 1], [1, 2], [2, 0]])  # local vertex pairs of the 3 faces (CCW)
