@@ -85,17 +85,25 @@ class Geometry(TreeNode):
         wR = a_int * (geom.elen * inv_area[geom.eR])[:, None]
         wB = -a_bnd * (geom.blen * inv_area[geom.bcell])[:, None]
         ik = torch.arange(self.Nk, device=rc.device)
-        idx_in = ik + self.Nk * torch.cat(
-            (
-                torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None]).tile(2, 1),
-                geom.bF[:, None].expand(-1, self.Nk),
+        idx_in = (
+            ik
+            + self.Nk
+            * torch.cat(
+                (
+                    torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None]).tile(2, 1),
+                    geom.bF[:, None].expand(-1, self.Nk),
+                )
             )
-        )
-        idx_out = ik + self.Nk * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
+        ).flatten()
+        idx_out = (
+            ik + self.Nk * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
+        ).flatten()
+        values = torch.cat((wL.flatten(), wR.flatten(), wB.flatten()))
+        sel_mine = torch.where(idx_out < self.cell_division.n_mine * self.Nk)[0]
         n_recon = self.cell_division.n_recon
         self.v_dot_del = torch.sparse_coo_tensor(
-            indices=torch.stack((idx_out.flatten(), idx_in.flatten())),
-            values=torch.cat((wL.flatten(), wR.flatten(), wB.flatten())),
+            indices=torch.stack((idx_out[sel_mine], idx_in[sel_mine])),
+            values=values[sel_mine],
             size=(len(geom.area) * self.Nk, n_recon * self._nf * self.Nk),
         ).to_sparse_csr()
 
@@ -271,7 +279,6 @@ class Geometry(TreeNode):
         n_mine = self.cell_division.n_mine
         if self.collision_enabled:
             out[:n_mine] += self.material.rho_dot(rho[:n_mine], t, id(self))
-        out[n_mine:].zero_()  # mask out ghost zhones
         return out
 
     def collision_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
