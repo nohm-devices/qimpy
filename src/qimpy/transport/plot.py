@@ -404,6 +404,7 @@ def run_finite_volume(
     log.setLevel(logging.INFO)
     t_probes = []
     probes_region = []
+    probes_flux = []
     for checkpoint_file in file_list:
         with Checkpoint(checkpoint_file) as cp:
             g = cp["/geometry"]
@@ -411,6 +412,7 @@ def run_finite_volume(
             t_list = np.array(g["t"])[mine]
             t_probes.append(np.array(g["t_probe"]))
             probes_region.append(np.array(g["probes"]))
+            probes_flux.append(np.array(g["probe_flux"]))
             obs = np.array(g["observables"][mine])  # (nframe, K, n_scalar)
             scalar_names = _read_str_list(g, "observable_names")
             region_names = _read_str_list(g["mesh"], "region_names")
@@ -520,11 +522,10 @@ def run_finite_volume(
     if probes and rc.is_head:
         t = np.concatenate(t_probes)
         probes_region = np.concatenate(probes_region, axis=0)
+        probes_flux = np.concatenate(probes_flux, axis=0)
         order = t.argsort()
         t = t[order]
         probes_region = probes_region[order]
-        if len(region_names) < probes_region.shape[1]:
-            region_names.append("remainder")
         for i_name, name in enumerate(scalar_names):
             plt.figure()
             plt.xlabel("t")
@@ -532,7 +533,19 @@ def run_finite_volume(
             for i_region, region_name in enumerate(region_names):
                 plt.plot(t, probes_region[:, i_region, i_name], label=region_name)
             plt.legend()
-            plt.savefig(probes.format(name), bbox_inches="tight")
+            filename = probes.format(name)
+            plt.savefig(filename, bbox_inches="tight")
+            log.info(f"Saved {filename}")
+        for i_name, name in enumerate(flux_names):
+            plt.figure()
+            plt.xlabel("t")
+            plt.ylabel(f"{name} flux")
+            for i_boundary, boundary_name in enumerate(boundary_names):
+                plt.plot(t, probes_flux[:, i_boundary, i_name], label=boundary_name)
+            plt.legend()
+            filename = probes.format(f"flux_{name}")
+            plt.savefig(filename, bbox_inches="tight")
+            log.info(f"Saved {filename}")
         plt.show()
 
 
