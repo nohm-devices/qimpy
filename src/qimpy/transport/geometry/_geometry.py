@@ -186,7 +186,11 @@ class Geometry(TreeNode):
                 values=values,
                 size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
             ).to_sparse_csr()
-            self.probe_faces = geom.bF[probe_edges]
+            self.probe_bcell, probe_i_cell = torch.unique(
+                geom.bcell[probe_edges], return_inverse=True
+            )
+            probe_i_face = geom.bF[probe_edges] - self._nf * geom.bcell[probe_edges]
+            self.probe_faces = probe_i_cell * self._nf + probe_i_face
             self.probe_outward = self.is_outward[probe_edges]
             self.probe_wall = torch.where(torch.isin(self._wall, probe_edges))[0]
             for contact in self.contacts.values():
@@ -298,13 +302,19 @@ class Geometry(TreeNode):
 
         # Reconstruct faces from cells in chunks:
         g = self.geom
-        n_recon = self.cell_division.n_recon
-        rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
-        block_size = self.faces_block_size if self.faces_block_size else n_recon
-        for sel in get_block_slices(n_recon, block_size):
-            rho_faces[sel] = self._face_limiter(
+        if boundary_only:
+            sel = self.probe_bcell
+            rho_faces = self._face_limiter(
                 rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
             )
+        else:
+            n_recon = self.cell_division.n_recon
+            rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
+            block_size = self.faces_block_size if self.faces_block_size else n_recon
+            for sel in get_block_slices(n_recon, block_size):
+                rho_faces[sel] = self._face_limiter(
+                    rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
+                )
         rho_faces = rho_faces.reshape(-1, self.Nk)
 
         # Apply boundary conditions:
