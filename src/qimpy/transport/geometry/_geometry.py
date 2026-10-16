@@ -232,8 +232,14 @@ class Geometry(TreeNode):
         else:
             self._reflector = None
 
-    def to_faces(self, rho: torch.Tensor) -> torch.Tensor:
-        """Reconstruct face values from cell-centred values."""
+    def to_faces(self, rho: torch.Tensor, t: float) -> torch.Tensor:
+        """Reconstruct face values from cell-centred values and boundary conditions.
+        Result is flattened over the cell and face dimensions."""
+        # Update ghost regions if needed:
+        if self.cell_division is not None:
+            self.cell_division.exchange(rho)
+
+        # Reconstruct faces from cells in chunks:
         g = self.geom
         n_recon = self.cell_division.n_recon
         rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
@@ -242,12 +248,9 @@ class Geometry(TreeNode):
             rho_faces[sel] = self._face_limiter(
                 rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
             )
-        return rho_faces
+        rho_faces = rho_faces.reshape(-1, self.Nk)
 
-    def _spatial_rhs(self, rho: torch.Tensor, t: float) -> torch.Tensor:
-        g = self.geom
-        self.material.constrain(rho)
-        rho_faces = self.to_faces(rho).reshape(-1, self.Nk)
+        # Apply boundary conditions:
         if g.bcell.numel():
             rho_outward = rho_faces[g.bF]  # boundary faces, valid outwards
             # Apply reflections and contacts:
@@ -258,13 +261,12 @@ class Geometry(TreeNode):
                 rho_inward[contact.indices] = contact.contactor(t)
             # Set back to faces:
             rho_faces[g.bF] = torch.where(self.is_outward, rho_outward, rho_inward)
-        return (self.v_dot_del @ rho_faces.view(-1)).view(-1, self.Nk)
+        return rho_faces
 
     def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
+        self.material.constrain(rho)
         watch = StopWatch("Geometry.rho_dot")
-        if self.cell_division is not None:
-            self.cell_division.exchange(rho)  # update ghost regions
-        out = self._spatial_rhs(rho, t)
+        out = (self.v_dot_del @ self.to_faces(rho, t).flatten()).view(rho.shape)
         watch.stop()
         n_mine = self.cell_division.n_mine
         if self.collision_enabled:
