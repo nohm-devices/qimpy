@@ -278,6 +278,9 @@ class Mesh(TreeNode):
         # Filter interior edges so that both cells local and at least one owned:
         interior = interior[(interior[..., 0] >= 0).all(axis=1)]  # both cells local
         interior = interior[(interior[..., 0] < cell_division.n_mine).any(axis=1)]
+        # Define edge ownership based on first cell owned, and sort by ownership:
+        interior = interior[np.lexsort(interior[:, ::-1, 0].T)]
+        n_interior_mine = int(np.searchsorted(interior[:, 0, 0], cell_division.n_mine))
         (kL, fL), (kR, fR) = np.transpose(interior, (1, 2, 0))
 
         # Filter boundary edges so that corresponding cell is owned:
@@ -350,6 +353,9 @@ class Mesh(TreeNode):
             blen=t(edge_lengths[bk, bf]),
             nbr=t(nbr, long=True),
             recon=t(recon),
+            edge_division=TaskDivisionCustom(
+                n_mine=n_interior_mine, group=cell_division.group
+            ),
         )
 
 
@@ -372,6 +378,7 @@ class FVGeom:
     blen: torch.Tensor  #: Boundary edge lengths
     nbr: torch.Tensor  #: Neighbor-indices by cell (n_cells, Nmax)
     recon: torch.Tensor  #: Face-increment  operator (n_cells, 3, Nmax)
+    edge_division: TaskDivisionCustom  #: Edge ownership by process
 
 
 def make_adjacency(x_to_y: csr_array) -> csr_array:
