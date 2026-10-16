@@ -138,6 +138,9 @@ class Geometry(TreeNode):
             self._edge_len = all_gather_padded(edge_len, sizes, self.group).cpu()
             self.edge_division = edge_div
 
+            self._setup_boundary(material, contacts)
+            self.collision_enabled = True
+
             # Construct flux matrix (selects appropriate direction and multiplies v):
             mine = slice(0, geom.n_interior_mine)
             idx_in = (
@@ -184,9 +187,12 @@ class Geometry(TreeNode):
                 size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
             ).to_sparse_csr()
             self.probe_faces = geom.bF[probe_edges]
-
-        self._setup_boundary(material, contacts)
-        self.collision_enabled = True
+            self.probe_outward = self.is_outward[probe_edges]
+            self.probe_wall = torch.where(torch.isin(self._wall, probe_edges))[0]
+            for contact in self.contacts.values():
+                contact.probe_indices = torch.where(
+                    torch.isin(contact.indices, probe_edges)
+                )[0]
 
         # Set up cell region (interior) probes:
         n_mine = self.cell_division.n_mine
@@ -252,8 +258,9 @@ class Geometry(TreeNode):
     class Contact:
         """Contact boundary conditions, along with the edges they apply to."""
 
-        indices: torch.Tensor  #: boundary-edge indices of this contact
         contactor: Callable[[float], torch.Tensor]  #: material-specific contact
+        indices: torch.Tensor  #: boundary-edge indices of this contact
+        probe_indices: torch.Tensor | None = None  #: above, but within probe set
 
     def _setup_boundary(self, material: Material, contacts: dict[str, dict]) -> None:
         """Group boundary edges by marker into a wall (reflector) set and one
@@ -268,7 +275,7 @@ class Geometry(TreeNode):
             indices = torch.where(g.bmark == names.index(name))[0]
             n = g.bn[indices]
             self.contacts[name] = Geometry.Contact(
-                indices, material.get_contactor(n, **params)
+                material.get_contactor(n, **params), indices
             )
             edge_used[indices] = True
 
@@ -284,7 +291,7 @@ class Geometry(TreeNode):
     ) -> torch.Tensor:
         """Reconstruct face values from cell-centred values and boundary conditions.
         Result is flattened over the cell and face dimensions.
-        If `boundary_only`, result is computed only for boundary faces."""
+        If `boundary_only`, result is computed only for marked boundary faces."""
         # Update ghost regions if needed:
         if self.cell_division is not None:
             self.cell_division.exchange(rho)
@@ -302,15 +309,21 @@ class Geometry(TreeNode):
 
         # Apply boundary conditions:
         if g.bcell.numel():
-            rho_outward = rho_faces[g.bF]  # boundary faces, valid outwards
+            bF = self.probe_faces if boundary_only else g.bF
+            rho_outward = rho_faces[bF]  # boundary faces, valid outwards
             # Apply reflections and contacts:
             rho_inward = rho_outward.detach().clone()  # prepare inward valid version
             if self._reflector is not None:
-                rho_inward[self._wall] = self._reflector(rho_outward[self._wall])
+                wall = self.probe_wall if boundary_only else self._wall
+                if len(wall):
+                    rho_inward[wall] = self._reflector(rho_outward[wall])
             for contact in self.contacts.values():
-                rho_inward[contact.indices] = contact.contactor(t)
+                indices = contact.probe_indices if boundary_only else contact.indices
+                if len(indices):
+                    rho_inward[indices] = contact.contactor(t)
             # Set back to faces:
-            rho_faces[g.bF] = torch.where(self.is_outward, rho_outward, rho_inward)
+            is_outward = self.probe_outward if boundary_only else self.is_outward
+            rho_faces[bF] = torch.where(is_outward, rho_outward, rho_inward)
         return rho_faces[self.probe_faces] if boundary_only else rho_faces
 
     def get_flux(self, t: float, boundary_only: bool = False) -> torch.Tensor:
