@@ -121,9 +121,8 @@ class Geometry(TreeNode):
         # face-normal flux F = elen * sum_k u_face_k (v_k.n) g_k -- the SAME upwind
         # trace the scheme streams with, so F is the conserved flux (exactly 0
         # through specular walls).  Scalars stay cell-centred.  (Serial only.)
-        self._flux_indices = material.get_flux_indices()
-        self._do_flux = bool(self._flux_indices)
-        if self._do_flux:
+        self.flux_indices = material.get_flux_indices()
+        if self.flux_indices:
             to_global = torch.from_numpy(self.cell_division.global_index).to(rc.device)
             eL = to_global[geom.eL]
             eR = to_global[geom.eR]
@@ -381,16 +380,11 @@ class Geometry(TreeNode):
         self.stash.i_step.append(i_step)
         self.stash.t.append(t)
         self.stash.observables.append(obserables.detach().cpu())
-        if self._do_flux:
+        if self.flux_indices:
             v_rho = self.v_multiply_select @ self.to_faces(self.rho, t).flatten()
-            flux_op = self.material.get_observables(t)[self._flux_indices].T
+            flux_op = self.material.get_observables(t)[self.flux_indices].T
             fluxes = (v_rho.view(-1, self.Nk) @ flux_op).contiguous()
             dist.all_reduce(fluxes, group=self.material.group)
-            """
-            Fi = g.elen[None, :] * (flux_g @ (uup_i * self._a_int).t())  # (Nflux, Ne)
-            Fb = g.blen[None, :] * (flux_g @ (uup_b * self._a_bnd).t())  # (Nflux, Nb)
-            F = torch.cat([Fi, Fb], dim=1).t()  # (n_edge, Nflux)
-            """
             self.stash.flux.append(fluxes.detach().cpu())
         self.material.update_stash(rho_mine, self.cell_division)
 
@@ -401,7 +395,7 @@ class Geometry(TreeNode):
         assert checkpoint is not None
         names = self.material.get_observable_names()
         saved = [
-            cp_path.write("flux_indices", np.array(self._flux_indices)),
+            cp_path.write("flux_indices", np.array(self.flux_indices)),
             cp_path.write_str("contact_names", ",".join(self.contacts.keys())),
             cp_path.write_str("observable_names", ",".join(names)),
             cp_path.write("t", np.array(self.stash.t)),
@@ -421,7 +415,7 @@ class Geometry(TreeNode):
         checkpoint.write_slice(
             dset, (0, div.i_start, 0), torch.stack(self.stash.observables)
         )
-        if self._do_flux and n_stash:
+        if self.flux_indices:
             # Flux observables live on edges: geometry + face-normal flux per frame.
             saved += [
                 cp_path.write("edge_cells", self._edge_cells),
