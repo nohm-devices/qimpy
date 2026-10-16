@@ -173,7 +173,7 @@ class Geometry(TreeNode):
             assert i_boundary_all.min() >= -1
             n_boundaries = int(i_boundary_all.max()) + 1  # marked boundary regions
             probe_edges = torch.where(geom.bmark >= 0)[0]
-            idx_in = (ik + self.Nk * probe_edges[:, None]).flatten()
+            idx_in = torch.arange(len(probe_edges) * self.Nk, device=rc.device)
             idx_out = (ik + self.Nk * geom.bmark[probe_edges, None]).flatten()
             values = (
                 self.material.wk * a_bnd[probe_edges] * geom.blen[probe_edges, None]
@@ -181,8 +181,9 @@ class Geometry(TreeNode):
             self.probe_boundaries = torch.sparse_coo_tensor(
                 indices=torch.stack((idx_out, idx_in)),
                 values=values,
-                size=(n_boundaries * self.Nk, len(geom.bcell) * self.Nk),
+                size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
             ).to_sparse_csr()
+            self.probe_faces = geom.bF[probe_edges]
 
         self._setup_boundary(material, contacts)
         self.collision_enabled = True
@@ -310,7 +311,7 @@ class Geometry(TreeNode):
                 rho_inward[contact.indices] = contact.contactor(t)
             # Set back to faces:
             rho_faces[g.bF] = torch.where(self.is_outward, rho_outward, rho_inward)
-        return rho_faces[g.bF] if boundary_only else rho_faces
+        return rho_faces[self.probe_faces] if boundary_only else rho_faces
 
     def get_flux(self, t: float, boundary_only: bool = False) -> torch.Tensor:
         """Compute flux on all faces, or only boundary regions (contacts),
