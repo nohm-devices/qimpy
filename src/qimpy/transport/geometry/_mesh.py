@@ -353,9 +353,7 @@ class Mesh(TreeNode):
             blen=t(edge_lengths[bk, bf]),
             nbr=t(nbr, long=True),
             recon=t(recon),
-            edge_division=TaskDivisionCustom(
-                n_mine=n_interior_mine, group=cell_division.group
-            ),
+            n_interior_mine=n_interior_mine,
         )
 
 
@@ -378,7 +376,7 @@ class FVGeom:
     blen: torch.Tensor  #: Boundary edge lengths
     nbr: torch.Tensor  #: Neighbor-indices by cell (n_cells, Nmax)
     recon: torch.Tensor  #: Face-increment  operator (n_cells, 3, Nmax)
-    edge_division: TaskDivisionCustom  #: Edge ownership by process
+    n_interior_mine: int  #: Number of interior edges owned by current cell
 
 
 def make_adjacency(x_to_y: csr_array) -> csr_array:

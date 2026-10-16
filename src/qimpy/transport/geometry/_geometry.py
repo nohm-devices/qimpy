@@ -9,7 +9,13 @@ import torch.distributed as dist
 
 from qimpy import rc, TreeNode
 from qimpy.io import CheckpointPath, InvalidInputException, CheckpointContext
-from qimpy.mpi import ProcessGrid, all_reduce_scalars, get_block_slices
+from qimpy.mpi import (
+    ProcessGrid,
+    all_reduce_scalars,
+    get_block_slices,
+    TaskDivisionCustom,
+    all_gather_padded,
+)
 from qimpy.profiler import StopWatch, stopwatch
 from ..material import Material
 from . import Mesh
@@ -116,29 +122,59 @@ class Geometry(TreeNode):
         # trace the scheme streams with, so F is the conserved flux (exactly 0
         # through specular walls).  Scalars stay cell-centred.  (Serial only.)
         self._flux_indices = material.get_flux_indices()
-        self._do_flux = self._flux_indices and (self.cell_division is None)
+        self._do_flux = bool(self._flux_indices)
         if self._do_flux:
-            eLc = geom.eL.detach().cpu().numpy()
-            eRc = geom.eR.detach().cpu().numpy()
-            bc = geom.bcell.detach().cpu().numpy()
-            self._edge_cells = np.concatenate(
-                [  # (n_edge, 2), eR=-1 on bnd
-                    np.stack([eLc, eRc], 1),
-                    np.stack([bc, -np.ones_like(bc)], 1),
-                ]
-            ).astype(np.int64)
-            self._edge_normal = np.concatenate(
-                [  # (n_edge, 2) out of first cell
-                    geom.en.detach().cpu().numpy(),
-                    geom.bn.detach().cpu().numpy(),
+            to_global = torch.from_numpy(self.cell_division.global_index).to(rc.device)
+            eL = to_global[geom.eL]
+            eR = to_global[geom.eR]
+            bcell = to_global[geom.bcell]
+            edge_cells = torch.cat(
+                [
+                    torch.stack([eL, eR], 1)[: geom.n_interior_mine],
+                    torch.stack([bcell, -torch.ones_like(bcell)], 1),
                 ]
             )
-            self._edge_len = np.concatenate(
-                [  # (n_edge,)
-                    geom.elen.detach().cpu().numpy(),
-                    geom.blen.detach().cpu().numpy(),
-                ]
-            )
+            edge_normal = torch.cat((geom.en[: geom.n_interior_mine], geom.bn))
+            edge_len = torch.cat((geom.elen[: geom.n_interior_mine], geom.blen))
+            n_edges_mine = len(edge_cells)
+            edge_div = TaskDivisionCustom(n_mine=n_edges_mine, group=self.group)
+
+            # Store collected global-index versions of above for checkpoint writing:
+            sizes = edge_div.n_each_custom
+            self._edge_cells = all_gather_padded(edge_cells, sizes, self.group).cpu()
+            self._edge_normal = all_gather_padded(edge_normal, sizes, self.group).cpu()
+            self._edge_len = all_gather_padded(edge_len, sizes, self.group).cpu()
+            self.edge_division = edge_div
+
+            # Construct flux matrix (selects appropriate direction and multiplies v):
+            mine = slice(0, geom.n_interior_mine)
+            idx_in = (
+                ik
+                + self.Nk
+                * torch.cat(
+                    (
+                        torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None])[mine],
+                        geom.bF[:, None].expand(-1, self.Nk),
+                    )
+                )
+            ).flatten()
+            idx_out = (
+                ik + self.Nk * torch.arange(n_edges_mine, device=rc.device)[:, None]
+            ).flatten()
+            values = (
+                self.material.wk
+                * torch.cat(
+                    (
+                        (a_int * geom.elen[:, None])[mine],
+                        a_bnd * geom.blen[:, None],
+                    )
+                )
+            ).flatten()
+            self.v_multiply_select = torch.sparse_coo_tensor(
+                indices=torch.stack((idx_out, idx_in)),
+                values=values,
+                size=(n_edges_mine * self.Nk, n_recon * self._nf * self.Nk),
+            ).to_sparse_csr()
 
         self._setup_boundary(material, contacts)
         self.collision_enabled = True
@@ -346,19 +382,16 @@ class Geometry(TreeNode):
         self.stash.t.append(t)
         self.stash.observables.append(obserables.detach().cpu())
         if self._do_flux:
-            # Face-normal fluxes on every edge, from the upwind face trace.
-            uf = self.to_faces(self.rho).reshape(-1, self.Nk)
-            g = self.geom
-            uup_i = torch.where(self._maskL, uf[g.eLF], uf[g.eRF])  # (Ne, Nk)
-            uMb = uf[g.bF]
-            uup_b = torch.where(
-                self.is_outward, uMb, self._exterior(uMb, t)
-            )  # (Nb, Nk)
-            flux_g = self.material.get_observables(t)[self._flux_indices]
+            v_rho = self.v_multiply_select @ self.to_faces(self.rho, t).flatten()
+            flux_op = self.material.get_observables(t)[self._flux_indices].T
+            fluxes = (v_rho.view(-1, self.Nk) @ flux_op).contiguous()
+            dist.all_reduce(fluxes, group=self.material.group)
+            """
             Fi = g.elen[None, :] * (flux_g @ (uup_i * self._a_int).t())  # (Nflux, Ne)
             Fb = g.blen[None, :] * (flux_g @ (uup_b * self._a_bnd).t())  # (Nflux, Nb)
             F = torch.cat([Fi, Fb], dim=1).t()  # (n_edge, Nflux)
-            self.stash.flux.append(F.detach().cpu())
+            """
+            self.stash.flux.append(fluxes.detach().cpu())
         self.material.update_stash(rho_mine, self.cell_division)
 
     def _save_checkpoint(
@@ -388,13 +421,6 @@ class Geometry(TreeNode):
         checkpoint.write_slice(
             dset, (0, div.i_start, 0), torch.stack(self.stash.observables)
         )
-        self.stash = Geometry.Stash()  # reset now-written cached observables
-
-        # Probes:
-        cp_path.write("probes", torch.stack(self.stash_probe.observables))
-        self.stash_probe = Geometry.Stash()  # reset now-written cached probes
-
-        # TO DO: revamp this:
         if self._do_flux and n_stash:
             # Flux observables live on edges: geometry + face-normal flux per frame.
             saved += [
@@ -403,11 +429,17 @@ class Geometry(TreeNode):
                 cp_path.write("edge_len", self._edge_len),
                 "edge_flux",
             ]
-            n_edge = self._edge_len.shape[0]
+            edge_div = self.edge_division
+            flux = torch.stack(self.stash.flux)
             dset = cp_path.create_dataset(
-                "edge_flux", (n_stash, n_edge, len(self._flux_indices)), np.float64
+                "edge_flux", (n_stash, edge_div.n_tot, len(flux)), np.float64
             )
-            checkpoint.write_slice(dset, (0, 0, 0), torch.stack(self.stash.flux))
+            checkpoint.write_slice(dset, (0, edge_div.i_start, 0), flux)
+        self.stash = Geometry.Stash()  # reset now-written cached observables
+
+        # Probes:
+        cp_path.write("probes", torch.stack(self.stash_probe.observables))
+        self.stash_probe = Geometry.Stash()  # reset now-written cached probes
 
         if self.save_rho:
             # Optional full state output (large) for continuing calculations:

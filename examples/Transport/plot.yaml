@@ -1,4 +1,4 @@
-checkpoints: animation/*.h5
+checkpoints: animation/advect*.h5
 output: animation/frame{:04d}.png
 probes: animation/probes-{}.pdf
 density:
@@ -6,8 +6,8 @@ density:
   interpolation: bilinear
   linthresh: 0.1
 
-# streamlines:
-#   transparency: no
-#   density: 2
-#   linewidth: 0.7
-#   arrowsize: 0.5
+streamlines:
+  transparency: no
+  density: 2
+  linewidth: 0.7
+  arrowsize: 0.5

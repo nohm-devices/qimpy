@@ -118,7 +118,7 @@ class Material(TreeNode):
         that may be violated during spatial transport or dynamics."""
 
     def measure_observables(self, rho: torch.Tensor, t: float) -> torch.Tensor:
-        """Return expectation value of observables, (Nx x Ny x No).
+        """Return expectation value of observables, (Nr x No).
         Optionally, override to add/replace observables that cannot be expressed
         as a linear operator `get_observables` on the occupations / density-matrices.
         Include the names of these added/replaced observables in `get_observable_names`.
