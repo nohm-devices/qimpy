@@ -228,24 +228,6 @@ def fv_contact_annotations(
     return out
 
 
-def _read_contact_names(g):
-    """Best-effort read of the checkpoint's ``contact_names`` (or None).
-
-    Stored either as one comma-joined string or an array of names; returns a
-    flat list of individual names, or None if absent/unreadable so the caller
-    falls back to the legacy "anything != wall is a contact" rule."""
-    try:
-        arr = np.array(g["contact_names"])
-    except Exception:
-        return None
-    parts = [arr.item()] if arr.ndim == 0 or arr.size == 1 else list(arr.ravel())
-    names = []
-    for p in parts:
-        s = p.decode() if isinstance(p, (bytes, bytearray)) else str(p)
-        names += [q for q in s.replace(",", " ").split() if q]
-    return names or None
-
-
 def _read_str_list(g, key):
     """Comma-separated name list written by FiniteVolume, or [] if absent."""
     if key not in g:
@@ -365,7 +347,6 @@ def run_finite_volume(
         boundary_names = CheckpointPath(cp, "/geometry/mesh").read_str_list(
             "boundary_names"
         )
-        contact_names = _read_contact_names(g)  # authoritative set or None
     triang = mtri.Triangulation(verts[:, 0], verts[:, 1], tris)
     edges = fv_edge_geometry(verts, tris)  # face (edge) geometry, once
     bmid = edges["bsegs"].mean(axis=1)  # (Nb, 2) edge midpoints
@@ -378,7 +359,7 @@ def run_finite_volume(
         edges["bkeys"],
         boundary_edges,
         boundary_names,
-        contact_names=contact_names,
+        contact_names=boundary_names,
         bmid=bmid,
         mesh_vertices=verts,
     )

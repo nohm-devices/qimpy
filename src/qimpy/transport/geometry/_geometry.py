@@ -113,6 +113,9 @@ class Geometry(TreeNode):
             size=(len(geom.area) * self.Nk, n_recon * self._nf * self.Nk),
         ).to_sparse_csr()
 
+        self.collision_enabled = True
+        self.boundary = Boundary(self, contacts)
+
         # Initialize flux collection on faces:
         self.flux_indices = material.get_flux_indices()
         if self.flux_indices:
@@ -137,9 +140,6 @@ class Geometry(TreeNode):
             self._edge_normal = all_gather_padded(edge_normal, sizes, self.group).cpu()
             self._edge_len = all_gather_padded(edge_len, sizes, self.group).cpu()
             self.edge_division = edge_div
-
-            self._setup_boundary(material, contacts)
-            self.collision_enabled = True
 
             # Construct flux matrix (selects appropriate direction and multiplies v):
             mine = slice(0, geom.n_interior_mine)
@@ -186,17 +186,7 @@ class Geometry(TreeNode):
                 values=values,
                 size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
             ).to_sparse_csr()
-            self.probe_bcell, probe_i_cell = torch.unique(
-                geom.bcell[probe_edges], return_inverse=True
-            )
-            probe_i_face = geom.bF[probe_edges] - self._nf * geom.bcell[probe_edges]
-            self.probe_faces = probe_i_cell * self._nf + probe_i_face
-            self.probe_outward = self.is_outward[probe_edges]
-            self.probe_wall = torch.where(torch.isin(self._wall, probe_edges))[0]
-            for contact in self.contacts.values():
-                contact.probe_indices = torch.where(
-                    torch.isin(contact.indices, probe_edges)
-                )[0]
+            self.boundary_probe = Boundary(self, contacts, probe_edges)
 
         # Set up cell region (interior) probes:
         n_mine = self.cell_division.n_mine
@@ -254,41 +244,9 @@ class Geometry(TreeNode):
         else:
             rho = torch.zeros(self.K, self.Nk, device=rc.device, dtype=v.dtype)
         self.rho = rho
-        self.stash = Geometry.Stash()
-        self.stash_probe = Geometry.Stash()  # coarse-grained, more frequent version
+        self.stash = Stash()
+        self.stash_probe = Stash()  # coarse-grained, more frequent version
         self.material.initialize_fields(self.rho, {}, id(self))
-
-    @dataclass
-    class Contact:
-        """Contact boundary conditions, along with the edges they apply to."""
-
-        contactor: Callable[[float], torch.Tensor]  #: material-specific contact
-        indices: torch.Tensor  #: boundary-edge indices of this contact
-        probe_indices: torch.Tensor | None = None  #: above, but within probe set
-
-    def _setup_boundary(self, material: Material, contacts: dict[str, dict]) -> None:
-        """Group boundary edges by marker into a wall (reflector) set and one
-        contact object per parametrized marker; unparametrized markers reflect."""
-        g = self.geom
-        names = self.mesh.boundary_names
-        edge_used = torch.full(
-            (len(g.bmark),), False, device=rc.device, dtype=torch.bool
-        )
-        self.contacts: dict[str, Geometry.Contact] = {}
-        for name, params in contacts.items():
-            indices = torch.where(g.bmark == names.index(name))[0]
-            n = g.bn[indices]
-            self.contacts[name] = Geometry.Contact(
-                material.get_contactor(n, **params), indices
-            )
-            edge_used[indices] = True
-
-        # Mark all boundary edges not in a contact as reflecting:
-        self._wall = torch.where(~edge_used)[0]
-        if len(self._wall):
-            self._reflector = material.get_reflector(g.bn[self._wall])
-        else:
-            self._reflector = None
 
     def to_faces(
         self, rho: torch.Tensor, t: float, boundary_only: bool = False
@@ -300,13 +258,15 @@ class Geometry(TreeNode):
         if self.cell_division is not None:
             self.cell_division.exchange(rho)
 
-        # Reconstruct faces from cells in chunks:
+        # Reconstruct rho at faces from rho at cell centroids:
         g = self.geom
         if boundary_only:
-            sel = self.probe_bcell
+            sel = self.boundary_probe.boundary_cells
             rho_faces = self._face_limiter(
                 rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
             )
+            # Apply boundary conditions and return only boundary faces:
+            return self.boundary_probe.apply(rho_faces.flatten(0, 1), t, update=False)
         else:
             n_recon = self.cell_division.n_recon
             rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
@@ -315,26 +275,10 @@ class Geometry(TreeNode):
                 rho_faces[sel] = self._face_limiter(
                     rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
                 )
-        rho_faces = rho_faces.reshape(-1, self.Nk)
-
-        # Apply boundary conditions:
-        if g.bcell.numel():
-            bF = self.probe_faces if boundary_only else g.bF
-            rho_outward = rho_faces[bF]  # boundary faces, valid outwards
-            # Apply reflections and contacts:
-            rho_inward = rho_outward.detach().clone()  # prepare inward valid version
-            if self._reflector is not None:
-                wall = self.probe_wall if boundary_only else self._wall
-                if len(wall):
-                    rho_inward[wall] = self._reflector(rho_outward[wall])
-            for contact in self.contacts.values():
-                indices = contact.probe_indices if boundary_only else contact.indices
-                if len(indices):
-                    rho_inward[indices] = contact.contactor(t)
-            # Set back to faces:
-            is_outward = self.probe_outward if boundary_only else self.is_outward
-            rho_faces[bF] = torch.where(is_outward, rho_outward, rho_inward)
-        return rho_faces[self.probe_faces] if boundary_only else rho_faces
+            # Apply boundary conditions and return all faces:
+            rho_faces = rho_faces.flatten(0, 1)
+            self.boundary.apply(rho_faces, t, update=True)
+            return rho_faces
 
     def get_flux(self, t: float, boundary_only: bool = False) -> torch.Tensor:
         """Compute flux on all faces, or only boundary regions (contacts),
@@ -373,15 +317,6 @@ class Geometry(TreeNode):
         self._rho = rho_new
         self.material.constrain(self._rho)
 
-    @dataclass
-    class Stash:
-        """Stash for probes and observables that are collated into checkpoints."""
-
-        i_step: list[int] = field(default_factory=list)
-        t: list[float] = field(default_factory=list)
-        observables: list[torch.Tensor] = field(default_factory=list)
-        flux: list[torch.Tensor] = field(default_factory=list)
-
     @stopwatch
     def update_probes(self, i_step: int, t: float) -> None:
         """Stash coarse-grained probes on defined cell regions and contacts."""
@@ -415,7 +350,6 @@ class Geometry(TreeNode):
         names = self.material.get_observable_names()
         saved = [
             cp_path.write("flux_indices", np.array(self.flux_indices)),
-            cp_path.write_str("contact_names", ",".join(self.contacts.keys())),
             cp_path.write_str("observable_names", ",".join(names)),
             cp_path.write("t", np.array(self.stash.t)),
             cp_path.write("i_step", np.array(self.stash.i_step)),
@@ -448,12 +382,12 @@ class Geometry(TreeNode):
                 "edge_flux", (n_stash, edge_div.n_tot, len(flux)), np.float64
             )
             checkpoint.write_slice(dset, (0, edge_div.i_start, 0), flux)
-        self.stash = Geometry.Stash()  # reset now-written cached observables
+        self.stash = Stash()  # reset now-written cached observables
 
         # Probes:
         cp_path.write("probes", torch.stack(self.stash_probe.observables))
         cp_path.write("probe_flux", torch.stack(self.stash_probe.flux))
-        self.stash_probe = Geometry.Stash()  # reset now-written cached probes
+        self.stash_probe = Stash()  # reset now-written cached probes
 
         if self.save_rho:
             # Optional full state output (large) for continuing calculations:
@@ -492,3 +426,79 @@ def _face_limiter(
     phi.clamp_(max=1.0)
     limiter = phi.amin(dim=1, keepdim=True)
     return rho_sel[:, None] + limiter * d
+
+
+@dataclass
+class Stash:
+    """Stash for probes and observables that are collated into checkpoints."""
+
+    i_step: list[int] = field(default_factory=list)
+    t: list[float] = field(default_factory=list)
+    observables: list[torch.Tensor] = field(default_factory=list)
+    flux: list[torch.Tensor] = field(default_factory=list)
+
+
+class Boundary:
+    """Boundary operators and indices for the entire boundary, or a selection of it."""
+
+    contacts: list[tuple[torch.Tensor, None | Callable[[float], torch.Tensor]]]
+    wall: tuple[torch.Tensor, None | Callable[[torch.Tensor], torch.Tensor]]
+    is_outward: torch.Tensor  #: whether each face, k velocity is outwards
+    boundary_cells: torch.Tensor | None  #: subset of cells at which rho_faces is needed
+    boundary_faces: torch.Tensor  #: flattened index of boundary edges into rho_faces
+
+    def __init__(
+        self,
+        geometry: Geometry,
+        contacts: dict[str, dict],
+        selection: torch.Tensor | None = None,
+    ) -> None:
+        g = geometry.geom
+        names = geometry.mesh.boundary_names
+        material = geometry.material
+        bmark = g.bmark
+        bn = g.bn
+        self.boundary_cells = None
+        self.boundary_faces = g.bF
+        if selection is not None:
+            bmark = bmark[selection]
+            bn = bn[selection]
+            # Find the cells for which rho_faces is needed for `selection`:
+            cells = g.bcell[selection]
+            self.boundary_cells, i_cell = torch.unique(cells, return_inverse=True)
+            n_faces = geometry._nf
+            i_face = g.bF[selection] - n_faces * cells
+            self.boundary_faces = i_cell * n_faces + i_face
+
+        edge_used = torch.full((len(bmark),), False, device=rc.device, dtype=torch.bool)
+        self.contacts = []
+        for name, params in contacts.items():
+            indices = torch.where(bmark == names.index(name))[0]
+            if len(indices):
+                edge_used[indices] = True
+                contactor = material.get_contactor(bn[indices], **params)
+                self.contacts.append((indices, contactor))
+
+        # Mark all boundary edges not in a contact as reflecting:
+        indices = torch.where(~edge_used)[0]
+        reflector = material.get_reflector(bn[indices]) if len(indices) else None
+        self.wall = (indices, reflector)
+        self.is_outward = (bn @ material.transport_velocity.T) > 0
+
+    def apply(self, rho_faces: torch.Tensor, t: float, update: bool) -> torch.Tensor:
+        """Apply boundary conditions to `rho_faces`, modifying it in place
+        if `update`. Otherwise, return the updated component alone."""
+        bf = self.boundary_faces
+        rho_outward = rho_faces[bf]  # boundary faces, valid outwards
+        # Apply reflections and contacts:
+        rho_inward = rho_outward.detach().clone()  # prepare inward valid version
+        indices, reflector = self.wall
+        if reflector is not None:
+            rho_inward[indices] = reflector(rho_outward[indices])
+        for indices, contactor in self.contacts:
+            rho_inward[indices] = contactor(t)
+        # Set back to faces / return:
+        rho_faces_bf = torch.where(self.is_outward, rho_outward, rho_inward)
+        if update:
+            rho_faces[bf] = rho_faces_bf
+        return rho_faces_bf
