@@ -511,7 +511,7 @@ def run_finite_volume(
             plt.figure()
             plt.xlabel("t")
             plt.ylabel(name)
-            for i_region, region_name in enumerate(region_names):
+            for i_region, region_name in enumerate(region_names + boundary_names):
                 plt.plot(t, probes_region[:, i_region, i_name], label=region_name)
             plt.legend()
             filename = probes.format(name)

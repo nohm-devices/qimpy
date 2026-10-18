@@ -181,10 +181,22 @@ class Geometry(TreeNode):
             values = (
                 self.material.wk * a_bnd[probe_edges] * geom.blen[probe_edges, None]
             ).flatten()
-            self.probe_boundaries = torch.sparse_coo_tensor(
+            self.boundary_flux_op = torch.sparse_coo_tensor(
                 indices=torch.stack((idx_out, idx_in)),
                 values=values,
                 size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
+            ).to_sparse_csr()
+            # Scalars at surface cells:
+            idx_in = torch.arange(len(probe_edges), device=rc.device)
+            idx_out = geom.bmark[probe_edges]
+            w_faces = geom.blen[probe_edges]
+            w_tot = torch.zeros(n_boundaries, dtype=w_faces.dtype, device=rc.device)
+            w_tot.index_add_(0, idx_out, w_faces)
+            dist.all_reduce(w_tot, group=self.group)
+            self.boundary_scalar_op = torch.sparse_coo_tensor(
+                indices=torch.stack((idx_out, idx_in)),
+                values=w_faces / w_tot[idx_out],
+                size=(n_boundaries, len(probe_edges)),
             ).to_sparse_csr()
             self.boundary_probe = Boundary(self, contacts, probe_edges)
 
@@ -280,15 +292,18 @@ class Geometry(TreeNode):
             self.boundary.apply(rho_faces, t, update=True)
             return rho_faces
 
-    def get_flux(self, t: float, boundary_only: bool = False) -> torch.Tensor:
-        """Compute flux on all faces, or only boundary regions (contacts),
-        depensing on `boundary_only`."""
-        v_op = self.probe_boundaries if boundary_only else self.v_multiply_select
-        v_rho = v_op @ self.to_faces(self.rho, t, boundary_only).flatten()
+    def get_flux(
+        self, t: float, boundary_only: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute flux on all faces, or only boundary regions if `boundary_only`.
+        Also return `rho_faces`, if needed for calculating observables on faces."""
+        rho_faces = self.to_faces(self.rho, t, boundary_only)
+        v_op = self.boundary_flux_op if boundary_only else self.v_multiply_select
+        v_rho = v_op @ rho_faces.flatten()
         flux_op = self.material.get_observables(t)[self.flux_indices].T
         flux = (v_rho.view(-1, self.Nk) @ flux_op).contiguous()
         dist.all_reduce(flux, group=(None if boundary_only else self.material.group))
-        return flux.detach()
+        return flux, rho_faces
 
     def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         self.material.constrain(rho)
@@ -326,9 +341,14 @@ class Geometry(TreeNode):
         obserables = self.material.measure_observables(self.rho[self.probe_cells], t)
         region_averages = (self.probe_mat_cell @ obserables).contiguous()
         dist.all_reduce(region_averages, group=self.group)
-        self.stash_probe.observables.append(region_averages.detach().cpu())
         if self.flux_indices:
-            self.stash_probe.flux.append(self.get_flux(t, boundary_only=True).cpu())
+            flux, rho_faces = self.get_flux(t, boundary_only=True)
+            observables = self.material.measure_observables(rho_faces, t)
+            surface_averages = (self.boundary_scalar_op @ observables).contiguous()
+            dist.all_reduce(surface_averages, group=self.group)
+            region_averages = torch.cat((region_averages, surface_averages))
+            self.stash_probe.flux.append(flux.detach().cpu())
+        self.stash_probe.observables.append(region_averages.detach().cpu())
 
     @stopwatch
     def update_observables(self, i_step: int, t: float) -> None:
@@ -339,7 +359,7 @@ class Geometry(TreeNode):
         self.stash.t.append(t)
         self.stash.observables.append(obserables.detach().cpu())
         if self.flux_indices:
-            self.stash.flux.append(self.get_flux(t).cpu())
+            self.stash.flux.append(self.get_flux(t)[0].detach().cpu())
         self.material.update_stash(rho_mine, self.cell_division)
 
     def _save_checkpoint(
