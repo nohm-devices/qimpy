@@ -26,24 +26,6 @@ def main() -> None:
     StopWatch.print_stats()
 
 
-def run(
-    *,
-    checkpoints: str,
-    output: str,
-    probes: str,
-    density: Optional[dict] = None,
-    streamlines: Optional[dict] = None,
-    dpi: int = 200,
-) -> None:
-    """Render transport checkpoints."""
-    if density is None:
-        density = {}
-    # Distribute frames over MPI:
-    file_list = rc.comm.bcast(sorted(glob.glob(checkpoints)))
-    mine = slice(rc.i_proc, None, rc.n_procs)
-    run_finite_volume(file_list, mine, output, probes, density, streamlines, dpi)
-
-
 def fv_edge_geometry(verts, tris):
     """Staggered-grid face geometry for a triangular finite-volume mesh.
 
@@ -237,7 +219,7 @@ def _rt0_assembly(verts, tris, edge_cells, edge_normal):
     identically zero along specular walls.  No cell averaging or least-squares
     smoothing is involved.
 
-    Returns ``(edge_idx (K,3), sign (K,3), p_opp (K,3,2), area (K,))`` mapping
+    Returns ``(edge_idx (K,3), sign (K,3), p_opp (2,K,3), area (K,))`` mapping
     each triangle's local edges to checkpoint edge indices and outward signs."""
     from collections import defaultdict
 
@@ -262,7 +244,7 @@ def _rt0_assembly(verts, tris, edge_cells, edge_normal):
             vpair2tris[tuple(sorted((int(t[a]), int(t[b]))))].append(k)
     edge_idx = np.zeros((K, 3), int)
     sign = np.zeros((K, 3))
-    p_opp = np.zeros((K, 3, 2))
+    p_opp = np.zeros((2, K, 3))
     area = 0.5 * np.abs(
         np.cross(
             verts[tris[:, 1]] - verts[tris[:, 0]], verts[tris[:, 2]] - verts[tris[:, 0]]
@@ -270,7 +252,7 @@ def _rt0_assembly(verts, tris, edge_cells, edge_normal):
     )
     for k, t in enumerate(tris):
         for j, (a, b, o) in enumerate(locals_):
-            p_opp[k, j] = verts[t[o]]
+            p_opp[:, k, j] = verts[t[o]]
             owners = vpair2tris[tuple(sorted((int(t[a]), int(t[b]))))]
             nb = [c for c in owners if c != k]
             va, vb = verts[t[a]], verts[t[b]]
@@ -290,24 +272,26 @@ def _rt0_assembly(verts, tris, edge_cells, edge_normal):
     return edge_idx, sign, p_opp, area
 
 
-def _rt0_sample(rt0, F, tid, inside, Xs, Ys):
+def _rt0_sample(rt0, F, tid, inside, grid):
     """Evaluate the exact face-flux (RT0) field at grid points; NaN outside."""
     edge_idx, sign, p_opp, area = rt0
     k = np.where(inside, tid, 0)
     Fout = sign * F[edge_idx]  # (K, 3) outward fluxes
-    U = np.zeros_like(Xs)
-    V = np.zeros_like(Ys)
+    flux = np.zeros_like(grid)
     for e in range(3):
         w = Fout[k, e] / (2.0 * area[k])
-        U += w * (Xs - p_opp[k, e, 0])
-        V += w * (Ys - p_opp[k, e, 1])
-    U = np.where(inside, U, np.nan)
-    V = np.where(inside, V, np.nan)
-    return U, V
+        flux += w * (grid - p_opp[:, k, e])
+    return np.where(inside, flux, np.nan)
 
 
-def run_finite_volume(
-    file_list, mine, output, probes, density, streamlines, dpi
+def run(
+    *,
+    checkpoints: str,
+    output: str,
+    probes: str,
+    density: Optional[dict] = None,
+    streamlines: Optional[dict] = None,
+    dpi: int = 200,
 ) -> None:
     """Frame-parallel, mesh-native rendering of FiniteVolume (finite-volume) output.
 
@@ -322,6 +306,12 @@ def run_finite_volume(
     frames, so post-processing scales like the solve."""
     import matplotlib.tri as mtri
     from matplotlib.collections import LineCollection
+
+    if density is None:
+        density = {}
+    # Distribute frames over MPI:
+    file_list = rc.comm.bcast(sorted(glob.glob(checkpoints)))
+    mine = slice(rc.i_proc, None, rc.n_procs)
 
     cmap = density.get("cmap", "bwr")
     with Checkpoint(file_list[0]) as cp:
@@ -360,10 +350,12 @@ def run_finite_volume(
         density.get("contact_pad", 0.012),
     )
     if streamlines is not None:
-        xs = np.linspace(verts[:, 0].min(), verts[:, 0].max(), 220)
-        ys = np.linspace(verts[:, 1].min(), verts[:, 1].max(), 220)
-        Xs, Ys = np.meshgrid(xs, ys)
-        tid = triang.get_trifinder()(Xs, Ys)  # containing triangle (-1 outside)
+        grids_1d = [
+            np.linspace(verts[:, i_dir].min(), verts[:, i_dir].max(), 220)
+            for i_dir in range(2)
+        ]
+        grid = np.stack(np.meshgrid(*grids_1d))
+        tid = triang.get_trifinder()(*grid)  # containing triangle (-1 outside)
         inside = tid >= 0
         rt0 = None  # built once from edge data
     orig_level = log.getEffectiveLevel()
@@ -466,12 +458,10 @@ def run_finite_volume(
                 # zero flux, so the field is exactly tangent to walls.
                 if rt0 is None:
                     rt0 = _rt0_assembly(verts, tris, edge_cells, edge_normal)
-                U, V = _rt0_sample(rt0, edge_flux[fr, :, i_cur], tid, inside, Xs, Ys)
+                flux = _rt0_sample(rt0, edge_flux[fr, :, i_cur], tid, inside, grid)
                 ax.streamplot(
-                    xs,
-                    ys,
-                    U,
-                    V,
+                    *grids_1d,
+                    *flux,
                     density=streamlines.get("density", 1.5),
                     linewidth=streamlines.get("linewidth", 0.9),
                     arrowsize=streamlines.get("arrowsize", 0.9),
