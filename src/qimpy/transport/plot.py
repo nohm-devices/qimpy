@@ -9,22 +9,7 @@ import numpy as np
 
 from qimpy import rc, log, io
 from qimpy.profiler import StopWatch
-from qimpy.io import log_config, Checkpoint, CheckpointPath
-
-# Checkpoint time is in Hartree atomic units; 1 a.u. = ℏ/E_h s.
-_PS_PER_AU_TIME = 2.4188843265857e-5
-
-# TODO(staggered output -- fix later): vector outputs (currents, heat fluxes,
-# etc.) need to be output at the EDGES of the triangular elements, whereas
-# scalars (density, temperature) need to be CELL-CENTERED. The solver currently
-# writes every fv_observable -- scalar and vector alike -- as a single
-# cell-centered (triangle-centroid) average, which is right for the scalars but
-# wrong for the vectors: on a triangular finite-volume mesh a flux's natural
-# home is the edge (face) midpoint, not the cell center. For now the streamlines
-# are traced straight from the cell-centered current (an approximation). The
-# proper fix is in the solver's checkpoint output -- emit vector quantities on
-# element edges and scalars on cells -- after which the current can be plotted
-# on the faces.
+from qimpy.io import log_config, Checkpoint, CheckpointPath, Unit
 
 
 def main() -> None:
@@ -431,7 +416,7 @@ def run_finite_volume(
                     triang, facecolors=n_dev / vmax, cmap=cmap, vmin=-1, vmax=1
                 )  # flat shading = FV cell average
             ax.set_aspect("equal")
-            ax.set_title(f"$t$ = {t * _PS_PER_AU_TIME:.4g} ps")
+            ax.set_title(f"$t$ = {t / Unit.MAP['ps']:.4g} ps")
             ax.axis("off")
             lw = density.get("outline_lw", 2.0)
             ax.add_collection(
