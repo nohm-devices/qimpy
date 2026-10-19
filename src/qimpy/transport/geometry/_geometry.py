@@ -30,7 +30,7 @@ class Geometry(TreeNode):
         material: Material,
         mesh: Mesh | dict | None = None,
         contacts: dict[str, dict],
-        cfl: float = 0.4,
+        courant_number: float = 1.0,
         epsilon_sq: float = 0.0,
         faces_block_size: int = 0,
         compile: bool = False,
@@ -48,8 +48,8 @@ class Geometry(TreeNode):
             Each value selects the contact kind: ``{dmu, vD}`` a fixed
             voltage/drift source, ``{floating: true}`` a zero-current probe, and
             ``{I_set: <current>}`` a current source (with optional ``vD``).
-        cfl
-            :yaml:`CFL number for the explicit step (dt = cfl * inradius / vmax).`
+        courant_number
+            :yaml:`Courant number for selecting the maximum stable time step.`
         epsilon_sq
             :yaml:`Flux-squared threshold on flux limiter.`
             Default of 0 yields a pure smooth limiter. Set to ~(mesh-scale variation)^2
@@ -233,9 +233,8 @@ class Geometry(TreeNode):
         else:
             self._face_limiter = _face_limiter  # eager mode
 
-        vmax = float(v.norm(dim=1).max())
-        dt_local = float(cfl) * float(geom.inradius.min()) / max(vmax, 1e-300)
-        self.dt_max = all_reduce_scalars(dt_local, dist.ReduceOp.MIN, self.group)
+        dt_local = float(courant_number * geom.inradius.min() / v.norm(dim=1).max())
+        self.dt_max = all_reduce_scalars(dt_local, dist.ReduceOp.MIN, dist.group.WORLD)
 
         rho0 = getattr(material, "rho0", None)
         if (
