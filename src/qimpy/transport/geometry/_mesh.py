@@ -1,6 +1,5 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from functools import cached_property
 
 from scipy.spatial import KDTree
 from scipy.sparse import csr_array
@@ -21,14 +20,21 @@ class Mesh(TreeNode):
     vertices: np.ndarray  #: vertex coordinates (Nv, 2)
     cells: np.ndarray  #: vertex indices and region ID in cells (Nc, d+2)
     region_names: list[str]  #: names of interior regions (for cell IDs >= 0)
-    boundary_edges: np.ndarray  #: sorted vertex indices, ID of boundary edges (Ne, d+1)
-    boundary_names: list[str]  #: names of boundary regions (for edge IDs >= 0)
+    boundary_faces: np.ndarray  #: sorted vertex indices, ID of boundary faces (Nb, d+1)
+    boundary_names: list[str]  #: names of boundary regions (for face IDs >= 0)
     lattice_vectors: np.ndarray | None  #: lattice vectors in rows if periodic
     cell_permutation: np.ndarray | None  #: Reordering of cells relative to the source
+
+    # Calculated members:
+    cell_division: CellDivision  #: split of cells over processes
+    faces: np.ndarray  #: Vertex indices by cell and face (Nc, d+1, d)
+    interior: np.ndarray  #: Pair of cell and face indices by interior face (Ni, 2, 2)
+    boundary: np.ndarray  #: Cell, face and region indices by boundary face (Nb, 3)
 
     def __init__(
         self,
         *,
+        group: dist.ProcessGroup,
         file: mesh_source.File | dict | None = None,
         line: mesh_source.Line | dict | None = None,
         rect: mesh_source.Rect | dict | None = None,
@@ -62,11 +68,14 @@ class Mesh(TreeNode):
         if checkpoint_in:
             self.load(checkpoint_in)
 
+        self.cell_division = self._partition_cells(group)
+        self._initialize_face_maps()
+
     def load(self, cp: CheckpointPath) -> None:
         self.vertices = cp.read_np("vertices")
         self.cells = cp.read_np("cells")
         self.region_names = cp.read_str_list("region_names")
-        self.boundary_edges = cp.read_np("boundary_edges")
+        self.boundary_faces = cp.read_np("boundary_faces")
         self.boundary_names = cp.read_str_list("boundary_names")
         self.lattice_vectors = cp.read_optional_np("lattice_vectors")
         self.cell_permutation = cp.read_optional_np("cell_permutation")
@@ -77,7 +86,7 @@ class Mesh(TreeNode):
             cp.write("vertices", self.vertices),
             cp.write("cells", self.cells),
             cp.write_str("region_names", ",".join(self.region_names)),
-            cp.write("boundary_edges", self.boundary_edges),
+            cp.write("boundary_faces", self.boundary_faces),
             cp.write_str("boundary_names", ",".join(self.boundary_names)),
         ]
         if self.lattice_vectors is not None:
@@ -95,11 +104,11 @@ class Mesh(TreeNode):
     def is1D(self) -> bool:
         return self.cells.shape[1] == 3  # cells coontain d + 1 vertices, 1 region index
 
-    def partition_cells(self, group: dist.ProcessGroup) -> CellDivision:
+    def _partition_cells(self, group: dist.ProcessGroup) -> CellDivision:
         """Optimally partition the mesh cells for communication over `group`.
         This reorders `cells` such that contiguous ranges of cells can be owned by
-        each process within `group`, and returns a helper class to track the
-        division and communicate ghost cells across processes.
+        each process within `group`, and returns a `CellDivision` instance to
+        track the division and communicate ghost cells across processes.
         Correspondingly, `cell_permutation` tracks any reordering of the cells."""
         size = group.size()
         if size == 1:
@@ -113,7 +122,7 @@ class Mesh(TreeNode):
             try:
                 import pymetis
 
-                adj = self.cell_adjacency_vertex
+                adj = self.get_cell_adjacency_vertex()
                 csr_adj = pymetis.CSRAdjacency(adj.indptr, adj.indices)
                 partition = np.asarray(pymetis.part_graph(size, csr_adj)[1], np.int32)
             except ImportError:
@@ -140,14 +149,9 @@ class Mesh(TreeNode):
             self.cell_permutation = permutation
         else:
             self.cell_permutation = self.cell_permutation[permutation]
-
-        # Invalidate cached maps involving cells:
-        self.__dict__.pop("cell_adjacency_vertex", None)
-        self.__dict__.pop("edge_maps", None)
         return CellDivision(self, counts, group)
 
-    @cached_property
-    def cell_adjacency_vertex(self) -> csr_array:
+    def get_cell_adjacency_vertex(self) -> csr_array:
         """Adjacency matrix of cells that share a vertex."""
         cells = self.cells[:, :-1]
         cell_to_vertex = csr_array(
@@ -158,86 +162,71 @@ class Mesh(TreeNode):
         )
         return make_adjacency(cell_to_vertex)
 
-    @cached_property
-    def cell_adjacency_edge(self) -> csr_array:
-        """Adjacency matrix of cells that share an edge."""
-        _, interior, _ = self.edge_maps
-        cell_pairs = interior[..., 0]
+    def get_cell_adjacency_face(self) -> csr_array:
+        """Adjacency matrix of cells that share an face."""
+        self._initialize_face_maps()  # kind of a hack: TODO fix
+        cell_pairs = self.interior[..., 0]
         i_cell, j_cell = np.vstack((cell_pairs, cell_pairs[:, ::-1])).T  # both orders
         n_cells = len(self.cells)
         return csr_array((np.ones_like(i_cell), (i_cell, j_cell)), (n_cells, n_cells))
 
-    @cached_property
-    def edge_maps(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Interior and boundary edges, mapped to cells.
-
-        Returns
-        -------
-        edges
-            Nc x (d + 1) x d indices of the 2 vertices per edge in 2D and 1 in 1D,
-            for each of the 3 edges per cell in 2D and 2 edges per cell in 1D.
-        interior
-            Ni x 2 x 2 indices: cell number and edge number within cell (last dimension)
-            for each of two cells (middle dimension) that each interior edge belongs to.
-        boundary
-            Nb x 3 indices: cell number, edge number within cell for the single cell
-            that each boundary edge belongs to, along with the boundary ID of the edge.
-        """
+    def _initialize_face_maps(self) -> None:
+        """Initialize interior and boundary faces, mapped to cells."""
         if self.is1D:
-            edges = self.cells[:, :-1, None]
-            edge_ids = edges[..., 0]  # edge defined by single vertex in 1D
-            boundary_edge_ids = self.boundary_edges[..., 0]
+            faces = self.cells[:, :-1, None]
+            face_ids = faces[..., 0]  # face defined by single vertex in 1D
+            boundary_face_ids = self.boundary_faces[..., 0]
         else:
-            edges = self.cells[:, np.array([(0, 1), (1, 2), (2, 0)])]
+            faces = self.cells[:, np.array([(0, 1), (1, 2), (2, 0)])]
 
-            if vertex_map := self.lattice_vertex_map() is None:
-                edges_weld = edges
-                boundary_edges_weld = self.boundary_edges[:, :2]
+            if vertex_map := self.get_lattice_vertex_map() is None:
+                faces_weld = faces
+                boundary_faces_weld = self.boundary_faces[:, :2]
                 n_vertices_weld = len(self.vertices)
             else:
                 # Identify vertices separated by lattice vectors:
-                edges_weld = vertex_map[edges]
-                boundary_edges_weld = vertex_map[self.boundary_edges[:, :2]]
+                faces_weld = vertex_map[faces]
+                boundary_faces_weld = vertex_map[self.boundary_faces[:, :2]]
                 n_vertices_weld = vertex_map.max() + 1
                 if n_vertices_weld == len(self.vertices):
                     log.info("Lattice vectors have no effect: no equivalent vertices.")
 
-            # Construct edge ID that is equal for edge with different vertex orders:
+            # Construct face ID that is equal for face with different vertex orders:
             stride = np.array((n_vertices_weld, 1))
-            edge_ids = np.sort(edges_weld, axis=-1) @ stride
-            boundary_edge_ids = np.sort(boundary_edges_weld, axis=-1) @ stride
+            face_ids = np.sort(faces_weld, axis=-1) @ stride
+            boundary_face_ids = np.sort(boundary_faces_weld, axis=-1) @ stride
+        self.faces = faces
 
-        # Find unique edge IDs and counts:
+        # Find unique face IDs and counts:
         unique_ids, unique_indices, unique_inverse, counts = np.unique(
-            edge_ids, return_index=True, return_inverse=True, return_counts=True
+            face_ids, return_index=True, return_inverse=True, return_counts=True
         )
         assert counts.max() <= 2
         unique_rank = np.ones_like(unique_inverse)  # rank within equivalence class
         unique_rank[unique_indices] = 0  # and others are 1 because count <= 2
-        edge_map = np.zeros_like(unique_inverse, shape=(len(unique_ids), 2, 2))
-        edge_map[unique_inverse, unique_rank] = np.stack(
+        face_map = np.zeros_like(unique_inverse, shape=(len(unique_ids), 2, 2))
+        face_map[unique_inverse, unique_rank] = np.stack(
             np.meshgrid(
-                np.arange(edges.shape[0]), np.arange(edges.shape[1]), indexing="ij"
+                np.arange(faces.shape[0]), np.arange(faces.shape[1]), indexing="ij"
             ),
             axis=-1,
         ).reshape(
             -1, 2
-        )  # cell and edge within cell, for each copy of each unique edge
+        )  # cell and face within cell, for each copy of each unique face
 
-        # Split edge map into interior and boundary
-        interior = edge_map[np.where(counts == 2)[0]]
+        # Split face map into interior and boundary
+        self.interior = face_map[np.where(counts == 2)[0]]
         sel_boundary = np.where(counts == 1)[0]
 
-        # Find boundary region index for each boundary edge:
-        i_unique_boundary = np.searchsorted(unique_ids, boundary_edge_ids)
+        # Find boundary region index for each boundary face:
+        i_unique_boundary = np.searchsorted(unique_ids, boundary_face_ids)
         boundary_region_ids = np.full(len(unique_ids), -1)
-        boundary_region_ids[i_unique_boundary] = self.boundary_edges[:, -1]
-        boundary = np.hstack(
-            (edge_map[sel_boundary, 0], boundary_region_ids[sel_boundary, None])
+        boundary_region_ids[i_unique_boundary] = self.boundary_faces[:, -1]
+        self.boundary = np.hstack(
+            (face_map[sel_boundary, 0], boundary_region_ids[sel_boundary, None])
         )
-        return edges, interior, boundary
 
-    def lattice_vertex_map(self) -> np.ndarray | None:
+    def get_lattice_vertex_map(self) -> np.ndarray | None:
         """Get mapping of vertices to reduced set under periodic boundary conditions,
         if any. Returns None if no periodicity."""
         if self.is1D or self.lattice_vectors is None:
@@ -254,11 +243,10 @@ class Mesh(TreeNode):
         )
         return np.unique(lowest_equivalent_index, return_inverse=True)[1]
 
-    def get_fv_geom(
-        self, cell_division: CellDivision, *, dtype: torch.dtype = torch.float64
-    ) -> FVGeom:
+    def get_fv_geom(self, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         """Initialize finite-volume parameters for mesh."""
         # Compute cell area and centroid:
+        cell_division = self.cell_division
         cells = self.cells[cell_division.global_index, :-1]  # local, ignore region ID
         cell_vertices = self.vertices[cells]
         if self.is1D:
@@ -269,45 +257,44 @@ class Mesh(TreeNode):
                 raise ValueError("Areas must be positive (counter-clockwise triangles)")
         centroid = cell_vertices.mean(axis=1)
 
-        # Identify interior and boundary edges, and map to local cell indices:
-        edges, interior, boundary = self.edge_maps
-        edges = edges[cell_division.global_index]  # local cells only (with padding)
+        # Identify interior and boundary faces, and map to local cell indices:
+        faces = self.faces[cell_division.global_index]  # local cells (with padding)
+        interior = np.copy(self.interior)
+        boundary = np.copy(self.boundary)
         interior[..., 0] = cell_division.local_index[interior[..., 0]]
         boundary[:, 0] = cell_division.local_index[boundary[:, 0]]
 
-        # Filter interior edges so that both cells local and at least one owned:
+        # Filter interior faces so that both cells local and at least one owned:
         interior = interior[(interior[..., 0] >= 0).all(axis=1)]  # both cells local
         interior = interior[(interior[..., 0] < cell_division.n_mine).any(axis=1)]
-        # Define edge ownership based on first cell owned, and sort by ownership:
+        # Define face ownership based on first cell owned, and sort by ownership:
         interior = interior[np.lexsort(interior[:, ::-1, 0].T)]
         n_interior_mine = int(np.searchsorted(interior[:, 0, 0], cell_division.n_mine))
         (kL, fL), (kR, fR) = np.transpose(interior, (1, 2, 0))
 
-        # Filter boundary edges so that corresponding cell is owned:
+        # Filter boundary faces so that corresponding cell is owned:
         sel = (boundary[:, 0] >= 0) & (boundary[:, 0] < cell_division.n_mine)
         boundary = boundary[sel]
         bk, bf, bmark = boundary.T
 
-        # Compute edge properties:
-        edge_vertices = self.vertices[edges]
-        edge_offset = (
-            edge_vertices.mean(axis=2) - centroid[:, None]
-        )  # cell to edge center
+        # Compute face properties:
+        face_vertices = self.vertices[faces]
+        face_offset = face_vertices.mean(axis=2) - centroid[:, None]  # from centroid
         if self.is1D:
-            edge_lengths = np.ones_like(edge_offset[..., 0])
-            edge_normals = edge_offset / np.linalg.norm(
-                edge_offset, axis=-1, keepdims=True
+            face_weights = np.ones_like(face_offset[..., 0])
+            face_normals = face_offset / np.linalg.norm(
+                face_offset, axis=-1, keepdims=True
             )
         else:
-            edge_vectors = edge_vertices[:, :, 1] - edge_vertices[:, :, 0]
-            edge_lengths = np.linalg.norm(edge_vectors, axis=2)
-            edge_normals = (
-                np.stack([edge_vectors[..., 1], -edge_vectors[..., 0]], axis=2)
-                / edge_lengths[..., None]
+            face_vectors = face_vertices[:, :, 1] - face_vertices[:, :, 0]
+            face_weights = np.linalg.norm(face_vectors, axis=2)
+            face_normals = (
+                np.stack([face_vectors[..., 1], -face_vectors[..., 0]], axis=2)
+                / face_weights[..., None]
             )
 
         # Inverse-distance-weighted least-squares gradient operator per cell:
-        adjacency = self.cell_adjacency_vertex
+        adjacency = self.get_cell_adjacency_vertex()
         neighbor_indices = cell_division.local_index[adjacency.indices]  # local index
         index_ranges = adjacency.indptr  # but index ranges by global index
         Nmax = np.diff(index_ranges).max()
@@ -325,7 +312,7 @@ class Mesh(TreeNode):
             grad_op[i, :, : len(js)] = np.linalg.pinv(w[:, None] * D) * w[None, :]
 
         # Fuse gradient + centroid -> face offsets to a single matrix multiply:
-        recon = np.einsum("kfx, kxg -> kfg", edge_offset[:n_cells_recon], grad_op)
+        recon = np.einsum("kfx, kxg -> kfg", face_offset[:n_cells_recon], grad_op)
 
         def t(a, long=False):
             return torch.tensor(
@@ -334,20 +321,20 @@ class Mesh(TreeNode):
                 dtype=torch.long if long else dtype,
             )
 
-        n_cell_edges = 2 if self.is1D else 3
+        n_cell_faces = 2 if self.is1D else 3
         return FVGeom(
             area=t(area),
             eL=t(kL, long=True),
             eR=t(kR, long=True),
-            eLF=t(kL * n_cell_edges + fL, long=True),
-            eRF=t(kR * n_cell_edges + fR, long=True),
-            en=t(edge_normals[kL, fL]),
-            elen=t(edge_lengths[kL, fL]),
+            eLF=t(kL * n_cell_faces + fL, long=True),
+            eRF=t(kR * n_cell_faces + fR, long=True),
+            en=t(face_normals[kL, fL]),
+            elen=t(face_weights[kL, fL]),
             bcell=t(bk, long=True),
-            bF=t(bk * n_cell_edges + bf, long=True),
+            bF=t(bk * n_cell_faces + bf, long=True),
             bmark=t(bmark, long=True),
-            bn=t(edge_normals[bk, bf]),
-            blen=t(edge_lengths[bk, bf]),
+            bn=t(face_normals[bk, bf]),
+            blen=t(face_weights[bk, bf]),
             nbr=t(nbr, long=True),
             recon=t(recon),
             n_interior_mine=n_interior_mine,
@@ -359,20 +346,20 @@ class FVGeom:
     """Finite-volume geometry parameters for mesh."""
 
     area: torch.Tensor  #: Cell areas (interval lengths in 1D)
-    eL: torch.Tensor  #: First cell index for interior edges
-    eR: torch.Tensor  #: Second cell index for interior edges
-    eLF: torch.Tensor  #: Flattened first cell-edge index for interior edges
-    eRF: torch.Tensor  #: Flattened second cell-edge index for interior edges
-    en: torch.Tensor  #: Outward normal directions for each edge (in first cell)
-    elen: torch.Tensor  #: Edge lengths
-    bcell: torch.Tensor  #: Cell index for boundary edges
-    bF: torch.Tensor  #: Flattened cell-edge index for boundary edges
-    bmark: torch.Tensor  #: Boundary region IDs for boundary edges
-    bn: torch.Tensor  #: Outward normal directions for boundary edges
-    blen: torch.Tensor  #: Boundary edge lengths
+    eL: torch.Tensor  #: First cell index for interior faces
+    eR: torch.Tensor  #: Second cell index for interior faces
+    eLF: torch.Tensor  #: Flattened first cell-face index for interior faces
+    eRF: torch.Tensor  #: Flattened second cell-face index for interior faces
+    en: torch.Tensor  #: Outward normal directions for each face (in first cell)
+    elen: torch.Tensor  #: Face areas
+    bcell: torch.Tensor  #: Cell index for boundary faces
+    bF: torch.Tensor  #: Flattened cell-face index for boundary faces
+    bmark: torch.Tensor  #: Boundary region IDs for boundary faces
+    bn: torch.Tensor  #: Outward normal directions for boundary faces
+    blen: torch.Tensor  #: Boundary face areas
     nbr: torch.Tensor  #: Neighbor-indices by cell (n_cells, Nmax)
     recon: torch.Tensor  #: Face-increment  operator (n_cells, 3, Nmax)
-    n_interior_mine: int  #: Number of interior edges owned by current cell
+    n_interior_mine: int  #: Number of interior faces owned by current cell
 
 
 def make_adjacency(x_to_y: csr_array) -> csr_array:
@@ -396,8 +383,8 @@ class CellDivision(TaskDivisionCustom):
     ) -> None:
         super().__init__(n_mine=counts[group.rank()], group=group)
         self.group = group
-        adj_vert = mesh.cell_adjacency_vertex
-        adj_edge = mesh.cell_adjacency_edge
+        adj_vert = mesh.get_cell_adjacency_vertex()
+        adj_face = mesh.get_cell_adjacency_face()
 
         def ring(cells: np.ndarray, adj: csr_array) -> np.ndarray:
             """1-ring vertex closure of a set of cells (cells + their neighbours)."""
@@ -407,7 +394,7 @@ class CellDivision(TaskDivisionCustom):
             return np.where(v)[0]
 
         owned = np.arange(self.i_start, self.i_stop)
-        ring1 = ring(owned, adj_edge)  # cells to reconstruct (+edge-neighbors)
+        ring1 = ring(owned, adj_face)  # cells to reconstruct (+face-neighbors)
         ring2 = ring(ring1, adj_vert)  # cells accessed overall (+vertex-neighbors)
         ghosts = ring2[~self.belongs(self.i_proc, ring2)]  # global indices from others
         self.n_recon = len(ring1)  # number of local cells to reconstruct
@@ -433,7 +420,7 @@ class CellDivision(TaskDivisionCustom):
                 recv.append(self.local_index[ghosts[self.belongs(j_proc, ghosts)]])
                 # Send the owned cells that other ranks need:
                 owned_q = np.arange(self.n_prev[j_proc], self.n_prev[j_proc + 1])
-                ring2_q = ring(ring(owned_q, adj_edge), adj_vert)
+                ring2_q = ring(ring(owned_q, adj_face), adj_vert)
                 ghost_q = ring2_q[~self.belongs(j_proc, ring2_q)]
                 send.append(self.local_index[owned[np.isin(owned, ghost_q)]])
         self.recv_index = torch.from_numpy(np.concatenate(recv)).to(rc.device)

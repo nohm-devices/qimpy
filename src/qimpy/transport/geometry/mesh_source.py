@@ -66,7 +66,7 @@ class Line(TreeNode):
         mesh.cells = np.column_stack(
             (np.arange(N), np.arange(1, N + 1), np.full(N, -1))
         )
-        mesh.boundary_edges = np.array([[0, 0], [N, 1]])
+        mesh.boundary_faces = np.array([[0, 0], [N, 1]])
         mesh.region_names = []
         mesh.boundary_names = ["source", "drain"]
         mesh.lattice_vectors = None
@@ -110,7 +110,7 @@ class Rect(TreeNode):
         contacts
             :yaml:`Named regions on the rectangle boundary to use as contacts.`
             Each name is associated with a circle (x0, y0, r) or axis-aligned
-            ellipse (x0, y0, rx, ry): any edges on the boundary with center
+            ellipse (x0, y0, rx, ry): any faces on the boundary with center
             within this circle or ellipse is associated to that name.
         regions
             :yaml:`Named regions in the interior to use as probes.`
@@ -167,7 +167,7 @@ class Rect(TreeNode):
         # Add boundaries and label contacts:
         null_x = np.full(Nx, -1)
         null_y = np.full(Ny, -1)
-        mesh.boundary_edges = np.concatenate(
+        mesh.boundary_faces = np.concatenate(
             (
                 np.stack((i_corners[:-1, 0], i_corners[1:, 0], null_x), axis=-1),
                 np.stack((i_corners[:-1, -1], i_corners[1:, -1], null_x), axis=-1),
@@ -176,11 +176,11 @@ class Rect(TreeNode):
             ),
             axis=0,
         )
-        edge_centers = mesh.vertices[mesh.boundary_edges[:, :-1]].mean(axis=1)
+        face_centers = mesh.vertices[mesh.boundary_faces[:, :-1]].mean(axis=1)
         mesh.boundary_names = []
         for i_contact, (contact_name, ellipse) in enumerate(contacts.items()):
             mesh.boundary_names.append(contact_name)
-            mesh.boundary_edges[within_ellipse(edge_centers, ellipse), -1] = i_contact
+            mesh.boundary_faces[within_ellipse(face_centers, ellipse), -1] = i_contact
 
         mesh.lattice_vectors = (
             None if lattice_vectors is None else np.array(lattice_vectors)

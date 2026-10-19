@@ -64,17 +64,17 @@ class Geometry(TreeNode):
             Speeds up sequential elemntise operations by kernel fusion when possible.
         """
         TreeNode.__init__(self)
-        self.material = material
-        self.add_child("mesh", Mesh, mesh, checkpoint_in)
         self.group = process_grid.get_group("r")
+        self.material = material
+        self.add_child("mesh", Mesh, mesh, checkpoint_in, group=self.group)
         self.save_rho = save_rho
         self.epsilon_sq = float(epsilon_sq)
         self.faces_block_size = faces_block_size
 
         self._mpi = self.group.size() > 1
-        self.cell_division = self.mesh.partition_cells(self.group)
         v = material.transport_velocity  # (Nk, 2)
-        geom = self.mesh.get_fv_geom(self.cell_division, dtype=v.dtype)
+        geom = self.mesh.get_fv_geom(dtype=v.dtype)
+        cell_division = self.mesh.cell_division
         self.geom = geom
         self.Nk = v.shape[0]
         self.K = int(geom.area.shape[0])  # local cells including padding
@@ -105,8 +105,8 @@ class Geometry(TreeNode):
             ik + self.Nk * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
         ).flatten()
         values = torch.cat((wL.flatten(), wR.flatten(), wB.flatten()))
-        sel_mine = torch.where(idx_out < self.cell_division.n_mine * self.Nk)[0]
-        n_recon = self.cell_division.n_recon
+        sel_mine = torch.where(idx_out < cell_division.n_mine * self.Nk)[0]
+        n_recon = cell_division.n_recon
         self.v_dot_del = torch.sparse_coo_tensor(
             indices=torch.stack((idx_out[sel_mine], idx_in[sel_mine])),
             values=values[sel_mine],
@@ -121,7 +121,7 @@ class Geometry(TreeNode):
         # Initialize flux collection on faces:
         self.flux_indices = material.get_flux_indices()
         if self.flux_indices:
-            to_global = torch.from_numpy(self.cell_division.global_index).to(rc.device)
+            to_global = torch.from_numpy(cell_division.global_index).to(rc.device)
             eL = to_global[geom.eL]
             eR = to_global[geom.eR]
             bcell = to_global[geom.bcell]
@@ -174,7 +174,7 @@ class Geometry(TreeNode):
             ).to_sparse_csr()
 
             # Set up boundary probes:
-            i_boundary_all = self.mesh.boundary_edges[:, -1]
+            i_boundary_all = self.mesh.boundary_faces[:, -1]
             assert i_boundary_all.min() >= -1
             n_boundaries = int(i_boundary_all.max()) + 1  # marked boundary regions
             probe_edges = torch.where(geom.bmark >= 0)[0]
@@ -203,13 +203,13 @@ class Geometry(TreeNode):
             self.boundary_probe = Boundary(self, contacts, probe_edges)
 
         # Set up cell region (interior) probes:
-        n_mine = self.cell_division.n_mine
+        n_mine = cell_division.n_mine
         w_cells = geom.area[:n_mine]
         i_region_all = self.mesh.cells[:, -1]
         assert i_region_all.min() >= -1
         n_regions = int(i_region_all.max()) + 1
         i_region = torch.from_numpy(
-            i_region_all[self.cell_division.global_index[:n_mine]]
+            i_region_all[cell_division.global_index[:n_mine]]
         ).to(rc.device)
         probe_cells = torch.where(i_region >= 0)[0]
         i_region = i_region[probe_cells]
@@ -236,11 +236,7 @@ class Geometry(TreeNode):
             self._face_limiter = _face_limiter  # eager mode
 
         rho0 = getattr(material, "rho0", None)
-        if (
-            (self.cell_division is None)
-            and checkpoint_in
-            and checkpoint_in.member("rho")
-        ):
+        if (cell_division is None) and checkpoint_in and checkpoint_in.member("rho"):
             cp, path = checkpoint_in  # warm start (serial)
             rho = torch.as_tensor(
                 np.array(cp[f"{path}/rho"]), device=rc.device, dtype=v.dtype
@@ -265,8 +261,9 @@ class Geometry(TreeNode):
         Result is flattened over the cell and face dimensions.
         If `boundary_only`, result is computed only for marked boundary faces."""
         # Update ghost regions if needed:
-        if self.cell_division is not None:
-            self.cell_division.exchange(rho)
+        cell_division = self.mesh.cell_division
+        if cell_division is not None:
+            cell_division.exchange(rho)
 
         # Reconstruct rho at faces from rho at cell centroids:
         g = self.geom
@@ -278,7 +275,7 @@ class Geometry(TreeNode):
             # Apply boundary conditions and return only boundary faces:
             return self.boundary_probe.apply(rho_faces.flatten(0, 1), t, update=False)
         else:
-            n_recon = self.cell_division.n_recon
+            n_recon = cell_division.n_recon
             rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
             block_size = self.faces_block_size if self.faces_block_size else n_recon
             for sel in get_block_slices(n_recon, block_size):
@@ -308,7 +305,7 @@ class Geometry(TreeNode):
         watch = StopWatch("Geometry.rho_dot")
         out = (self.v_dot_del @ self.to_faces(rho, t).flatten()).view(rho.shape)
         watch.stop()
-        n_mine = self.cell_division.n_mine
+        n_mine = self.mesh.cell_division.n_mine
         if self.collision_enabled:
             out[:n_mine] += self.material.rho_dot(rho[:n_mine], t, id(self))
         return out
@@ -317,7 +314,7 @@ class Geometry(TreeNode):
         """The material collision term ALONE, with no spatial RHS.
         Used by operator splitting (``collision_interval > 1``)."""
         out = torch.zeros_like(rho)
-        n_mine = self.cell_division.n_mine
+        n_mine = self.mesh.cell_division.n_mine
         out[:n_mine] += self.material.rho_dot(rho[:n_mine], t, id(self))
         return out
 
@@ -351,14 +348,14 @@ class Geometry(TreeNode):
     @stopwatch
     def update_observables(self, i_step: int, t: float) -> None:
         """Stash observables (and related) for output in next checkpoint."""
-        rho_mine = self.rho[: self.cell_division.n_mine]
+        rho_mine = self.rho[: self.mesh.cell_division.n_mine]
         obserables = self.material.measure_observables(rho_mine, t)
         self.stash.i_step.append(i_step)
         self.stash.t.append(t)
         self.stash.observables.append(obserables.detach().cpu())
         if self.flux_indices:
             self.stash.flux.append(self.get_flux(t)[0].detach().cpu())
-        self.material.update_stash(rho_mine, self.cell_division)
+        self.material.update_stash(rho_mine, self.mesh.cell_division)
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -379,7 +376,7 @@ class Geometry(TreeNode):
 
         # Observables:
         n_stash = len(self.stash.t)
-        div = self.cell_division
+        div = self.mesh.cell_division
         dset = cp_path.create_dataset(
             "observables", (n_stash, div.n_tot, len(names)), np.float64
         )
