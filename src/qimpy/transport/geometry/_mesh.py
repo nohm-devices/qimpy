@@ -298,7 +298,6 @@ class Mesh(TreeNode):
             edge_normals = edge_offset / np.linalg.norm(
                 edge_offset, axis=-1, keepdims=True
             )
-            inradius = area  # as used for dt determination with Courant condition
         else:
             edge_vectors = edge_vertices[:, :, 1] - edge_vertices[:, :, 0]
             edge_lengths = np.linalg.norm(edge_vectors, axis=2)
@@ -306,7 +305,6 @@ class Mesh(TreeNode):
                 np.stack([edge_vectors[..., 1], -edge_vectors[..., 0]], axis=2)
                 / edge_lengths[..., None]
             )
-            inradius = area / (0.5 * edge_lengths.sum(axis=1))
 
         # Inverse-distance-weighted least-squares gradient operator per cell:
         adjacency = self.cell_adjacency_vertex
@@ -339,7 +337,6 @@ class Mesh(TreeNode):
         n_cell_edges = 2 if self.is1D else 3
         return FVGeom(
             area=t(area),
-            inradius=t(inradius),
             eL=t(kL, long=True),
             eR=t(kR, long=True),
             eLF=t(kL * n_cell_edges + fL, long=True),
@@ -362,7 +359,6 @@ class FVGeom:
     """Finite-volume geometry parameters for mesh."""
 
     area: torch.Tensor  #: Cell areas (interval lengths in 1D)
-    inradius: torch.Tensor  #: Corresponding in-radii for time step determination
     eL: torch.Tensor  #: First cell index for interior edges
     eR: torch.Tensor  #: Second cell index for interior edges
     eLF: torch.Tensor  #: Flattened first cell-edge index for interior edges

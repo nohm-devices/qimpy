@@ -7,14 +7,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from qimpy import rc, TreeNode
+from qimpy import rc, log, TreeNode
 from qimpy.io import CheckpointPath, InvalidInputException, CheckpointContext
 from qimpy.mpi import (
     ProcessGrid,
-    all_reduce_scalars,
     get_block_slices,
     TaskDivisionCustom,
     all_gather_padded,
+    globalreduce,
 )
 from qimpy.profiler import StopWatch, stopwatch
 from ..material import Material
@@ -112,6 +112,8 @@ class Geometry(TreeNode):
             values=values[sel_mine],
             size=(len(geom.area) * self.Nk, n_recon * self._nf * self.Nk),
         ).to_sparse_csr()
+        self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD)
+        log.info(f"Set dt_max = {self.dt_max:.4g} for Courant number {courant_number}")
 
         self.collision_enabled = True
         self.boundary = Boundary(self, contacts)
@@ -232,9 +234,6 @@ class Geometry(TreeNode):
                 self._face_limiter = torch.compile(_face_limiter, mode=mode)
         else:
             self._face_limiter = _face_limiter  # eager mode
-
-        dt_local = float(courant_number * geom.inradius.min() / v.norm(dim=1).max())
-        self.dt_max = all_reduce_scalars(dt_local, dist.ReduceOp.MIN, dist.group.WORLD)
 
         rho0 = getattr(material, "rho0", None)
         if (

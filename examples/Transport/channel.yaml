@@ -23,7 +23,6 @@ geometry:
       regions:
         s-interior: [0.0, 0.125, 0.1, 0.125]
         d-interior: [1.0, 0.125, 0.1, 0.125]
-  courant-number: 1.2
   compile: no
   contacts:
     source:
