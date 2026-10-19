@@ -112,7 +112,7 @@ class Geometry(TreeNode):
             values=values[sel_mine],
             size=(len(geom.area) * self.Nk, n_recon * self._nf * self.Nk),
         ).to_sparse_csr()
-        self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD)
+        self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD).item()
         log.info(f"Set dt_max = {self.dt_max:.4g} for Courant number {courant_number}")
 
         self.collision_enabled = True
