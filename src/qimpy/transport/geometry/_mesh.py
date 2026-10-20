@@ -396,6 +396,8 @@ class CellDivision(TaskDivisionCustom):
 
     def exchange(self, u: torch.Tensor) -> None:
         """Fill this rank's ghost rows of ``u`` (K, Nk) with their owners' values."""
+        if self.n_procs == 1:
+            return
         send_buf = u[self.send_index].contiguous()
         recv_buf = torch.empty(
             (len(self.recv_index), u.shape[1]), dtype=u.dtype, device=u.device

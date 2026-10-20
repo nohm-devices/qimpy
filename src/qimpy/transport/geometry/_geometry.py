@@ -236,7 +236,7 @@ class Geometry(TreeNode):
             self._face_limiter = _face_limiter  # eager mode
 
         rho0 = getattr(material, "rho0", None)
-        if (cell_division is None) and checkpoint_in and checkpoint_in.member("rho"):
+        if checkpoint_in and checkpoint_in.member("rho"):
             cp, path = checkpoint_in  # warm start (serial)
             rho = torch.as_tensor(
                 np.array(cp[f"{path}/rho"]), device=rc.device, dtype=v.dtype
@@ -262,8 +262,7 @@ class Geometry(TreeNode):
         If `boundary_only`, result is computed only for marked boundary faces."""
         # Update ghost regions if needed:
         cell_division = self.mesh.cell_division
-        if cell_division is not None:
-            cell_division.exchange(rho)
+        cell_division.exchange(rho)
 
         # Reconstruct rho at faces from rho at cell centroids:
         g = self.geom
