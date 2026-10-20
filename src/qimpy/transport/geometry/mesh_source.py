@@ -69,7 +69,6 @@ class Line(TreeNode):
         mesh.boundary_faces = np.array([[0, 0], [N, 1]])
         mesh.region_names = []
         mesh.boundary_names = ["source", "drain"]
-        mesh.lattice_vectors = None
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext
@@ -89,7 +88,6 @@ class Rect(TreeNode):
         Ny: int,
         contacts: dict[str, tuple[float, ...]],
         regions: dict[str, tuple[float, ...]] | None = None,
-        lattice_vectors: list[list[float]] | None = None,
         mesh: geometry.Mesh,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
@@ -115,11 +113,6 @@ class Rect(TreeNode):
         regions
             :yaml:`Named regions in the interior to use as probes.`
             Each name is associated with a circle or ellipse as in `contacts`.
-        lattice
-            :yaml:`Lattice vectors for periodic boundary conditions.`
-            If specified, it should be a 2 x 2 matrix with each row corresponding
-            to a lattice vector. If desirable to only have one periodic direction,
-            just make the second lattice vector longer than the geometry.
         """
         super().__init__()
         self.Lx = Lx
@@ -181,10 +174,6 @@ class Rect(TreeNode):
         for i_contact, (contact_name, ellipse) in enumerate(contacts.items()):
             mesh.boundary_names.append(contact_name)
             mesh.boundary_faces[within_ellipse(face_centers, ellipse), -1] = i_contact
-
-        mesh.lattice_vectors = (
-            None if lattice_vectors is None else np.array(lattice_vectors)
-        )
 
     def _save_checkpoint(
         self, cp_path: CheckpointPath, context: CheckpointContext

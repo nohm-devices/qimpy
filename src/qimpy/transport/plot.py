@@ -318,7 +318,7 @@ def run(
         g = cp["/geometry"]
         verts = np.array(g["mesh/vertices"])  # (Nv, 2)
         tris = np.array(g["mesh/cells"])[:, :-1]  # (K, 3)
-        boundary_edges = np.array(g["mesh/boundary_edges"])
+        boundary_faces = np.array(g["mesh/boundary_faces"])
         boundary_names = CheckpointPath(cp, "/geometry/mesh").read_str_list(
             "boundary_names"
         )
@@ -332,7 +332,7 @@ def run(
     # Contact edges (gold) vs walls (black), from the mesh's own markers.
     contact, contact_labels = fv_contact_mask(
         edges["bkeys"],
-        boundary_edges,
+        boundary_faces,
         boundary_names,
         contact_names=boundary_names,
         bmid=bmid,

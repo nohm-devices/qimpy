@@ -1,13 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from scipy.spatial import KDTree
 from scipy.sparse import csr_array
 import numpy as np
 import torch
 import torch.distributed as dist
 
-from qimpy import rc, log, TreeNode
+from qimpy import rc, TreeNode
 from qimpy.io import CheckpointPath, CheckpointContext
 from qimpy.mpi import TaskDivisionCustom
 from . import mesh_source
@@ -22,7 +21,6 @@ class Mesh(TreeNode):
     region_names: list[str]  #: names of interior regions (for cell IDs >= 0)
     boundary_faces: np.ndarray  #: sorted vertex indices, ID of boundary faces (Nb, d+1)
     boundary_names: list[str]  #: names of boundary regions (for face IDs >= 0)
-    lattice_vectors: np.ndarray | None  #: lattice vectors in rows if periodic
     cell_permutation: np.ndarray | None  #: Reordering of cells relative to the source
 
     # Calculated members:
@@ -77,7 +75,6 @@ class Mesh(TreeNode):
         self.region_names = cp.read_str_list("region_names")
         self.boundary_faces = cp.read_np("boundary_faces")
         self.boundary_names = cp.read_str_list("boundary_names")
-        self.lattice_vectors = cp.read_optional_np("lattice_vectors")
         self.cell_permutation = cp.read_optional_np("cell_permutation")
 
     def save(self, cp: CheckpointPath) -> list[str]:
@@ -89,8 +86,6 @@ class Mesh(TreeNode):
             cp.write("boundary_faces", self.boundary_faces),
             cp.write_str("boundary_names", ",".join(self.boundary_names)),
         ]
-        if self.lattice_vectors is not None:
-            saved_list.append(cp.write("lattice_vectors", self.lattice_vectors))
         if self.cell_permutation is not None:
             saved_list.append(cp.write("cell_permutation", self.cell_permutation))
         return saved_list
@@ -178,23 +173,9 @@ class Mesh(TreeNode):
             boundary_face_ids = self.boundary_faces[..., 0]
         else:
             faces = self.cells[:, np.array([(0, 1), (1, 2), (2, 0)])]
-
-            if vertex_map := self.get_lattice_vertex_map() is None:
-                faces_weld = faces
-                boundary_faces_weld = self.boundary_faces[:, :2]
-                n_vertices_weld = len(self.vertices)
-            else:
-                # Identify vertices separated by lattice vectors:
-                faces_weld = vertex_map[faces]
-                boundary_faces_weld = vertex_map[self.boundary_faces[:, :2]]
-                n_vertices_weld = vertex_map.max() + 1
-                if n_vertices_weld == len(self.vertices):
-                    log.info("Lattice vectors have no effect: no equivalent vertices.")
-
-            # Construct face ID that is equal for face with different vertex orders:
-            stride = np.array((n_vertices_weld, 1))
-            face_ids = np.sort(faces_weld, axis=-1) @ stride
-            boundary_face_ids = np.sort(boundary_faces_weld, axis=-1) @ stride
+            stride = np.array((len(self.vertices), 1))
+            face_ids = np.sort(faces, axis=-1) @ stride  # equal for all vertex orders
+            boundary_face_ids = np.sort(self.boundary_faces[:, :2], axis=-1) @ stride
         self.faces = faces
 
         # Find unique face IDs and counts:
@@ -225,23 +206,6 @@ class Mesh(TreeNode):
         self.boundary = np.hstack(
             (face_map[sel_boundary, 0], boundary_region_ids[sel_boundary, None])
         )
-
-    def get_lattice_vertex_map(self) -> np.ndarray | None:
-        """Get mapping of vertices to reduced set under periodic boundary conditions,
-        if any. Returns None if no periodicity."""
-        if self.is1D or self.lattice_vectors is None:
-            return None
-        frac_coords = self.vertices @ np.linalg.inv(self.lattice_vectors)
-        frac_coords -= np.floor(frac_coords)  # wrap to [0, 1)
-        tree = KDTree(frac_coords, boxsize=(1.0, 1.0))  # periodic lookup
-        MAX_EQUIVALENT = 4
-        _, i_equivalents = tree.query(
-            frac_coords, k=MAX_EQUIVALENT, distance_upper_bound=1.0e-5
-        )
-        lowest_equivalent_index = np.minimum(
-            i_equivalents.min(axis=1), np.arange(len(self.vertices))
-        )
-        return np.unique(lowest_equivalent_index, return_inverse=True)[1]
 
     def get_fv_geom(self, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         """Initialize finite-volume parameters for mesh."""
