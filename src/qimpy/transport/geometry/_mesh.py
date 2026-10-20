@@ -66,8 +66,8 @@ class Mesh(TreeNode):
         if checkpoint_in:
             self.load(checkpoint_in)
 
-        self.cell_division = self._partition_cells(group)
         self._initialize_face_maps()
+        self.cell_division = self._partition_cells(group)
 
     def load(self, cp: CheckpointPath) -> None:
         self.vertices = cp.read_np("vertices")
@@ -140,6 +140,11 @@ class Mesh(TreeNode):
 
         # Apply and track permutation:
         self.cells = self.cells[permutation]
+        self.faces = self.faces[permutation]
+        inv_permutation = np.zeros_like(permutation)
+        inv_permutation[permutation] = np.arange(len(permutation))
+        self.interior[..., 0] = inv_permutation[self.interior[..., 0]]
+        self.boundary[:, 0] = inv_permutation[self.boundary[:, 0]]
         if self.cell_permutation is None:
             self.cell_permutation = permutation
         else:
@@ -159,7 +164,6 @@ class Mesh(TreeNode):
 
     def get_cell_adjacency_face(self) -> csr_array:
         """Adjacency matrix of cells that share an face."""
-        self._initialize_face_maps()  # kind of a hack: TODO fix
         cell_pairs = self.interior[..., 0]
         i_cell, j_cell = np.vstack((cell_pairs, cell_pairs[:, ::-1])).T  # both orders
         n_cells = len(self.cells)
