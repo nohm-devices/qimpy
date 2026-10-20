@@ -26,8 +26,7 @@ class Mesh(TreeNode):
     # Calculated members:
     cell_division: CellDivision  #: split of cells over processes
     faces: np.ndarray  #: Vertex indices by cell and face (Nc, d+1, d)
-    interior: np.ndarray  #: Pair of cell and face indices by interior face (Ni, 2, 2)
-    boundary: np.ndarray  #: Cell, face and region indices by boundary face (Nb, 3)
+    face_map: np.ndarray  #: Pair of cell and face index within cell by face (Nf, 2, 2)
 
     def __init__(
         self,
@@ -138,17 +137,19 @@ class Mesh(TreeNode):
         permutation = np.argsort(partition, kind="stable")  # group cells by rank
         counts = np.bincount(partition, minlength=size)
 
-        # Apply and track permutation:
+        # Apply and track permutation on quantities stored by cells:
         self.cells = self.cells[permutation]
         self.faces = self.faces[permutation]
-        inv_permutation = np.zeros_like(permutation)
-        inv_permutation[permutation] = np.arange(len(permutation))
-        self.interior[..., 0] = inv_permutation[self.interior[..., 0]]
-        self.boundary[:, 0] = inv_permutation[self.boundary[:, 0]]
         if self.cell_permutation is None:
             self.cell_permutation = permutation
         else:
             self.cell_permutation = self.cell_permutation[permutation]
+
+        # Remap cell indices in face_map, and keep it sorted by cell indices:
+        inv_permutation = np.full(len(permutation) + 1, -1)  # last entry maps -1 to -1
+        inv_permutation[permutation] = np.arange(len(permutation))
+        self.face_map[..., 0] = inv_permutation[self.face_map[..., 0]]
+        self.face_map = self.face_map[np.lexsort(self.face_map[:, ::-1, 0].T)]
         return CellDivision(self, counts, group)
 
     def get_cell_adjacency_vertex(self) -> csr_array:
@@ -164,7 +165,7 @@ class Mesh(TreeNode):
 
     def get_cell_adjacency_face(self) -> csr_array:
         """Adjacency matrix of cells that share an face."""
-        cell_pairs = self.interior[..., 0]
+        cell_pairs = self.face_map[self.face_map[:, 1, 0] >= 0, :, 0]  # interior faces
         i_cell, j_cell = np.vstack((cell_pairs, cell_pairs[:, ::-1])).T  # both orders
         n_cells = len(self.cells)
         return csr_array((np.ones_like(i_cell), (i_cell, j_cell)), (n_cells, n_cells))
@@ -191,27 +192,18 @@ class Mesh(TreeNode):
         assert counts.max() <= 2
         unique_rank = np.ones_like(unique_inverse)  # rank within equivalence class
         unique_rank[unique_indices] = 0  # and others are 1 because count <= 2
-        face_map = np.zeros_like(unique_inverse, shape=(len(unique_ids), 2, 2))
+        face_map = np.full((len(unique_ids), 2, 2), -1)
         face_map[unique_inverse, unique_rank] = np.stack(
-            np.meshgrid(
-                np.arange(faces.shape[0]), np.arange(faces.shape[1]), indexing="ij"
-            ),
-            axis=-1,
-        ).reshape(
-            -1, 2
+            np.unravel_index(np.arange(len(unique_inverse)), face_ids.shape), axis=-1
         )  # cell and face within cell, for each copy of each unique face
 
-        # Split face map into interior and boundary
-        self.interior = face_map[np.where(counts == 2)[0]]
-        sel_boundary = np.where(counts == 1)[0]
-
-        # Find boundary region index for each boundary face:
+        # Boundary faces have only one cell set in face_map, with the other being -1s.
+        # Use the second cell index being -1 as the marker for boundary faces.
+        # Set the face within cell index of the second cell to be the region ID:
         i_unique_boundary = np.searchsorted(unique_ids, boundary_face_ids)
-        boundary_region_ids = np.full(len(unique_ids), -1)
-        boundary_region_ids[i_unique_boundary] = self.boundary_faces[:, -1]
-        self.boundary = np.hstack(
-            (face_map[sel_boundary, 0], boundary_region_ids[sel_boundary, None])
-        )
+        assert (face_map[i_unique_boundary, 1, 0] == -1).all()
+        face_map[i_unique_boundary, 1, 1] = self.boundary_faces[:, -1]
+        self.face_map = face_map[np.lexsort(face_map[:, ::-1, 0].T)]  # sort by cells
 
     def get_fv_geom(self, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         """Initialize finite-volume parameters for mesh."""
@@ -229,23 +221,29 @@ class Mesh(TreeNode):
 
         # Identify interior and boundary faces, and map to local cell indices:
         faces = self.faces[cell_division.global_index]  # local cells (with padding)
-        interior = np.copy(self.interior)
-        boundary = np.copy(self.boundary)
-        interior[..., 0] = cell_division.local_index[interior[..., 0]]
-        boundary[:, 0] = cell_division.local_index[boundary[:, 0]]
+        is_interior = self.face_map[:, 1, 0] >= 0
+        interior = np.copy(self.face_map[is_interior])
+        boundary = np.copy(self.face_map[~is_interior])
 
-        # Filter interior faces so that both cells local and at least one owned:
-        interior = interior[(interior[..., 0] >= 0).all(axis=1)]  # both cells local
-        interior = interior[(interior[..., 0] < cell_division.n_mine).any(axis=1)]
+        interior[..., 0] = cell_division.local_index[interior[..., 0]]
+        boundary[:, 0, 0] = cell_division.local_index[boundary[:, 0, 0]]
+
+        # Filter interior faces so that at least one owned (then other must be local):
+        interior = interior[
+            ((interior[..., 0] >= 0) & (interior[..., 0] < cell_division.n_mine)).any(
+                axis=1
+            )
+        ]
+
         # Define face ownership based on first cell owned, and sort by ownership:
         interior = interior[np.lexsort(interior[:, ::-1, 0].T)]
         n_interior_mine = int(np.searchsorted(interior[:, 0, 0], cell_division.n_mine))
         (kL, fL), (kR, fR) = np.transpose(interior, (1, 2, 0))
 
         # Filter boundary faces so that corresponding cell is owned:
-        sel = (boundary[:, 0] >= 0) & (boundary[:, 0] < cell_division.n_mine)
+        sel = (boundary[:, 0, 0] >= 0) & (boundary[:, 0, 0] < cell_division.n_mine)
         boundary = boundary[sel]
-        bk, bf, bmark = boundary.T
+        (bk, bf), (_, bmark) = np.transpose(boundary, (1, 2, 0))
 
         # Compute face properties:
         face_vertices = self.vertices[faces]
