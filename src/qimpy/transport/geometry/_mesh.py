@@ -60,7 +60,7 @@ class Mesh(TreeNode):
             checkpoint_in,
             TreeNode.ChildOptions("file", mesh_source.File, file, mesh=self),
             TreeNode.ChildOptions("line", mesh_source.Line, line, mesh=self),
-            TreeNode.ChildOptions("file", mesh_source.Rect, rect, mesh=self),
+            TreeNode.ChildOptions("rect", mesh_source.Rect, rect, mesh=self),
             have_default=False,
         )
         if checkpoint_in:
@@ -167,15 +167,17 @@ class Mesh(TreeNode):
 
     def _initialize_face_maps(self) -> None:
         """Initialize interior and boundary faces, mapped to cells."""
-        if self.is1D:
-            faces = self.cells[:, :-1, None]
-            face_ids = faces[..., 0]  # face defined by single vertex in 1D
-            boundary_face_ids = self.boundary_faces[..., 0]
-        else:
-            faces = self.cells[:, np.array([(0, 1), (1, 2), (2, 0)])]
-            stride = np.array((len(self.vertices), 1))
-            face_ids = np.sort(faces, axis=-1) @ stride  # equal for all vertex orders
-            boundary_face_ids = np.sort(self.boundary_faces[:, :2], axis=-1) @ stride
+        n_faces_per_cell = self.cells.shape[1] - 1  # for each vertex dropped from cell
+        faces = np.stack(
+            [
+                np.roll(self.cells[:, :-1], -i_drop, axis=1)[:, 1:]
+                for i_drop in range(n_faces_per_cell)
+            ],
+            axis=1,
+        )
+        stride = len(self.vertices) ** np.arange(faces.shape[-1])[::-1]
+        face_ids = np.sort(faces, axis=-1) @ stride  # equal for all vertex orders
+        boundary_face_ids = np.sort(self.boundary_faces[:, :-1], axis=-1) @ stride
         self.faces = faces
 
         # Find unique face IDs and counts:
