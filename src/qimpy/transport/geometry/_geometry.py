@@ -71,14 +71,26 @@ class Geometry(TreeNode):
         self.epsilon_sq = float(epsilon_sq)
         self.faces_block_size = faces_block_size
 
-        self._mpi = self.group.size() > 1
+        # Initialize cell to face reconstruction operator:
+        neighbors, reconstruct = self.mesh.get_face_reconstruction_op()
+        self.neighbors = torch.from_numpy(neighbors).to(rc.device)
+        self.reconstruct = torch.from_numpy(reconstruct).to(rc.device)
+        if compile:
+            mode = os.environ.get("QIMPY_COMPILE_MODE", "max-autotune")
+            if mode == "jit-script":
+                self._face_limiter = torch.jit.script(_face_limiter)
+            else:
+                self._face_limiter = torch.compile(_face_limiter, mode=mode)
+        else:
+            self._face_limiter = _face_limiter  # eager mode
+
         v = material.transport_velocity  # (Nk, 2)
         geom = self.mesh.get_fv_geom(dtype=v.dtype)
         cell_division = self.mesh.cell_division
         self.geom = geom
         self.Nk = v.shape[0]
         self.K = int(geom.area.shape[0])  # local cells including padding
-        self._nf = int(geom.recon.shape[1])  # faces/cell: 3 (tri) or 2 (1D)
+        self._nf = self.mesh.faces.shape[1]
 
         # Precompute velocity-weighted, area-scaled edge operators (constant):
         #   into eL: -a*elen/area_L,  into eR: +a*elen/area_R,  a = v_c.n
@@ -225,16 +237,6 @@ class Geometry(TreeNode):
             size=(n_regions, n_probe),
         ).to_sparse_csr()  # multiply by per-cell observables to get region averages
 
-        # Compile the face limiter which involves several elemntwise operations:
-        if compile:
-            mode = os.environ.get("QIMPY_COMPILE_MODE", "max-autotune")
-            if mode == "jit-script":
-                self._face_limiter = torch.jit.script(_face_limiter)
-            else:
-                self._face_limiter = torch.compile(_face_limiter, mode=mode)
-        else:
-            self._face_limiter = _face_limiter  # eager mode
-
         rho0 = getattr(material, "rho0", None)
         if checkpoint_in and checkpoint_in.member("rho"):
             cp, path = checkpoint_in  # warm start (serial)
@@ -261,29 +263,29 @@ class Geometry(TreeNode):
         Result is flattened over the cell and face dimensions.
         If `boundary_only`, result is computed only for marked boundary faces."""
         # Update ghost regions if needed:
-        cell_division = self.mesh.cell_division
-        cell_division.communicate_ghosts(rho)
+        self.mesh.cell_division.communicate_ghosts(rho)
 
         # Reconstruct rho at faces from rho at cell centroids:
-        g = self.geom
+        neighbors = self.neighbors
+        reconstruct = self.reconstruct
         if boundary_only:
             sel = self.boundary_probe.boundary_cells
             rho_faces = self._face_limiter(
-                rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
+                rho[sel], rho, neighbors[sel], reconstruct[sel], self.epsilon_sq
             )
             # Apply boundary conditions and return only boundary faces:
             return self.boundary_probe.apply(rho_faces.flatten(0, 1), t, update=False)
         else:
-            n_reconstruct = cell_division.n_reconstruct
+            n_reconstruct = len(reconstruct)
             if self.faces_block_size:
                 rho_faces = rho.new_zeros(n_reconstruct, self._nf, self.Nk)
                 for sel in get_block_slices(n_reconstruct, self.faces_block_size):
                     rho_faces[sel] = self._face_limiter(
-                        rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
+                        rho[sel], rho, neighbors[sel], reconstruct[sel], self.epsilon_sq
                     )
             else:
                 rho_faces = self._face_limiter(
-                    rho[:n_reconstruct], rho, g.nbr, g.recon, self.epsilon_sq
+                    rho[:n_reconstruct], rho, neighbors, reconstruct, self.epsilon_sq
                 )
             # Apply boundary conditions and return all faces:
             rho_faces = rho_faces.flatten(0, 1)

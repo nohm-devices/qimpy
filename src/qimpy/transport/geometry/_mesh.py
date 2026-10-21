@@ -207,6 +207,42 @@ class Mesh(TreeNode):
         face_map[i_unique_boundary, 1, 1] = self.boundary_faces[:, -1]
         self.face_map = face_map[np.lexsort(face_map[:, ::-1, 0].T)]  # sort by cells
 
+    def get_face_reconstruction_op(self) -> tuple[np.ndarray, np.ndarray]:
+        """Construct vertex neighbor list (n_reconstruct x max_neighbors) for local
+        cells requiring face reconstruction, and corresponding cell center to face
+        center reconstruction operator (n_reconstruct x n_faces x max_neighbors)."""
+        # Get neighbor list:
+        cell_div = self.cell_division
+        adjacency = self.get_cell_adjacency_vertex()
+        neighbor_indices = cell_div.local_index[adjacency.indices]  # local index
+        index_ranges = adjacency.indptr  # but index ranges by global index
+        max_neighbors = np.diff(index_ranges).max()
+        min_neighbors = self.cells.shape[1] - 2  # needed for valid reconstruction
+
+        # Create inverse-distance-weighted least-squares gradient operator:
+        n_reconstruct = cell_div.n_reconstruct
+        neighbors = np.tile(
+            np.arange(n_reconstruct)[:, None], max_neighbors
+        )  # padded with self when neighbors < max_neighbors
+        grad_op = np.zeros((n_reconstruct, 2, max_neighbors))
+        cells = self.cells[cell_div.global_index, :-1]
+        cell_centers = self.vertices[cells].mean(axis=1)
+        for i, i_global in enumerate(cell_div.global_index[:n_reconstruct]):
+            js = neighbor_indices[index_ranges[i_global] : index_ranges[i_global + 1]]
+            if len(js) < min_neighbors:
+                continue
+            neighbors[i, : len(js)] = js
+            D = cell_centers[js] - cell_centers[i]
+            w = 1.0 / np.linalg.norm(D, axis=1)
+            grad_op[i, :, : len(js)] = np.linalg.pinv(w[:, None] * D) * w[None, :]
+
+        # Combine to reconstruction operator:
+        faces = self.faces[cell_div.global_index[:n_reconstruct]]
+        face_centers = self.vertices[faces].mean(axis=2)
+        face_offsets = face_centers - cell_centers[:n_reconstruct, None]
+        reconstruct = np.einsum("cfi, cin -> cfn", face_offsets, grad_op)
+        return neighbors, reconstruct
+
     def get_fv_geom(self, *, dtype: torch.dtype = torch.float64) -> FVGeom:
         """Initialize finite-volume parameters for mesh."""
         # Compute cell area and centroid:
@@ -250,27 +286,6 @@ class Mesh(TreeNode):
                 / face_weights[..., None]
             )
 
-        # Inverse-distance-weighted least-squares gradient operator per cell:
-        adjacency = self.get_cell_adjacency_vertex()
-        neighbor_indices = cell_division.local_index[adjacency.indices]  # local index
-        index_ranges = adjacency.indptr  # but index ranges by global index
-        Nmax = np.diff(index_ranges).max()
-        n_cells_recon = cell_division.n_reconstruct
-        nbr = np.arange(n_cells_recon)[:, None].repeat(Nmax, axis=1)  # pad with self
-        grad_op = np.zeros((n_cells_recon, 2, Nmax))
-        Nmin = 1 if self.is1D else 2
-        for i, i_global in enumerate(cell_division.global_index[:n_cells_recon]):
-            js = neighbor_indices[index_ranges[i_global] : index_ranges[i_global + 1]]
-            if len(js) < Nmin:
-                continue
-            nbr[i, : len(js)] = js
-            D = centroid[js] - centroid[i]
-            w = 1.0 / np.linalg.norm(D, axis=1)
-            grad_op[i, :, : len(js)] = np.linalg.pinv(w[:, None] * D) * w[None, :]
-
-        # Fuse gradient + centroid -> face offsets to a single matrix multiply:
-        recon = np.einsum("kfx, kxg -> kfg", face_offset[:n_cells_recon], grad_op)
-
         def t(a, long=False):
             return torch.tensor(
                 np.ascontiguousarray(a),
@@ -292,8 +307,6 @@ class Mesh(TreeNode):
             bmark=t(bmark, long=True),
             bn=t(face_normals[bk, bf]),
             blen=t(face_weights[bk, bf]),
-            nbr=t(nbr, long=True),
-            recon=t(recon),
             n_interior_mine=face_division.n_interior_mine,
         )
 
@@ -314,8 +327,6 @@ class FVGeom:
     bmark: torch.Tensor  #: Boundary region IDs for boundary faces
     bn: torch.Tensor  #: Outward normal directions for boundary faces
     blen: torch.Tensor  #: Boundary face areas
-    nbr: torch.Tensor  #: Neighbor-indices by cell (n_cells, Nmax)
-    recon: torch.Tensor  #: Face-increment  operator (n_cells, 3, Nmax)
     n_interior_mine: int  #: Number of interior faces owned by current cell
 
 
