@@ -106,11 +106,11 @@ class Geometry(TreeNode):
         ).flatten()
         values = torch.cat((wL.flatten(), wR.flatten(), wB.flatten()))
         sel_mine = torch.where(idx_out < cell_division.n_mine * self.Nk)[0]
-        n_recon = cell_division.n_recon
+        n_reconstruct = cell_division.n_reconstruct
         self.v_dot_del = torch.sparse_coo_tensor(
             indices=torch.stack((idx_out[sel_mine], idx_in[sel_mine])),
             values=values[sel_mine],
-            size=(len(geom.area) * self.Nk, n_recon * self._nf * self.Nk),
+            size=(len(geom.area) * self.Nk, n_reconstruct * self._nf * self.Nk),
         ).to_sparse_csr()
         self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD).item()
         log.info(f"Set dt_max = {self.dt_max:.4g} for Courant number {courant_number}")
@@ -170,7 +170,7 @@ class Geometry(TreeNode):
             self.v_multiply_select = torch.sparse_coo_tensor(
                 indices=torch.stack((idx_out, idx_in)),
                 values=values,
-                size=(n_edges_mine * self.Nk, n_recon * self._nf * self.Nk),
+                size=(n_edges_mine * self.Nk, n_reconstruct * self._nf * self.Nk),
             ).to_sparse_csr()
 
             # Set up boundary probes:
@@ -262,7 +262,7 @@ class Geometry(TreeNode):
         If `boundary_only`, result is computed only for marked boundary faces."""
         # Update ghost regions if needed:
         cell_division = self.mesh.cell_division
-        cell_division.exchange(rho)
+        cell_division.communicate_ghosts(rho)
 
         # Reconstruct rho at faces from rho at cell centroids:
         g = self.geom
@@ -274,12 +274,16 @@ class Geometry(TreeNode):
             # Apply boundary conditions and return only boundary faces:
             return self.boundary_probe.apply(rho_faces.flatten(0, 1), t, update=False)
         else:
-            n_recon = cell_division.n_recon
-            rho_faces = rho.new_zeros(n_recon, self._nf, self.Nk)
-            block_size = self.faces_block_size if self.faces_block_size else n_recon
-            for sel in get_block_slices(n_recon, block_size):
-                rho_faces[sel] = self._face_limiter(
-                    rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
+            n_reconstruct = cell_division.n_reconstruct
+            if self.faces_block_size:
+                rho_faces = rho.new_zeros(n_reconstruct, self._nf, self.Nk)
+                for sel in get_block_slices(n_reconstruct, self.faces_block_size):
+                    rho_faces[sel] = self._face_limiter(
+                        rho[sel], rho, g.nbr[sel], g.recon[sel], self.epsilon_sq
+                    )
+            else:
+                rho_faces = self._face_limiter(
+                    rho[:n_reconstruct], rho, g.nbr, g.recon, self.epsilon_sq
                 )
             # Apply boundary conditions and return all faces:
             rho_faces = rho_faces.flatten(0, 1)

@@ -25,6 +25,7 @@ class Mesh(TreeNode):
 
     # Calculated members:
     cell_division: CellDivision  #: split of cells over processes
+    face_division: FaceDivision  #: split of faces over processes
     faces: np.ndarray  #: Vertex indices by cell and face (Nc, d+1, d)
     face_map: np.ndarray  #: Pair of cell and face index within cell by face (Nf, 2, 2)
 
@@ -67,6 +68,7 @@ class Mesh(TreeNode):
 
         self._initialize_face_maps()
         self.cell_division = self._partition_cells(group)
+        self.face_division = FaceDivision(self.face_map, self.cell_division)
 
     def load(self, cp: CheckpointPath) -> None:
         self.vertices = cp.read_np("vertices")
@@ -219,30 +221,17 @@ class Mesh(TreeNode):
                 raise ValueError("Areas must be positive (counter-clockwise triangles)")
         centroid = cell_vertices.mean(axis=1)
 
-        # Identify interior and boundary faces, and map to local cell indices:
-        faces = self.faces[cell_division.global_index]  # local cells (with padding)
-        is_interior = self.face_map[:, 1, 0] >= 0
-        interior = np.copy(self.face_map[is_interior])
-        boundary = np.copy(self.face_map[~is_interior])
+        # Get local boundary and interior faces:
+        face_division = self.face_division
+        faces = self.faces[cell_division.global_index]  # local cells (+ padding)
+        face_map = self.face_map[face_division.global_index]  # local faces (+ padding)
+        boundary = np.copy(face_map[: face_division.n_boundary_mine])
+        interior = np.copy(face_map[face_division.n_boundary_mine :])
 
+        # Map cells to local indices in these face maps:
         interior[..., 0] = cell_division.local_index[interior[..., 0]]
         boundary[:, 0, 0] = cell_division.local_index[boundary[:, 0, 0]]
-
-        # Filter interior faces so that at least one owned (then other must be local):
-        interior = interior[
-            ((interior[..., 0] >= 0) & (interior[..., 0] < cell_division.n_mine)).any(
-                axis=1
-            )
-        ]
-
-        # Define face ownership based on first cell owned, and sort by ownership:
-        interior = interior[np.lexsort(interior[:, ::-1, 0].T)]
-        n_interior_mine = int(np.searchsorted(interior[:, 0, 0], cell_division.n_mine))
         (kL, fL), (kR, fR) = np.transpose(interior, (1, 2, 0))
-
-        # Filter boundary faces so that corresponding cell is owned:
-        sel = (boundary[:, 0, 0] >= 0) & (boundary[:, 0, 0] < cell_division.n_mine)
-        boundary = boundary[sel]
         (bk, bf), (_, bmark) = np.transpose(boundary, (1, 2, 0))
 
         # Compute face properties:
@@ -266,7 +255,7 @@ class Mesh(TreeNode):
         neighbor_indices = cell_division.local_index[adjacency.indices]  # local index
         index_ranges = adjacency.indptr  # but index ranges by global index
         Nmax = np.diff(index_ranges).max()
-        n_cells_recon = cell_division.n_recon
+        n_cells_recon = cell_division.n_reconstruct
         nbr = np.arange(n_cells_recon)[:, None].repeat(Nmax, axis=1)  # pad with self
         grad_op = np.zeros((n_cells_recon, 2, Nmax))
         Nmin = 1 if self.is1D else 2
@@ -305,7 +294,7 @@ class Mesh(TreeNode):
             blen=t(face_weights[bk, bf]),
             nbr=t(nbr, long=True),
             recon=t(recon),
-            n_interior_mine=n_interior_mine,
+            n_interior_mine=face_division.n_interior_mine,
         )
 
 
@@ -346,6 +335,11 @@ def make_adjacency(x_to_y: csr_array) -> csr_array:
 class CellDivision(TaskDivisionCustom):
     """Divide cells and communicate ghosts between processes."""
 
+    group: dist.ProcessGroup
+    n_reconstruct: int  #: number of local cells requiring face reconstruction
+    global_index: np.ndarray  #: indices of all local cells in global array of cells
+    local_index: np.ndarray  #: inverse of global_index (-1 for locally unused cells)
+
     def __init__(
         self, mesh: Mesh, counts: np.ndarray, group: dist.ProcessGroup
     ) -> None:
@@ -365,7 +359,7 @@ class CellDivision(TaskDivisionCustom):
         ring1 = ring(owned, adj_face)  # cells to reconstruct (+face-neighbors)
         ring2 = ring(ring1, adj_vert)  # cells accessed overall (+vertex-neighbors)
         ghosts = ring2[~self.belongs(self.i_proc, ring2)]  # global indices from others
-        self.n_recon = len(ring1)  # number of local cells to reconstruct
+        self.n_reconstruct = len(ring1)  # number of local cells to reconstruct
 
         # Collect global cell indices of owned, ring1 and ring2 on current process
         ring1_only = ring1[~np.isin(ring1, owned)]
@@ -391,20 +385,54 @@ class CellDivision(TaskDivisionCustom):
                 ring2_q = ring(ring(owned_q, adj_face), adj_vert)
                 ghost_q = ring2_q[~self.belongs(j_proc, ring2_q)]
                 send.append(self.local_index[owned[np.isin(owned, ghost_q)]])
-        self.recv_index = torch.from_numpy(np.concatenate(recv)).to(rc.device)
-        self.send_index = torch.from_numpy(np.concatenate(send)).to(rc.device)
-        self.recv_counts = [len(idx) for idx in recv]
-        self.send_counts = [len(idx) for idx in send]
+        self._recv_index = torch.from_numpy(np.concatenate(recv)).to(rc.device)
+        self._send_index = torch.from_numpy(np.concatenate(send)).to(rc.device)
+        self._recv_counts = [len(idx) for idx in recv]
+        self._send_counts = [len(idx) for idx in send]
 
-    def exchange(self, u: torch.Tensor) -> None:
-        """Fill this rank's ghost rows of ``u`` (K, Nk) with their owners' values."""
+    def communicate_ghosts(self, rho: torch.Tensor) -> None:
+        """Communicate ghost cells from owned processes to wherever needed."""
         if self.n_procs == 1:
             return
-        send_buf = u[self.send_index].contiguous()
+        send_buf = rho[self._send_index].contiguous()
         recv_buf = torch.empty(
-            (len(self.recv_index), u.shape[1]), dtype=u.dtype, device=u.device
+            (len(self._recv_index), rho.shape[1]), dtype=rho.dtype, device=rho.device
         )
         dist.all_to_all_single(
-            recv_buf, send_buf, self.recv_counts, self.send_counts, group=self.group
+            recv_buf, send_buf, self._recv_counts, self._send_counts, group=self.group
         )
-        u[self.recv_index] = recv_buf
+        rho[self._recv_index] = recv_buf
+
+
+class FaceDivision(TaskDivisionCustom):
+    """Track index mapping and process ownership of faces in Mesh."""
+
+    n_boundary_mine: int  #: number of owned boundary faces
+    n_interior_mine: int  #: number of owned interior faces
+    global_index: np.ndarray  #: indices of all local faces in global face map
+    local_index: np.ndarray  #: inverse of global_index (-1 for locally unused faces)
+
+    def __init__(self, face_map: np.ndarray, cell_division: CellDivision) -> None:
+        cell1, cell2 = face_map[:, :, 0].T
+
+        # Define face ownership by first cell:
+        is_face_mine = (cell1 >= cell_division.i_start) & (cell1 < cell_division.i_stop)
+        n_faces_mine = np.count_nonzero(is_face_mine)
+        super().__init__(n_mine=n_faces_mine, group=cell_division.group)
+
+        # Sort by boundary, interior (owned) and interior (not owned, but local):
+        local = np.where(
+            is_face_mine
+            | ((cell2 >= cell_division.i_start) & (cell2 < cell_division.i_stop))
+        )[0]
+        owned = np.arange(self.i_start, self.i_stop)
+        boundary = np.where(is_face_mine & (cell2 == -1))[0]
+        interior_mine = owned[~np.isin(owned, boundary)]
+        interior_not_mine = local[~np.isin(local, owned)]
+        self.n_boundary_mine = len(boundary)
+        self.n_interior_mine = len(interior_mine)
+        self.global_index = np.concatenate((boundary, interior_mine, interior_not_mine))
+
+        # Inverse map from all global face indices to local ones (-1 for untouched ones)
+        self.local_index = np.full(self.n_tot, -1)
+        self.local_index[self.global_index] = np.arange(len(local))
