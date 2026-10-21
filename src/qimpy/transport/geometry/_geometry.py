@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from qimpy import rc, log, TreeNode
-from qimpy.io import CheckpointPath, InvalidInputException, CheckpointContext
+from qimpy.io import CheckpointPath, CheckpointContext
 from qimpy.mpi import (
     ProcessGrid,
     get_block_slices,
@@ -88,9 +88,8 @@ class Geometry(TreeNode):
         geom = self.mesh.get_fv_geom(dtype=v.dtype)
         cell_division = self.mesh.cell_division
         self.geom = geom
-        self.Nk = v.shape[0]
-        self.K = int(geom.area.shape[0])  # local cells including padding
-        self._nf = self.mesh.faces.shape[1]
+        self.n_kbb_mine = v.shape[0]
+        self.n_faces = self.mesh.faces.shape[1]
 
         # Precompute velocity-weighted, area-scaled edge operators (constant):
         #   into eL: -a*elen/area_L,  into eR: +a*elen/area_R,  a = v_c.n
@@ -102,27 +101,30 @@ class Geometry(TreeNode):
         wL = -a_int * (geom.elen * inv_area[geom.eL])[:, None]
         wR = a_int * (geom.elen * inv_area[geom.eR])[:, None]
         wB = -a_bnd * (geom.blen * inv_area[geom.bcell])[:, None]
-        ik = torch.arange(self.Nk, device=rc.device)
+        ik = torch.arange(self.n_kbb_mine, device=rc.device)
         idx_in = (
             ik
-            + self.Nk
+            + self.n_kbb_mine
             * torch.cat(
                 (
                     torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None]).tile(2, 1),
-                    geom.bF[:, None].expand(-1, self.Nk),
+                    geom.bF[:, None].expand(-1, self.n_kbb_mine),
                 )
             )
         ).flatten()
         idx_out = (
-            ik + self.Nk * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
+            ik + self.n_kbb_mine * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
         ).flatten()
         values = torch.cat((wL.flatten(), wR.flatten(), wB.flatten()))
-        sel_mine = torch.where(idx_out < cell_division.n_mine * self.Nk)[0]
+        sel_mine = torch.where(idx_out < cell_division.n_mine * self.n_kbb_mine)[0]
         n_reconstruct = cell_division.n_reconstruct
         self.v_dot_del = torch.sparse_coo_tensor(
             indices=torch.stack((idx_out[sel_mine], idx_in[sel_mine])),
             values=values[sel_mine],
-            size=(len(geom.area) * self.Nk, n_reconstruct * self._nf * self.Nk),
+            size=(
+                len(geom.area) * self.n_kbb_mine,
+                n_reconstruct * self.n_faces * self.n_kbb_mine,
+            ),
         ).to_sparse_csr()
         self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD).item()
         log.info(f"Set dt_max = {self.dt_max:.4g} for Courant number {courant_number}")
@@ -159,16 +161,18 @@ class Geometry(TreeNode):
             mine = slice(0, geom.n_interior_mine)
             idx_in = (
                 ik
-                + self.Nk
+                + self.n_kbb_mine
                 * torch.cat(
                     (
                         torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None])[mine],
-                        geom.bF[:, None].expand(-1, self.Nk),
+                        geom.bF[:, None].expand(-1, self.n_kbb_mine),
                     )
                 )
             ).flatten()
             idx_out = (
-                ik + self.Nk * torch.arange(n_edges_mine, device=rc.device)[:, None]
+                ik
+                + self.n_kbb_mine
+                * torch.arange(n_edges_mine, device=rc.device)[:, None]
             ).flatten()
             values = (
                 self.material.wk
@@ -182,7 +186,10 @@ class Geometry(TreeNode):
             self.v_multiply_select = torch.sparse_coo_tensor(
                 indices=torch.stack((idx_out, idx_in)),
                 values=values,
-                size=(n_edges_mine * self.Nk, n_reconstruct * self._nf * self.Nk),
+                size=(
+                    n_edges_mine * self.n_kbb_mine,
+                    n_reconstruct * self.n_faces * self.n_kbb_mine,
+                ),
             ).to_sparse_csr()
 
             # Set up boundary probes:
@@ -190,15 +197,18 @@ class Geometry(TreeNode):
             assert i_boundary_all.min() >= -1
             n_boundaries = int(i_boundary_all.max()) + 1  # marked boundary regions
             probe_edges = torch.where(geom.bmark >= 0)[0]
-            idx_in = torch.arange(len(probe_edges) * self.Nk, device=rc.device)
-            idx_out = (ik + self.Nk * geom.bmark[probe_edges, None]).flatten()
+            idx_in = torch.arange(len(probe_edges) * self.n_kbb_mine, device=rc.device)
+            idx_out = (ik + self.n_kbb_mine * geom.bmark[probe_edges, None]).flatten()
             values = (
                 self.material.wk * a_bnd[probe_edges] * geom.blen[probe_edges, None]
             ).flatten()
             self.boundary_flux_op = torch.sparse_coo_tensor(
                 indices=torch.stack((idx_out, idx_in)),
                 values=values,
-                size=(n_boundaries * self.Nk, len(probe_edges) * self.Nk),
+                size=(
+                    n_boundaries * self.n_kbb_mine,
+                    len(probe_edges) * self.n_kbb_mine,
+                ),
             ).to_sparse_csr()
             # Scalars at surface cells:
             idx_in = torch.arange(len(probe_edges), device=rc.device)
@@ -237,21 +247,16 @@ class Geometry(TreeNode):
             size=(n_regions, n_probe),
         ).to_sparse_csr()  # multiply by per-cell observables to get region averages
 
-        rho0 = getattr(material, "rho0", None)
+        n_cells_padded = len(cell_division.global_index)
+        self.rho = material.rho0.flatten()[None, :].repeat(n_cells_padded, 1)
         if checkpoint_in and checkpoint_in.member("rho"):
-            cp, path = checkpoint_in  # warm start (serial)
-            rho = torch.as_tensor(
-                np.array(cp[f"{path}/rho"]), device=rc.device, dtype=v.dtype
+            cp, path = checkpoint_in
+            n_bands_sq = material.n_bands**2
+            self.rho[: cell_division.n_mine] = cp.read_slice(
+                cp[f"{path}/rho"],
+                (cell_division.i_start, material.k_division.i_start * n_bands_sq),
+                (cell_division.n_mine, material.k_division.n_mine * n_bands_sq),
             )
-            if tuple(rho.shape) != (self.K, self.Nk):
-                raise InvalidInputException(
-                    f"checkpoint rho shape {tuple(rho.shape)} != ({self.K}, {self.Nk})"
-                )
-        elif rho0 is not None:
-            rho = rho0.flatten().to(rc.device, v.dtype)[None, :].repeat(self.K, 1)
-        else:
-            rho = torch.zeros(self.K, self.Nk, device=rc.device, dtype=v.dtype)
-        self.rho = rho
         self.stash = Stash()
         self.stash_probe = Stash()  # coarse-grained, more frequent version
         self.material.initialize_fields(self.rho, {}, id(self))
@@ -278,7 +283,7 @@ class Geometry(TreeNode):
         else:
             n_reconstruct = len(reconstruct)
             if self.faces_block_size:
-                rho_faces = rho.new_zeros(n_reconstruct, self._nf, self.Nk)
+                rho_faces = rho.new_zeros(n_reconstruct, self.n_faces, self.n_kbb_mine)
                 for sel in get_block_slices(n_reconstruct, self.faces_block_size):
                     rho_faces[sel] = self._face_limiter(
                         rho[sel], rho, neighbors[sel], reconstruct[sel], self.epsilon_sq
@@ -301,7 +306,7 @@ class Geometry(TreeNode):
         v_op = self.boundary_flux_op if boundary_only else self.v_multiply_select
         v_rho = v_op @ rho_faces.flatten()
         flux_op = self.material.get_observables(t)[self.flux_indices].T
-        flux = (v_rho.view(-1, self.Nk) @ flux_op).contiguous()
+        flux = (v_rho.view(-1, self.n_kbb_mine) @ flux_op).contiguous()
         dist.all_reduce(flux, group=(None if boundary_only else self.material.group))
         return flux, rho_faces
 
@@ -412,7 +417,9 @@ class Geometry(TreeNode):
         if self.save_rho:
             # Optional full state output (large) for continuing calculations:
             rho_mine = self.rho[: div.n_mine].detach()
-            dset = cp_path.create_dataset("rho", (div.n_tot, self.Nk), rho_mine.dtype)
+            dset = cp_path.create_dataset(
+                "rho", (div.n_tot, self.n_kbb_mine), rho_mine.dtype
+            )
             checkpoint.write_slice(dset, (div.i_start, 0), rho_mine)
             saved.append("rho")
 
@@ -486,7 +493,7 @@ class Boundary:
             # Find the cells for which rho_faces is needed for `selection`:
             cells = g.bcell[selection]
             self.boundary_cells, i_cell = torch.unique(cells, return_inverse=True)
-            n_faces = geometry._nf
+            n_faces = geometry.n_faces
             i_face = g.bF[selection] - n_faces * cells
             self.boundary_faces = i_cell * n_faces + i_face
 

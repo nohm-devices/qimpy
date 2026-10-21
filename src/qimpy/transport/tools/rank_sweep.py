@@ -119,7 +119,7 @@ def run(mesh: str, steps: int, n_k: int) -> dict:
     g = t.geometry
     assert (
         float(
-            t.material.rho_dot(torch.randn(4, g.Nk, device=rc.device), 0.0, 0)
+            t.material.rho_dot(torch.randn(4, g.n_kbb_mine, device=rc.device), 0.0, 0)
             .abs()
             .max()
         )
@@ -173,7 +173,7 @@ def run(mesh: str, steps: int, n_k: int) -> dict:
         n_ch_sum=float(n_ch.sum()),
         n_ch_absmax=float(n_ch.abs().max()),
         K=int(g.K),
-        Nk=int(g.Nk),
+        Nk=int(g.n_kbb_mine),
         ranks=n_ranks,
     )
     _stage("reduced")

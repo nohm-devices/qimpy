@@ -263,7 +263,7 @@ def test_periodic_lattice_promotes_all_boundary_edges() -> None:
     torch.set_default_dtype(torch.float64)
     geom, _ = _build_fv({}, mesh_path=_periodic_mesh(6, 10.0))
     assert geom.geom.bcell.numel() == 0
-    geom._u = torch.randn(geom.K, geom.Nk, device=rc.device)
+    geom._u = torch.randn(geom.K, geom.n_kbb_mine, device=rc.device)
     assert abs(_mass_rate(geom)) < 1e-12
 
 
@@ -282,7 +282,7 @@ def test_closed_domain_conserves_mass() -> None:
     tmp = tempfile.mkdtemp()
     path = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"), all_walls=True)
     geom, _ = _build_fv({}, mesh_path=path)
-    geom._u = torch.randn(geom.K, geom.Nk, device=rc.device)  # arbitrary state
+    geom._u = torch.randn(geom.K, geom.n_kbb_mine, device=rc.device)  # arbitrary state
     assert abs(_mass_rate(geom)) < 1e-9
 
 
@@ -298,7 +298,7 @@ def test_closed_domain_conserves_mass_radial() -> None:
     tmp = tempfile.mkdtemp()
     path = _make_rect_mesh(12.0, os.path.join(tmp, "rect.npz"), all_walls=True)
     geom, _ = _build_fv({}, mesh_path=path, Nr=4, tau_p=2.0, tau_ee=3.0)
-    geom._u = torch.randn(geom.K, geom.Nk, device=rc.device)
+    geom._u = torch.randn(geom.K, geom.n_kbb_mine, device=rc.device)
     assert abs(_mass_rate(geom)) < 1e-9
 
 
@@ -328,7 +328,7 @@ def test_floating_contact_reads_uniform_potential() -> None:
     torch.set_default_dtype(torch.float64)
     geom, _ = _build_fv({"source": {"dmu": 0.1}, "drain": {"floating": True}})
     for V0 in (0.05, -0.1, 0.2):
-        geom._u = torch.full((geom.K, geom.Nk), float(V0), device=rc.device)
+        geom._u = torch.full((geom.K, geom.n_kbb_mine), float(V0), device=rc.device)
         geom.contact_currents(0.0)  # solves the feedback level
         assert abs(geom.contact_potentials()["drain"] - V0) < 1e-12
 
@@ -391,7 +391,7 @@ def test_reflective_walls_conserve_mass_long_time() -> None:
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
     blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0**2))  # (K,)
-    geom._u = blob[:, None].repeat(1, geom.Nk)  # isotropic = density
+    geom._u = blob[:, None].repeat(1, geom.n_kbb_mine)  # isotropic = density
     m0 = _integral(geom, mat, 0)
     _step(geom, _steps_for(geom, 30.0))
     assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
@@ -434,7 +434,7 @@ def test_cartesian_reflective_walls_conserve_mass() -> None:
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([55.0, 30.0], dtype=torch.float64, device=rc.device)
     blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 6.0**2))
-    geom._u = blob[:, None].repeat(1, geom.Nk)
+    geom._u = blob[:, None].repeat(1, geom.n_kbb_mine)
     w = material.representation.get_density_weight()
     mass = lambda: float((geom.geom.area[:, None] * geom._u * w[None]).sum())
     m0 = mass()
@@ -743,7 +743,7 @@ def test_curved_mass_conservation() -> None:
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
     q0 = torch.tensor([50.0, 30.0], dtype=torch.float64, device=rc.device)
     blob = torch.exp(-((cen - q0) ** 2).sum(-1) / (2 * 5.0**2))
-    geom._u = blob[:, None].repeat(1, geom.Nk)
+    geom._u = blob[:, None].repeat(1, geom.n_kbb_mine)
     m0 = _integral(geom, mat, 0)
     _step(geom, _steps_for(geom, 30.0))
     assert abs(_integral(geom, mat, 0) - m0) / abs(m0) < 1e-10
@@ -781,7 +781,7 @@ def _decomp_worker() -> None:
         process_grid=pg,
     )
     cen = torch.from_numpy(geom.geom.centroid_np).to(rc.device)
-    geom._u = torch.zeros(geom.K, geom.Nk, device=rc.device)
+    geom._u = torch.zeros(geom.K, geom.n_kbb_mine, device=rc.device)
     geom._u[:, 0] = 0.01 * (
         1.0 + cen[:, 0] / 100.0 + cen[:, 1] / 50.0
     )  # partition-invariant
@@ -812,7 +812,7 @@ def test_1d_line_mesh_ballistic_is_antisymmetric() -> None:
     geom, mat = _build_fv(
         {"source": {"dmu": 0.1}, "drain": {"dmu": -0.1}}, mesh_path=mesh
     )
-    assert geom._nf == 2  # interval cells -> 2 faces
+    assert geom.n_faces == 2  # interval cells -> 2 faces
     _step(geom, _steps_for(geom, 20.0))
     x = geom.geom.centroid_np[:, 0]
     obs = torch.einsum("oc,kc->ko", _obs_weights(mat), geom._u)
