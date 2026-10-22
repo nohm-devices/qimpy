@@ -31,7 +31,7 @@ class Mesh(TreeNode):
     def __init__(
         self,
         *,
-        group: dist.ProcessGroup,
+        group: dist.ProcessGroup | None = None,
         file: mesh_source.File | dict | None = None,
         line: mesh_source.Line | dict | None = None,
         rect: mesh_source.Rect | dict | None = None,
@@ -99,13 +99,13 @@ class Mesh(TreeNode):
     def dimension(self) -> int:
         return self.cells.shape[1] - 2  # cells coontain d + 1 vertices, 1 region index
 
-    def _partition_cells(self, group: dist.ProcessGroup) -> CellDivision:
+    def _partition_cells(self, group: dist.ProcessGroup | None) -> CellDivision:
         """Optimally partition the mesh cells for communication over `group`.
         This reorders `cells` such that contiguous ranges of cells can be owned by
         each process within `group`, and returns a `CellDivision` instance to
         track the division and communicate ghost cells across processes.
         Correspondingly, `cell_permutation` tracks any reordering of the cells."""
-        size = group.size()
+        size = 1 if group is None else group.size()
         if size == 1:
             counts = np.array([len(self.cells)])  # no partitioning required
             return CellDivision(self, counts, group)
@@ -150,7 +150,7 @@ class Mesh(TreeNode):
         inv_permutation = np.full(len(permutation) + 1, -1)  # last entry maps -1 to -1
         inv_permutation[permutation] = np.arange(len(permutation))
         self.face_map[..., 0] = inv_permutation[self.face_map[..., 0]]
-        self.face_map = self.face_map[np.lexsort(self.face_map[:, ::-1, 0].T)]
+        self.face_map = sort_face_map(self.face_map)
         return CellDivision(self, counts, group)
 
     def get_cell_adjacency_vertex(self) -> csr_array:
@@ -204,7 +204,7 @@ class Mesh(TreeNode):
         i_unique_boundary = np.searchsorted(unique_ids, boundary_face_ids)
         assert (face_map[i_unique_boundary, 1, 0] == -1).all()
         face_map[i_unique_boundary, 1, 1] = self.boundary_faces[:, -1]
-        self.face_map = face_map[np.lexsort(face_map[:, ::-1, 0].T)]  # sort by cells
+        self.face_map = sort_face_map(face_map)
 
     def get_face_reconstruction_op(self) -> tuple[np.ndarray, np.ndarray]:
         """Construct vertex neighbor list (n_reconstruct x max_neighbors) for local
@@ -292,18 +292,27 @@ def make_adjacency(x_to_y: csr_array) -> csr_array:
     return adjacency
 
 
+def sort_face_map(face_map: np.ndarray) -> np.ndarray:
+    cell1, cell2 = face_map[..., 0].T
+    should_flip = (cell2 >= 0) & (cell2 < cell1)
+    face_map = np.copy(face_map)
+    face_map[should_flip] = face_map[should_flip, ::-1]  # cell1 < cell2 now
+    return face_map[np.lexsort(face_map[:, ::-1, 0].T)]  # sort by (cell1, cell2)
+
+
 class CellDivision(TaskDivisionCustom):
     """Divide cells and communicate ghosts between processes."""
 
-    group: dist.ProcessGroup
+    group: dist.ProcessGroup | None
     n_reconstruct: int  #: number of local cells requiring face reconstruction
     global_index: np.ndarray  #: indices of all local cells in global array of cells
     local_index: np.ndarray  #: inverse of global_index (-1 for locally unused cells)
 
     def __init__(
-        self, mesh: Mesh, counts: np.ndarray, group: dist.ProcessGroup
+        self, mesh: Mesh, counts: np.ndarray, group: dist.ProcessGroup | None
     ) -> None:
-        super().__init__(n_mine=counts[group.rank()], group=group)
+        i_proc = 0 if group is None else group.rank()
+        super().__init__(n_mine=counts[i_proc], group=group)
         self.group = group
         adj_vert = mesh.get_cell_adjacency_vertex()
         adj_face = mesh.get_cell_adjacency_face()

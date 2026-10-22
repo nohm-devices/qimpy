@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from qimpy import rc, log, TreeNode
 from qimpy.io import CheckpointPath, CheckpointContext
-from qimpy.mpi import ProcessGrid, get_block_slices, all_gather_padded, globalreduce
+from qimpy.mpi import ProcessGrid, get_block_slices, globalreduce
 from qimpy.profiler import StopWatch, stopwatch
 from ..material import Material
 from . import Mesh
@@ -135,16 +135,8 @@ class Geometry(TreeNode):
         # Initialize flux collection on faces:
         self.flux_indices = material.get_flux_indices()
         if self.flux_indices:
-            self._edge_cells = self.mesh.face_map[..., 0]
-            face_weights_mine = np.zeros((face_division.n_mine, 2))
             i_face_global = face_division.global_index[: face_division.n_mine]
             i_face_mine = i_face_global - face_division.i_start  # mine in global order
-            face_weights_mine[i_face_mine] = face_weights[: face_division.n_mine]
-            face_weights_all = all_gather_padded(
-                rc.from_np(face_weights_mine), face_division.n_each_custom, self.group
-            ).cpu()
-            self._edge_len = face_weights_all.norm(dim=-1)
-            self._edge_normal = face_weights_all / self._edge_len[:, None]
 
             # Construct flux matrix (selects appropriate direction and multiplies v):
             n_interior_fk = face_division.n_interior_mine * n_kbb_mine
@@ -360,16 +352,11 @@ class Geometry(TreeNode):
         )
         if self.flux_indices:
             # Flux observables live on edges: geometry + face-normal flux per frame.
-            saved += [
-                cp_path.write("edge_cells", self._edge_cells),
-                cp_path.write("edge_normal", self._edge_normal),
-                cp_path.write("edge_len", self._edge_len),
-                "edge_flux",
-            ]
+            saved += ["face_flux"]
             face_div = self.mesh.face_division
             flux = torch.stack(self.stash.flux)
             dset = cp_path.create_dataset(
-                "edge_flux", (n_stash, face_div.n_tot, len(flux)), np.float64
+                "face_flux", (n_stash, face_div.n_tot, len(flux)), np.float64
             )
             checkpoint.write_slice(dset, (0, face_div.i_start, 0), flux)
         self.stash = Stash()  # reset now-written cached observables

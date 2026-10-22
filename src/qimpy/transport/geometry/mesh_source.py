@@ -86,7 +86,7 @@ class Rect(TreeNode):
         Ly: float,
         Nx: int,
         Ny: int,
-        contacts: dict[str, tuple[float, ...]],
+        contacts: dict[str, tuple[float, ...]] | None = None,
         regions: dict[str, tuple[float, ...]] | None = None,
         mesh: geometry.Mesh,
         checkpoint_in: CheckpointPath = CheckpointPath(),
@@ -171,6 +171,7 @@ class Rect(TreeNode):
         )
         face_centers = mesh.vertices[mesh.boundary_faces[:, :-1]].mean(axis=1)
         mesh.boundary_names = []
+        assert contacts is not None
         for i_contact, (contact_name, ellipse) in enumerate(contacts.items()):
             mesh.boundary_names.append(contact_name)
             mesh.boundary_faces[within_ellipse(face_centers, ellipse), -1] = i_contact
