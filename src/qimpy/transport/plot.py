@@ -225,10 +225,10 @@ class Boundary:
             # Labels:
             for component in split_continuous(edges[indices], mesh.vertices):
                 # Locate and orient label to the central segment of each component:
-                i_mid = len(component) // 2
-                mid_segment = mesh.vertices[component[i_mid]]
-                x, y = mid_segment.mean(axis=0)
-                tangent = mid_segment[1] - mid_segment[0]
+                v1 = mesh.vertices[component[(len(component) - 1) // 2, 0]]
+                v2 = mesh.vertices[component[len(component) // 2, 1]]
+                x, y = 0.5 * (v1 + v2)
+                tangent = v2 - v1
                 angle = np.rad2deg(np.arctan2(tangent[1], tangent[0]))
                 if abs(angle) > 90:
                     # Avoid upside down text
