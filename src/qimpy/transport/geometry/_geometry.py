@@ -9,13 +9,7 @@ import torch.distributed as dist
 
 from qimpy import rc, log, TreeNode
 from qimpy.io import CheckpointPath, CheckpointContext
-from qimpy.mpi import (
-    ProcessGrid,
-    get_block_slices,
-    TaskDivisionCustom,
-    all_gather_padded,
-    globalreduce,
-)
+from qimpy.mpi import ProcessGrid, get_block_slices, all_gather_padded, globalreduce
 from qimpy.profiler import StopWatch, stopwatch
 from ..material import Material
 from . import Mesh
@@ -84,158 +78,127 @@ class Geometry(TreeNode):
         else:
             self._face_limiter = _face_limiter  # eager mode
 
-        v = material.transport_velocity  # (Nk, 2)
-        geom = self.mesh.get_fv_geom(dtype=v.dtype)
-        cell_division = self.mesh.cell_division
-        self.geom = geom
-        self.n_kbb_mine = v.shape[0]
-        self.n_faces = self.mesh.faces.shape[1]
+        # Get properties of local faces and their mapping to cells:
+        face_weights, face_map = self.mesh.get_face_weights()
+        face_division = self.mesh.face_division
+        boundary_weights = face_weights[: face_division.n_boundary_mine]
+        interior_weights = face_weights[face_division.n_boundary_mine :]
+        boundary_region = face_map[: face_division.n_boundary_mine, 1, 1]
+        boundary_map = face_map[: face_division.n_boundary_mine, 0]
+        interior_map = face_map[face_division.n_boundary_mine :].swapaxes(0, 1)
+        # --- flattened indices by cell and face-within-cell:
+        n_faces = self.mesh.faces.shape[1]
+        boundary_cf = boundary_map[:, 0] * n_faces + boundary_map[:, 1]
+        interior_cf = interior_map[..., 0] * n_faces + interior_map[..., 1]
+        # --- further flattened indices including kbb dimension as well:
+        v = material.transport_velocity.cpu().numpy()
+        n_kbb_mine = v.shape[0]
+        i_kbb = np.arange(n_kbb_mine)
+        boundary_cfk = (i_kbb + n_kbb_mine * boundary_cf[:, None]).flatten()
+        interior_cfk = (i_kbb + n_kbb_mine * interior_cf[..., None]).reshape(2, -1)
+        self.n_faces = n_faces
+        self.n_kbb_mine = n_kbb_mine
 
-        # Precompute velocity-weighted, area-scaled edge operators (constant):
-        #   into eL: -a*elen/area_L,  into eR: +a*elen/area_R,  a = v_c.n
-        a_int = geom.en @ v.t()  # (Ne, Nk)
-        a_bnd = geom.bn @ v.t()  # (Nb, Nk)
-        inv_area = 1 / geom.area
-        maskL = a_int > 0
-        self.is_outward = a_bnd > 0
-        wL = -a_int * (geom.elen * inv_area[geom.eL])[:, None]
-        wR = a_int * (geom.elen * inv_area[geom.eR])[:, None]
-        wB = -a_bnd * (geom.blen * inv_area[geom.bcell])[:, None]
-        ik = torch.arange(self.n_kbb_mine, device=rc.device)
-        idx_in = (
-            ik
-            + self.n_kbb_mine
-            * torch.cat(
-                (
-                    torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None]).tile(2, 1),
-                    geom.bF[:, None].expand(-1, self.n_kbb_mine),
-                )
-            )
+        # Initialize face to cell -v.del operator for advection:
+        # Mask which cell's flux contributes to each interior face based on flux (per k)
+        cell_weights = self.mesh.get_cell_weights()
+        interior_flux = interior_weights @ v.T  # outward flux per face and kbb
+        boundary_flux = boundary_weights @ v.T
+        interior_cfk_sel = np.where(interior_flux.flatten() > 0, *interior_cfk)
+        index_cfk = np.concatenate((interior_cfk_sel, interior_cfk_sel, boundary_cfk))
+        index_c = np.concatenate((*interior_map[..., 0], boundary_map[:, 0]))
+        index_ck = (i_kbb + n_kbb_mine * index_c[:, None]).flatten()
+        values = (
+            np.concatenate((-interior_flux, interior_flux, -boundary_flux))
+            / cell_weights[index_c, None]
         ).flatten()
-        idx_out = (
-            ik + self.n_kbb_mine * torch.cat((geom.eL, geom.eR, geom.bcell))[:, None]
-        ).flatten()
-        values = torch.cat((wL.flatten(), wR.flatten(), wB.flatten()))
-        sel_mine = torch.where(idx_out < cell_division.n_mine * self.n_kbb_mine)[0]
+        cell_division = self.mesh.cell_division
         n_reconstruct = cell_division.n_reconstruct
-        self.v_dot_del = torch.sparse_coo_tensor(
-            indices=torch.stack((idx_out[sel_mine], idx_in[sel_mine])),
-            values=values[sel_mine],
-            size=(
-                len(geom.area) * self.n_kbb_mine,
-                n_reconstruct * self.n_faces * self.n_kbb_mine,
-            ),
+        sel_mine = np.where(index_ck < cell_division.n_mine * n_kbb_mine)[0]
+        self.minus_v_dot_del = torch.sparse_coo_tensor(
+            indices=rc.from_np(np.stack((index_ck[sel_mine], index_cfk[sel_mine]))),
+            values=rc.from_np(values[sel_mine]),
+            size=(len(cell_weights) * n_kbb_mine, n_reconstruct * n_faces * n_kbb_mine),
         ).to_sparse_csr()
-        self.dt_max = courant_number / globalreduce.max(values, dist.group.WORLD).item()
+        rates = self.minus_v_dot_del.values().abs()
+        self.dt_max = courant_number / globalreduce.max(rates, dist.group.WORLD).item()
         log.info(f"Set dt_max = {self.dt_max:.4g} for Courant number {courant_number}")
 
-        self.collision_enabled = True
-        self.boundary = Boundary(self, contacts)
+        # Set up boundary conditions:
+        boundary_args = (
+            rc.from_np(boundary_map),
+            rc.from_np(boundary_region),
+            rc.from_np(boundary_weights),
+        )
+        self.boundary = Boundary(self, contacts, *boundary_args)
 
         # Initialize flux collection on faces:
         self.flux_indices = material.get_flux_indices()
         if self.flux_indices:
-            to_global = torch.from_numpy(cell_division.global_index).to(rc.device)
-            eL = to_global[geom.eL]
-            eR = to_global[geom.eR]
-            bcell = to_global[geom.bcell]
-            edge_cells = torch.cat(
-                [
-                    torch.stack([eL, eR], 1)[: geom.n_interior_mine],
-                    torch.stack([bcell, -torch.ones_like(bcell)], 1),
-                ]
-            )
-            edge_normal = torch.cat((geom.en[: geom.n_interior_mine], geom.bn))
-            edge_len = torch.cat((geom.elen[: geom.n_interior_mine], geom.blen))
-            n_edges_mine = len(edge_cells)
-            edge_div = TaskDivisionCustom(n_mine=n_edges_mine, group=self.group)
-
-            # Store collected global-index versions of above for checkpoint writing:
-            sizes = edge_div.n_each_custom
-            self._edge_cells = all_gather_padded(edge_cells, sizes, self.group).cpu()
-            self._edge_normal = all_gather_padded(edge_normal, sizes, self.group).cpu()
-            self._edge_len = all_gather_padded(edge_len, sizes, self.group).cpu()
-            self.edge_division = edge_div
+            self._edge_cells = self.mesh.face_map[..., 0]
+            face_weights_mine = np.zeros((face_division.n_mine, 2))
+            i_face_global = face_division.global_index[: face_division.n_mine]
+            i_face_mine = i_face_global - face_division.i_start  # mine in global order
+            face_weights_mine[i_face_mine] = face_weights[: face_division.n_mine]
+            face_weights_all = all_gather_padded(
+                rc.from_np(face_weights_mine), face_division.n_each_custom, self.group
+            ).cpu()
+            self._edge_len = face_weights_all.norm(dim=-1)
+            self._edge_normal = face_weights_all / self._edge_len[:, None]
 
             # Construct flux matrix (selects appropriate direction and multiplies v):
-            mine = slice(0, geom.n_interior_mine)
-            idx_in = (
-                ik
-                + self.n_kbb_mine
-                * torch.cat(
-                    (
-                        torch.where(maskL, geom.eLF[:, None], geom.eRF[:, None])[mine],
-                        geom.bF[:, None].expand(-1, self.n_kbb_mine),
-                    )
-                )
-            ).flatten()
-            idx_out = (
-                ik
-                + self.n_kbb_mine
-                * torch.arange(n_edges_mine, device=rc.device)[:, None]
-            ).flatten()
-            values = (
-                self.material.wk
-                * torch.cat(
-                    (
-                        (a_int * geom.elen[:, None])[mine],
-                        a_bnd * geom.blen[:, None],
-                    )
-                )
-            ).flatten()
+            n_interior_fk = face_division.n_interior_mine * n_kbb_mine
+            index_cfk = np.concatenate((boundary_cfk, interior_cfk_sel[:n_interior_fk]))
+            index_fk = (i_kbb + n_kbb_mine * i_face_mine[:, None]).flatten()
+            values = np.concatenate(
+                (boundary_flux.flatten(), interior_flux.flatten()[:n_interior_fk])
+            )
             self.v_multiply_select = torch.sparse_coo_tensor(
-                indices=torch.stack((idx_out, idx_in)),
-                values=values,
-                size=(
-                    n_edges_mine * self.n_kbb_mine,
-                    n_reconstruct * self.n_faces * self.n_kbb_mine,
-                ),
+                indices=rc.from_np(np.stack((index_fk, index_cfk))),
+                values=rc.from_np(values),
+                size=(len(values), n_reconstruct * n_faces * n_kbb_mine),
             ).to_sparse_csr()
 
-            # Set up boundary probes:
+            # Set up boundary flux probes:
             i_boundary_all = self.mesh.boundary_faces[:, -1]
             assert i_boundary_all.min() >= -1
             n_boundaries = int(i_boundary_all.max()) + 1  # marked boundary regions
-            probe_edges = torch.where(geom.bmark >= 0)[0]
-            idx_in = torch.arange(len(probe_edges) * self.n_kbb_mine, device=rc.device)
-            idx_out = (ik + self.n_kbb_mine * geom.bmark[probe_edges, None]).flatten()
-            values = (
-                self.material.wk * a_bnd[probe_edges] * geom.blen[probe_edges, None]
-            ).flatten()
+            probe_f = np.where(boundary_region >= 0)[0]  # face indices within probes
+            probe_region = boundary_region[probe_f]
+            index_fk = np.arange(len(probe_f) * n_kbb_mine)
+            index_pk = (i_kbb + n_kbb_mine * probe_region[:, None]).flatten()
+            values = (self.material.wk * rc.from_np(boundary_flux[probe_f])).flatten()
             self.boundary_flux_op = torch.sparse_coo_tensor(
-                indices=torch.stack((idx_out, idx_in)),
+                indices=rc.from_np(np.stack((index_pk, index_fk))),
                 values=values,
-                size=(
-                    n_boundaries * self.n_kbb_mine,
-                    len(probe_edges) * self.n_kbb_mine,
-                ),
+                size=(n_boundaries * n_kbb_mine, len(probe_f) * n_kbb_mine),
             ).to_sparse_csr()
-            # Scalars at surface cells:
-            idx_in = torch.arange(len(probe_edges), device=rc.device)
-            idx_out = geom.bmark[probe_edges]
-            w_faces = geom.blen[probe_edges]
+            self.boundary_probe = Boundary(
+                self, contacts, *boundary_args, rc.from_np(probe_f)
+            )
+
+            # Set up boundary scalar probes:
+            index_f = torch.arange(len(probe_f), device=rc.device)
+            index_p = rc.from_np(probe_region)
+            w_faces = rc.from_np(np.linalg.norm(face_weights[probe_f], axis=1))
             w_tot = torch.zeros(n_boundaries, dtype=w_faces.dtype, device=rc.device)
-            w_tot.index_add_(0, idx_out, w_faces)
+            w_tot.index_add_(0, index_p, w_faces)
             dist.all_reduce(w_tot, group=self.group)
             self.boundary_scalar_op = torch.sparse_coo_tensor(
-                indices=torch.stack((idx_out, idx_in)),
-                values=w_faces / w_tot[idx_out],
-                size=(n_boundaries, len(probe_edges)),
+                indices=torch.stack((index_p, index_f)),
+                values=w_faces / w_tot[index_p],
+                size=(n_boundaries, len(probe_f)),
             ).to_sparse_csr()
-            self.boundary_probe = Boundary(self, contacts, probe_edges)
 
         # Set up cell region (interior) probes:
         n_mine = cell_division.n_mine
-        w_cells = geom.area[:n_mine]
         i_region_all = self.mesh.cells[:, -1]
         assert i_region_all.min() >= -1
         n_regions = int(i_region_all.max()) + 1
-        i_region = torch.from_numpy(
-            i_region_all[cell_division.global_index[:n_mine]]
-        ).to(rc.device)
-        probe_cells = torch.where(i_region >= 0)[0]
+        i_region = rc.from_np(i_region_all[cell_division.global_index[:n_mine]])
+        probe_cells = torch.where(i_region >= 0)[0]  # cell indices within probes
         i_region = i_region[probe_cells]
-        w_cells = w_cells[probe_cells]
+        w_cells = rc.from_np(cell_weights)[probe_cells]
         w_tot = torch.zeros(n_regions, dtype=w_cells.dtype, device=rc.device)
         w_tot.index_add_(0, i_region, w_cells)
         dist.all_reduce(w_tot, group=self.group)
@@ -247,6 +210,7 @@ class Geometry(TreeNode):
             size=(n_regions, n_probe),
         ).to_sparse_csr()  # multiply by per-cell observables to get region averages
 
+        # Initialize state (rho):
         n_cells_padded = len(cell_division.global_index)
         self.rho = material.rho0.flatten()[None, :].repeat(n_cells_padded, 1)
         if checkpoint_in and checkpoint_in.member("rho"):
@@ -260,6 +224,7 @@ class Geometry(TreeNode):
         self.stash = Stash()
         self.stash_probe = Stash()  # coarse-grained, more frequent version
         self.material.initialize_fields(self.rho, {}, id(self))
+        self.collision_enabled = True
 
     def to_faces(
         self, rho: torch.Tensor, t: float, boundary_only: bool = False
@@ -274,7 +239,7 @@ class Geometry(TreeNode):
         neighbors = self.neighbors
         reconstruct = self.reconstruct
         if boundary_only:
-            sel = self.boundary_probe.boundary_cells
+            sel = self.boundary_probe.boundary_c
             rho_faces = self._face_limiter(
                 rho[sel], rho, neighbors[sel], reconstruct[sel], self.epsilon_sq
             )
@@ -313,7 +278,7 @@ class Geometry(TreeNode):
     def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         self.material.constrain(rho)
         watch = StopWatch("Geometry.rho_dot")
-        out = (self.v_dot_del @ self.to_faces(rho, t).flatten()).view(rho.shape)
+        out = (self.minus_v_dot_del @ self.to_faces(rho, t).flatten()).view(rho.shape)
         watch.stop()
         n_mine = self.mesh.cell_division.n_mine
         if self.collision_enabled:
@@ -401,12 +366,12 @@ class Geometry(TreeNode):
                 cp_path.write("edge_len", self._edge_len),
                 "edge_flux",
             ]
-            edge_div = self.edge_division
+            face_div = self.mesh.face_division
             flux = torch.stack(self.stash.flux)
             dset = cp_path.create_dataset(
-                "edge_flux", (n_stash, edge_div.n_tot, len(flux)), np.float64
+                "edge_flux", (n_stash, face_div.n_tot, len(flux)), np.float64
             )
-            checkpoint.write_slice(dset, (0, edge_div.i_start, 0), flux)
+            checkpoint.write_slice(dset, (0, face_div.i_start, 0), flux)
         self.stash = Stash()  # reset now-written cached observables
 
         # Probes:
@@ -471,52 +436,54 @@ class Boundary:
     contacts: list[tuple[torch.Tensor, None | Callable[[float], torch.Tensor]]]
     wall: tuple[torch.Tensor, None | Callable[[torch.Tensor], torch.Tensor]]
     is_outward: torch.Tensor  #: whether each face, k velocity is outwards
-    boundary_cells: torch.Tensor | None  #: subset of cells at which rho_faces is needed
-    boundary_faces: torch.Tensor  #: flattened index of boundary edges into rho_faces
+    boundary_c: torch.Tensor | None  #: subset of cells at which rho_faces is needed
+    boundary_cf: torch.Tensor  #: flattened index of boundary faces into rho_faces
 
     def __init__(
         self,
         geometry: Geometry,
         contacts: dict[str, dict],
+        boundary_map: torch.Tensor,
+        boundary_region: torch.Tensor,
+        boundary_weights: torch.Tensor,
         selection: torch.Tensor | None = None,
     ) -> None:
-        g = geometry.geom
         names = geometry.mesh.boundary_names
         material = geometry.material
-        bmark = g.bmark
-        bn = g.bn
-        self.boundary_cells = None
-        self.boundary_faces = g.bF
-        if selection is not None:
-            bmark = bmark[selection]
-            bn = bn[selection]
+        normals = boundary_weights / boundary_weights.norm(dim=-1, keepdim=True)
+        n_faces = geometry.n_faces
+        if selection is None:
+            self.boundary_c = None
+            self.boundary_cf = boundary_map[:, 0] * n_faces + boundary_map[:, 1]
+        else:
+            boundary_region = boundary_region[selection]
+            normals = normals[selection]
             # Find the cells for which rho_faces is needed for `selection`:
-            cells = g.bcell[selection]
-            self.boundary_cells, i_cell = torch.unique(cells, return_inverse=True)
-            n_faces = geometry.n_faces
-            i_face = g.bF[selection] - n_faces * cells
-            self.boundary_faces = i_cell * n_faces + i_face
+            cells, i_face = boundary_map[selection].T
+            self.boundary_c, i_cell = torch.unique(cells, return_inverse=True)
+            self.boundary_cf = i_cell * n_faces + i_face
 
-        edge_used = torch.full((len(bmark),), False, device=rc.device, dtype=torch.bool)
+        face_used = torch.full(
+            (len(boundary_region),), False, device=rc.device, dtype=torch.bool
+        )
         self.contacts = []
         for name, params in contacts.items():
-            indices = torch.where(bmark == names.index(name))[0]
+            indices = torch.where(boundary_region == names.index(name))[0]
             if len(indices):
-                edge_used[indices] = True
-                contactor = material.get_contactor(bn[indices], **params)
+                face_used[indices] = True
+                contactor = material.get_contactor(normals[indices], **params)
                 self.contacts.append((indices, contactor))
 
-        # Mark all boundary edges not in a contact as reflecting:
-        indices = torch.where(~edge_used)[0]
-        reflector = material.get_reflector(bn[indices]) if len(indices) else None
+        # Mark all boundary faces not in a contact as reflecting:
+        indices = torch.where(~face_used)[0]
+        reflector = material.get_reflector(normals[indices]) if len(indices) else None
         self.wall = (indices, reflector)
-        self.is_outward = (bn @ material.transport_velocity.T) > 0
+        self.is_outward = (normals @ material.transport_velocity.T) > 0
 
     def apply(self, rho_faces: torch.Tensor, t: float, update: bool) -> torch.Tensor:
         """Apply boundary conditions to `rho_faces`, modifying it in place
         if `update`. Otherwise, return the updated component alone."""
-        bf = self.boundary_faces
-        rho_outward = rho_faces[bf]  # boundary faces, valid outwards
+        rho_outward = rho_faces[self.boundary_cf]  # boundary faces, valid outwards
         # Apply reflections and contacts:
         rho_inward = rho_outward.detach().clone()  # prepare inward valid version
         indices, reflector = self.wall
@@ -525,7 +492,7 @@ class Boundary:
         for indices, contactor in self.contacts:
             rho_inward[indices] = contactor(t)
         # Set back to faces / return:
-        rho_faces_bf = torch.where(self.is_outward, rho_outward, rho_inward)
+        rho_faces_sel = torch.where(self.is_outward, rho_outward, rho_inward)
         if update:
-            rho_faces[bf] = rho_faces_bf
-        return rho_faces_bf
+            rho_faces[self.boundary_cf] = rho_faces_sel
+        return rho_faces_sel

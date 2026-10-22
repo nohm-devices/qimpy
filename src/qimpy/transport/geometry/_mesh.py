@@ -1,5 +1,4 @@
 from __future__ import annotations
-from dataclasses import dataclass
 
 from scipy.sparse import csr_array
 import numpy as np
@@ -97,8 +96,8 @@ class Mesh(TreeNode):
         return self.save(cp_path)
 
     @property
-    def is1D(self) -> bool:
-        return self.cells.shape[1] == 3  # cells coontain d + 1 vertices, 1 region index
+    def dimension(self) -> int:
+        return self.cells.shape[1] - 2  # cells coontain d + 1 vertices, 1 region index
 
     def _partition_cells(self, group: dist.ProcessGroup) -> CellDivision:
         """Optimally partition the mesh cells for communication over `group`.
@@ -243,91 +242,41 @@ class Mesh(TreeNode):
         reconstruct = np.einsum("cfi, cin -> cfn", face_offsets, grad_op)
         return neighbors, reconstruct
 
-    def get_fv_geom(self, *, dtype: torch.dtype = torch.float64) -> FVGeom:
-        """Initialize finite-volume parameters for mesh."""
-        # Compute cell area and centroid:
-        cell_division = self.cell_division
-        cells = self.cells[cell_division.global_index, :-1]  # local, ignore region ID
+    def get_face_weights(self) -> tuple[np.ndarray, np.ndarray]:
+        """Calculate directed face weights (Nf x 2), i.e. normal * face area,
+        only for local faces (boundary and interior). Also, return the local version
+        of `face_map` of local faces indexed to local cells."""
+        # Calculate for all local cells:
+        face_vertices = self.vertices[self.faces[self.cell_division.global_index]]
+        if self.dimension == 1:
+            # Unit vectors along/opposite 1D domain (unit transverse area)
+            face_centers = face_vertices.mean(axis=2)
+            normals = face_centers - face_centers.mean(axis=1, keepdims=True)
+            face_weights = normals / np.linalg.norm(normals, axis=-1, keepdims=True)
+        else:
+            # Same length as vector along face (edge), but rotated by 90 degrees:
+            face_vectors = (
+                face_vertices[:, :, 1] - face_vertices[:, :, 0]
+            )  # Nc x Nf x 2
+            rot90 = np.array([[0.0, -1.0], [1.0, 0.0]])
+            face_weights = face_vectors @ rot90
+
+        # Index to unique faces:
+        face_map = np.copy(self.face_map[self.face_division.global_index])
+        face_map[..., 0] = np.where(
+            face_map[..., 0] == -1, -1, self.cell_division.local_index[face_map[..., 0]]
+        )  # map cell indices to local ones (taking care of -1s for the boundary faces)
+        i_cell, i_face = face_map[:, 0].T
+        return face_weights[i_cell, i_face], face_map
+
+    def get_cell_weights(self) -> np.ndarray:
+        """Calculate local cell weights (volumes with unit transverse length/area)."""
+        cells = self.cells[self.cell_division.global_index, :-1]  # local, ignore region
         cell_vertices = self.vertices[cells]
-        if self.is1D:
-            area = np.linalg.norm(cell_vertices[:, 1] - cell_vertices[:, 0], axis=-1)
+        if self.dimension == 1:
+            return np.linalg.norm(cell_vertices[:, 1] - cell_vertices[:, 0], axis=-1)
         else:
-            area = 0.5 * np.linalg.det(cell_vertices[:, 1:] - cell_vertices[:, :1])
-            if np.any(area <= 0.0):
-                raise ValueError("Areas must be positive (counter-clockwise triangles)")
-        centroid = cell_vertices.mean(axis=1)
-
-        # Get local boundary and interior faces:
-        face_division = self.face_division
-        faces = self.faces[cell_division.global_index]  # local cells (+ padding)
-        face_map = self.face_map[face_division.global_index]  # local faces (+ padding)
-        boundary = np.copy(face_map[: face_division.n_boundary_mine])
-        interior = np.copy(face_map[face_division.n_boundary_mine :])
-
-        # Map cells to local indices in these face maps:
-        interior[..., 0] = cell_division.local_index[interior[..., 0]]
-        boundary[:, 0, 0] = cell_division.local_index[boundary[:, 0, 0]]
-        (kL, fL), (kR, fR) = np.transpose(interior, (1, 2, 0))
-        (bk, bf), (_, bmark) = np.transpose(boundary, (1, 2, 0))
-
-        # Compute face properties:
-        face_vertices = self.vertices[faces]
-        face_offset = face_vertices.mean(axis=2) - centroid[:, None]  # from centroid
-        if self.is1D:
-            face_weights = np.ones_like(face_offset[..., 0])
-            face_normals = face_offset / np.linalg.norm(
-                face_offset, axis=-1, keepdims=True
-            )
-        else:
-            face_vectors = face_vertices[:, :, 1] - face_vertices[:, :, 0]
-            face_weights = np.linalg.norm(face_vectors, axis=2)
-            face_normals = (
-                np.stack([face_vectors[..., 1], -face_vectors[..., 0]], axis=2)
-                / face_weights[..., None]
-            )
-
-        def t(a, long=False):
-            return torch.tensor(
-                np.ascontiguousarray(a),
-                device=rc.device,
-                dtype=torch.long if long else dtype,
-            )
-
-        n_cell_faces = 2 if self.is1D else 3
-        return FVGeom(
-            area=t(area),
-            eL=t(kL, long=True),
-            eR=t(kR, long=True),
-            eLF=t(kL * n_cell_faces + fL, long=True),
-            eRF=t(kR * n_cell_faces + fR, long=True),
-            en=t(face_normals[kL, fL]),
-            elen=t(face_weights[kL, fL]),
-            bcell=t(bk, long=True),
-            bF=t(bk * n_cell_faces + bf, long=True),
-            bmark=t(bmark, long=True),
-            bn=t(face_normals[bk, bf]),
-            blen=t(face_weights[bk, bf]),
-            n_interior_mine=face_division.n_interior_mine,
-        )
-
-
-@dataclass
-class FVGeom:
-    """Finite-volume geometry parameters for mesh."""
-
-    area: torch.Tensor  #: Cell areas (interval lengths in 1D)
-    eL: torch.Tensor  #: First cell index for interior faces
-    eR: torch.Tensor  #: Second cell index for interior faces
-    eLF: torch.Tensor  #: Flattened first cell-face index for interior faces
-    eRF: torch.Tensor  #: Flattened second cell-face index for interior faces
-    en: torch.Tensor  #: Outward normal directions for each face (in first cell)
-    elen: torch.Tensor  #: Face areas
-    bcell: torch.Tensor  #: Cell index for boundary faces
-    bF: torch.Tensor  #: Flattened cell-face index for boundary faces
-    bmark: torch.Tensor  #: Boundary region IDs for boundary faces
-    bn: torch.Tensor  #: Outward normal directions for boundary faces
-    blen: torch.Tensor  #: Boundary face areas
-    n_interior_mine: int  #: Number of interior faces owned by current cell
+            return 0.5 * abs(np.linalg.det(cell_vertices[:, 1:] - cell_vertices[:, :1]))
 
 
 def make_adjacency(x_to_y: csr_array) -> csr_array:

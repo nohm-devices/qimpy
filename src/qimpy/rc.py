@@ -193,6 +193,16 @@ def report_end():
     log.info(f"\nEnd time: {time.ctime(t_stop)} (Duration: {duration})")
 
 
+def from_np(x: np.ndarray) -> torch.Tensor:
+    """Construct tensor on `device` from numpy array."""
+    return torch.from_numpy(x).to(device)
+
+
+def to_np(x: torch.Tensor) -> np.ndarray:
+    """Get numpy array from tensor on `device` or `cpu`."""
+    return x.detach().cpu().numpy()
+
+
 class HostProcessList(NamedTuple):
     """List of processes running on each hostname"""
 
