@@ -1,13 +1,15 @@
 from __future__ import annotations
-from typing import TypeAlias
+from typing import TypeAlias, Any
 
 import numpy as np
+import triangle
+import torch.distributed as dist
 
-from qimpy import TreeNode
+from qimpy import rc, TreeNode
 from qimpy.io import Checkpoint, CheckpointPath, CheckpointContext
 from qimpy.transport import geometry
 
-__all__ = ("File", "Line", "Rect", "Options")
+__all__ = ("File", "Line", "Rect", "Triangulate", "Options")
 
 
 class File(TreeNode):
@@ -186,10 +188,118 @@ class Rect(TreeNode):
         return list(cp_path.attrs.keys())
 
 
+class Triangulate(TreeNode):
+    def __init__(
+        self,
+        *,
+        vertices: list[tuple[float, float]] | np.ndarray,
+        segments: list[tuple[int, int]] | np.ndarray,
+        max_area: float,
+        min_angle: float = 30.0,
+        holes: list[tuple[float, float]] | np.ndarray | None = None,
+        regions: dict[str, tuple[float, float]] | None = None,
+        contacts: dict[str, tuple[float, ...]] | None = None,
+        mesh: geometry.Mesh,
+        checkpoint_in: CheckpointPath = CheckpointPath(),
+    ) -> None:
+        """Generate a triangulation using the triangle python library.
+        Specify the geometry in terms of vertices, segments that define polygons,
+        optionally lists of points which make some of these polygons into holes,
+        or define them with distinct region IDs. See the examples in the documentation
+        of the triangle library to understand how these options work.
+
+        Parameters
+        ----------
+        vertices
+            :yaml:`Vertex coordinates that defines the polygonal geometry.`
+        segments
+            :yaml:`Pairs of vertex indices for each polygon segment.`
+        max_area
+            :yaml:`Maximum area of triangle in mesh.`
+        min_angle
+            :yaml:`Minimum angle (degrees) of triangle in mesh.`
+        holes
+            :yaml:`Optional coordinates of points defining holes.`
+            If any point listed here is within a polygon defined by `segments`,
+            than that polygon becomes a hole in the geometry.
+        regions
+            :yaml:`Optional named regions in the geometry.`
+            Each name is associated with the coordinates of a point: the polygon
+            containing that point then becomes a named region for probe output.
+        contacts
+            :yaml:`Named regions on the boundary to use as contacts.`
+            Each name is associated with a circle (x0, y0, r) or axis-aligned
+            ellipse (x0, y0, rx, ry): any faces on the boundary with center
+            within this circle or ellipse is associated to that name.
+        """
+        super().__init__()
+        self.vertices = np.array(vertices)
+        self.segments = np.array(segments)
+        self.max_area = float(max_area)
+        self.min_angle = float(min_angle)
+        if checkpoint_in:
+            return  # data will be loaded from checkpoint instead
+
+        # Prepare inputs for triangle library:
+        triangle_input = dict[str, Any](vertices=self.vertices, segments=self.segments)
+        triangle_command = f"pq{self.min_angle}a{self.max_area}e"
+        self.holes: np.ndarray | None = None
+        if holes is not None:
+            triangle_input["holes"] = np.array(holes)
+        mesh.region_names = list[str]()
+        if regions is not None:
+            region_list = []
+            for i_region, (region_name, (x, y)) in enumerate(regions.items()):
+                mesh.region_names.append(region_name)
+                region_list.append([x, y, i_region, 0.0])
+            triangle_input["regions"] = region_list
+            triangle_command += "A"
+
+        # Triangulate on head and broadcast results (mesh must be consistent):
+        object_list = [
+            (
+                triangle.triangulate(triangle_input, triangle_command)
+                if rc.is_head
+                else None
+            )
+        ]
+        if rc.n_procs > 1:
+            dist.broadcast_object_list(object_list, src=0)
+        results = object_list[0]
+
+        # Extract required properties for mesh:
+        mesh.vertices = results["vertices"]
+        triangles = results["triangles"]
+        if (cell_regions := results.get("triangle_attributes")) is None:
+            cell_regions = np.full((len(triangles), 1), -1)
+        mesh.cells = np.hstack((triangles, cell_regions)).astype(int)
+
+        # Assign contacts:
+        edges = results["edges"].astype(int)
+        edge_markers = results["edge_markers"].astype(int)[:, 0]
+        edges = edges[edge_markers == 1]  # keep only boundary edges
+        mesh.boundary_faces = np.hstack((edges, np.full((len(edges), 1), -1)))
+        mesh.boundary_names = []
+        face_centers = mesh.vertices[edges].mean(axis=1)
+        assert contacts is not None
+        for i_contact, (contact_name, ellipse) in enumerate(contacts.items()):
+            mesh.boundary_names.append(contact_name)
+            mesh.boundary_faces[within_ellipse(face_centers, ellipse), -1] = i_contact
+
+    def _save_checkpoint(
+        self, cp_path: CheckpointPath, context: CheckpointContext
+    ) -> list[str]:
+        cp_path.attrs["vertices"] = self.vertices
+        cp_path.attrs["segments"] = self.segments
+        cp_path.attrs["max_area"] = self.max_area
+        cp_path.attrs["min_angle"] = self.min_angle
+        return list(cp_path.attrs.keys())
+
+
 def within_ellipse(points: np.ndarray, ellipse: tuple[float, ...]) -> np.ndarray:
     center = ellipse[:2]
     r = ellipse[2:]  # 1 or 2 values, broadcasts to get circle or ellipse
     return np.linalg.norm((points - center) / r, axis=1) <= 1.0
 
 
-Options: TypeAlias = File | Line | Rect
+Options: TypeAlias = File | Line | Rect | Triangulate

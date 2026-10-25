@@ -35,6 +35,7 @@ class Mesh(TreeNode):
         file: mesh_source.File | dict | None = None,
         line: mesh_source.Line | dict | None = None,
         rect: mesh_source.Rect | dict | None = None,
+        triangulate: mesh_source.Triangulate | dict | None = None,
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         """
@@ -60,6 +61,9 @@ class Mesh(TreeNode):
             TreeNode.ChildOptions("file", mesh_source.File, file, mesh=self),
             TreeNode.ChildOptions("line", mesh_source.Line, line, mesh=self),
             TreeNode.ChildOptions("rect", mesh_source.Rect, rect, mesh=self),
+            TreeNode.ChildOptions(
+                "triangulate", mesh_source.Triangulate, triangulate, mesh=self
+            ),
             have_default=False,
         )
         if checkpoint_in:

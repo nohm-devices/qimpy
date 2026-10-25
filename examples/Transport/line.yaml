@@ -3,7 +3,7 @@ ab_initio:
   T: 300 K
   mu: 0.528824 eV
 
-spatial_transport:
+geometry:
   mesh:
     line:
       L: 20 nm
@@ -23,4 +23,4 @@ time_evolution:
   dt_save: 0.2 ps
   n_collate: 32
 
-checkpoint_out: animation/advect_{:04d}.h5
+checkpoint_out: results/frame{:04d}.h5

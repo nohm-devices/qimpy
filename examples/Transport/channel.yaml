@@ -38,4 +38,4 @@ time_evolution:
   integrator: RK2
 
 checkpoint: null
-checkpoint_out: animation/advect_{:04d}.h5
+checkpoint_out: results/frame{:04d}.h5
