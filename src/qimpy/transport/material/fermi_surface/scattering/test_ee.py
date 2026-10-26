@@ -27,7 +27,7 @@ from . import _kernels
 # So picking the top-N by GPU time is the wrong criterion -- it is the whole
 # module.  `make test` must run on a laptop (upstream's is under a minute), so
 # these are deselected by default and run by `make test-validate`.
-# ⛔ Coverage is NOT simply dropped: test_ee_smoke.py keeps a seconds-scale
+# ⛔ Coverage is NOT simply dropped: test_ee_fast.py keeps a seconds-scale
 # construct / apply / conserve check in the default suite, so a build that
 # breaks the operator outright still fails `make test`.
 pytestmark = pytest.mark.validate
