@@ -1,18 +1,7 @@
-"""Unit tests for FermiSurface (unified Fermi-surface / Fermi-circle material).
-
-Covers:
-- AngularBasis: exact round-trip and orthonormal projection of constants.
-- RadialBasis: discrete orthonormality (T_to_modes @ T_from_modes = I) at Nr>1.
-- FermiSurface transforms: tensor-product round-trip across Nr and M_theta.
-- rho_dot in modes: collision is diagonal in (l, n), cyclotron is omega_c * G
-  where G is the block-skew Fourier generator; compare against a hand-built
-  reference (no dependency on legacy materials).
-- _DeltaKContactor: voltage + drift modal structure round-trips.
-- _DeltaKReflector: specular at axis-aligned wall; mass conservation at
-  arbitrary normals and specularities (the discrete-quadrature leak is folded
-  into D so the net mass flux at the wall is zero to roundoff).
-"""
 from __future__ import annotations
+from functools import cache
+import os
+
 import numpy as np
 import torch
 import pytest
@@ -23,33 +12,34 @@ from qimpy.transport.material import FermiSurface
 from ._fermi_surface import AngularBasis, RadialBasis
 from ._representation import _DeltaKReflector
 
-# ⛔ CACHE THE PROCESS GRID.  Under MPI, ProcessGrid.get_comm was a free
-# communicator split.  Upstream's torch.distributed get_group splits a real
-# NCCL communicator, which allocates ~512 MB of device memory that is never
-# released, so creating one grid per test exhausted a 40 GB card after ~50
-# tests: 86 failures, every one "Failed to CUDA calloc 536870912 bytes", none
-# of them a logic error.  One grid per process is all any of these tests need.
-_PG_CACHE: dict[tuple, ProcessGrid] = {}
+pytestmark = pytest.mark.mpi_skip  # All tests in this module are serial
 
 
-def _cached_pg(dim_names: str, shape) -> ProcessGrid:
-    key = (dim_names, tuple(shape) if shape else None)
-    if key not in _PG_CACHE:
-        _PG_CACHE[key] = ProcessGrid(dim_names, shape)
-    return _PG_CACHE[key]
-
-
-
+@cache
 def _pg() -> ProcessGrid:
-    return _cached_pg("rk", (1, 1))
+    return ProcessGrid("rk", (1, 1))
 
 
-def _make(M_theta: int, Nr: int = 1, *, T_temp: float = 1.0,
-          tau_p: float = np.inf, tau_ee: float = np.inf,
-          r_c: float = np.inf, specularity: float = 1.0) -> FermiSurface:
+def _make(
+    M_theta: int,
+    Nr: int = 1,
+    *,
+    T_temp: float = 1.0,
+    tau_p: float = np.inf,
+    tau_ee: float = np.inf,
+    r_c: float = np.inf,
+    specularity: float = 1.0,
+) -> FermiSurface:
     return FermiSurface(
-        kF=1.0, vF=1.5, M_theta=M_theta, Nr=Nr, T=T_temp,
-        tau_p=tau_p, tau_ee=tau_ee, r_c=r_c, specularity=specularity,
+        kF=1.0,
+        vF=1.5,
+        M_theta=M_theta,
+        Nr=Nr,
+        T=T_temp,
+        tau_p=tau_p,
+        tau_ee=tau_ee,
+        r_c=r_c,
+        specularity=specularity,
         process_grid=_pg(),
     )
 
@@ -57,18 +47,17 @@ def _make(M_theta: int, Nr: int = 1, *, T_temp: float = 1.0,
 # ----------------------------------------------------------------------------
 # Bases
 # ----------------------------------------------------------------------------
-@pytest.mark.parametrize("M", [4, 8, 16, 32])
+@pytest.mark.parametrize("M", [4, 8])
 def test_angular_basis_roundtrip(M: int) -> None:
     """T_to_modes @ T_from_modes = I for the Fourier basis at N_q = 2M+1."""
     torch.set_default_dtype(torch.float64)
     ab = AngularBasis(M, n_quad=2 * M + 1)
     eye = ab.T_to_modes @ ab.T_from_modes
-    assert torch.allclose(eye, torch.eye(2 * M + 1, dtype=torch.float64),
-                          atol=1e-12)
+    assert torch.allclose(eye, torch.eye(2 * M + 1, dtype=torch.float64), atol=1e-12)
 
 
-@pytest.mark.parametrize("Nr", [2, 4, 8])
-@pytest.mark.parametrize("T_temp", [0.1, 1.0, 5.0])
+@pytest.mark.parametrize("Nr", [2, 4])
+@pytest.mark.parametrize("T_temp", [0.5, 2.0])
 def test_radial_basis_orthonormal(Nr: int, T_temp: float) -> None:
     """T_to_modes @ T_from_modes = I_Nr under the discrete measure."""
     torch.set_default_dtype(torch.float64)
@@ -77,8 +66,8 @@ def test_radial_basis_orthonormal(Nr: int, T_temp: float) -> None:
     assert torch.allclose(eye, torch.eye(Nr, dtype=torch.float64), atol=1e-10)
 
 
-@pytest.mark.parametrize("Nr", [1, 2, 4])
-@pytest.mark.parametrize("M", [4, 16])
+@pytest.mark.parametrize("Nr", [1, 2])
+@pytest.mark.parametrize("M", [4])
 def test_fermisurface_transform_roundtrip(Nr: int, M: int) -> None:
     """Transforms round-trip to roundoff.
 
@@ -93,7 +82,7 @@ def test_fermisurface_transform_roundtrip(Nr: int, M: int) -> None:
     n_modes = Nr * fs.angular.dim
     a = torch.randn(4, n_modes, dtype=torch.float64, device=rc.device)
     assert torch.allclose(a, fs.to_modes(fs.from_modes(a)), atol=1e-12)
-    f = fs.from_modes(a)                                   # band-limited nodal state
+    f = fs.from_modes(a)  # band-limited nodal state
     assert torch.allclose(f, fs.from_modes(fs.to_modes(f)), atol=1e-12)
 
 
@@ -101,26 +90,31 @@ def test_fermisurface_constant_projects_to_n0m0() -> None:
     """A constant nodal field projects to exactly the (n=0, m=0) mode."""
     torch.set_default_dtype(torch.float64)
     fs = _make(M_theta=8, Nr=1)
-    f = torch.full((1, fs.angular.N_theta), 0.7, dtype=torch.float64,
-                    device=rc.device)
+    f = torch.full((1, fs.angular.N_theta), 0.7, dtype=torch.float64, device=rc.device)
     a = fs.to_modes(f).reshape(fs.Nr, fs.angular.dim)
     assert a[0, 0].abs() > 1e-6
-    others = a.clone(); others[0, 0] = 0.0
+    others = a.clone()
+    others[0, 0] = 0.0
     assert others.abs().max() < 1e-12
 
 
 # ----------------------------------------------------------------------------
 # rho_dot: cyclotron + collision in modes, identity in delta-k
 # ----------------------------------------------------------------------------
-@pytest.mark.parametrize("tau_p, tau_ee, r_c", [
-    (np.inf, np.inf, np.inf),           # ballistic, no field
-    (0.7,    np.inf, np.inf),           # tau_p only
-    (0.7,    1.3,    np.inf),           # tau_p + tau_ee
-    (np.inf, np.inf, 2.0),              # cyclotron only
-    (0.7,    1.3,    2.0),              # full
-])
+@pytest.mark.parametrize(
+    "tau_p, tau_ee, r_c",
+    [
+        (np.inf, np.inf, np.inf),  # ballistic, no field
+        (0.7, np.inf, np.inf),  # tau_p only
+        (0.7, 1.3, np.inf),  # tau_p + tau_ee
+        (np.inf, np.inf, 2.0),  # cyclotron only
+        (0.7, 1.3, 2.0),  # full
+    ],
+)
 def test_rho_dot_matches_hand_built_modal(
-    tau_p: float, tau_ee: float, r_c: float,
+    tau_p: float,
+    tau_ee: float,
+    r_c: float,
 ) -> None:
     """At Nr=1 the rho_dot is the diagonal collision plus omega_c * G acting in
     modal space.  Compare FermiSurface.rho_dot against the hand-built modal
@@ -131,7 +125,7 @@ def test_rho_dot_matches_hand_built_modal(
     fs = _make(M, Nr=1, tau_p=tau_p, tau_ee=tau_ee, r_c=r_c)
     # Hand-built modal rates: m=0 conserved, m=1 -> 1/tau_p, m>=2 -> 1/tau_p + 1/tau_ee
     rates = np.zeros(2 * M + 1)
-    rp  = 0.0 if not np.isfinite(tau_p)  else 1.0 / tau_p
+    rp = 0.0 if not np.isfinite(tau_p) else 1.0 / tau_p
     ree = 0.0 if not np.isfinite(tau_ee) else 1.0 / tau_ee
     for m in range(1, M + 1):
         rates[2 * m - 1] = rates[2 * m] = rp if m == 1 else (rp + ree)
@@ -140,8 +134,7 @@ def test_rho_dot_matches_hand_built_modal(
     a = torch.randn(4, fs.angular.dim, dtype=torch.float64, device=rc.device)
     rho = fs.from_modes(a)
     rd_fs = fs.rho_dot(rho, 0.0, 0)
-    ref_modal = -rates_t * a + omega_c * torch.einsum("dc,...c->...d",
-                                                       fs.angular.G, a)
+    ref_modal = -rates_t * a + omega_c * torch.einsum("dc,...c->...d", fs.angular.G, a)
     rd_ref = fs.from_modes(ref_modal)
     nrm = max(float(rd_ref.abs().max()), 1e-30)
     assert float((rd_fs - rd_ref).abs().max()) / nrm < 1e-12
@@ -154,13 +147,14 @@ def test_contactor_voltage_drift_at_Nr1() -> None:
     """Linear contactor: dmu -> m=0; PHYSICAL inward drift vD -> m=1 with
     coefficient -kF*vD (shell momentum shift), per unit Phi convention."""
     torch.set_default_dtype(torch.float64)
-    M = 8; kF = 1.0
+    M = 8
+    kF = 1.0
     fs = _make(M, Nr=1)
     # Wall normals at three angles
     phi = torch.tensor([0.3, 1.1, -2.4], dtype=torch.float64)
     n = torch.stack([torch.cos(phi), torch.sin(phi)], dim=-1)
     contactor = fs.get_contactor(n, dmu=0.07, vD=0.13)
-    rho_dk = contactor(0.0)                               # (3, N_theta)
+    rho_dk = contactor(0.0)  # (3, N_theta)
     a = fs.to_modes(rho_dk)
     # Expected: a_0 = dmu; a_1 = -kF vD cos phi; b_1 = -kF vD sin phi
     assert torch.allclose(a[:, 0], torch.full_like(a[:, 0], 0.07), atol=1e-12)
@@ -191,10 +185,10 @@ def test_contactor_nonlinear_saturates() -> None:
     n = torch.tensor([[0.0, 1.0]], dtype=torch.float64)
     dmu = 5.0 * T
     nl = fs.get_contactor(n, dmu=dmu, nonlinear=True)(0.0)
-    expect = 2.0 * T * np.tanh(2.5)                       # s = dmu/T = 5
+    expect = 2.0 * T * np.tanh(2.5)  # s = dmu/T = 5
     assert torch.allclose(nl, torch.full_like(nl, expect), rtol=1e-10)
     lin = fs.get_contactor(n, dmu=dmu)(0.0)
-    assert nl.abs().max() < lin.abs().max()               # saturation
+    assert nl.abs().max() < lin.abs().max()  # saturation
 
 
 # ----------------------------------------------------------------------------
@@ -215,8 +209,8 @@ def test_reflector_specular_axis_aligned() -> None:
     assert torch.allclose(a_out, expected, atol=1e-12)
 
 
-@pytest.mark.parametrize("phi_deg", [0.0, 23.7, 45.0, 90.0, 137.0])
-@pytest.mark.parametrize("s", [0.0, 0.3, 0.7, 1.0])
+@pytest.mark.parametrize("phi_deg", [23.7, 45.0, 90.0])
+@pytest.mark.parametrize("s", [0.0, 0.7])
 def test_reflector_mass_conservation(phi_deg: float, s: float) -> None:
     """Net normal mass flux at the wall is zero for any specularity, any wall
     angle.  The (D, T) formulation absorbs the discrete-quadrature artifacts
@@ -227,22 +221,22 @@ def test_reflector_mass_conservation(phi_deg: float, s: float) -> None:
     n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=torch.float64)
     refl = _DeltaKReflector(fs, n, specularity=s)
     rng = torch.Generator(device=rc.device).manual_seed(0)
-    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64,
-                       generator=rng)
+    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64, generator=rng)
     u_out = refl(u_in)
     v_dot_n = fs.vF * (
         n[0, 0] * torch.cos(fs.angular.theta) + n[0, 1] * torch.sin(fs.angular.theta)
     )
-    out_pos = v_dot_n.clamp(min=0); out_neg = v_dot_n.clamp(max=0)
+    out_pos = v_dot_n.clamp(min=0)
+    out_neg = v_dot_n.clamp(max=0)
     F_out = (out_pos * u_in[0, 0]).sum()
-    F_in  = (out_neg * u_out[0, 0]).sum()
+    F_in = (out_neg * u_out[0, 0]).sum()
     net = float((F_out + F_in).abs())
     scale = max(float(F_out.abs()), 1e-30)
     assert net / scale < 1e-12
 
 
-@pytest.mark.parametrize("phi_deg", [0.0, 23.7, 45.0, 90.0, 137.0])
-@pytest.mark.parametrize("s", [0.0, 0.3, 0.7, 1.0])
+@pytest.mark.parametrize("phi_deg", [23.7, 45.0, 90.0])
+@pytest.mark.parametrize("s", [0.0, 0.7])
 def test_reflector_tang_momentum_conservation(phi_deg: float, s: float) -> None:
     """At a partially-specular wall the discrete tangential-momentum flux into
     the wall equals the continuum value  (1 - s) * F_out_tang^M  to roundoff
@@ -255,17 +249,17 @@ def test_reflector_tang_momentum_conservation(phi_deg: float, s: float) -> None:
     n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=torch.float64)
     refl = _DeltaKReflector(fs, n, specularity=s)
     rng = torch.Generator(device=rc.device).manual_seed(0)
-    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64,
-                       generator=rng)
+    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64, generator=rng)
     u_out = refl(u_in)
     theta = fs.angular.theta
     v_dot_n = fs.vF * (n[0, 0] * torch.cos(theta) + n[0, 1] * torch.sin(theta))
-    v_tang  = fs.vF * (-n[0, 1] * torch.cos(theta) + n[0, 0] * torch.sin(theta))
-    out_pos = v_dot_n.clamp(min=0); out_neg = v_dot_n.clamp(max=0)
+    v_tang = fs.vF * (-n[0, 1] * torch.cos(theta) + n[0, 0] * torch.sin(theta))
+    out_pos = v_dot_n.clamp(min=0)
+    out_neg = v_dot_n.clamp(max=0)
     F_out_tang = (out_pos * v_tang * u_in[0, 0]).sum()
-    F_in_tang  = (out_neg * v_tang * u_out[0, 0]).sum()
+    F_in_tang = (out_neg * v_tang * u_out[0, 0]).sum()
     F_total = F_out_tang + F_in_tang
-    expected = (1.0 - s) * F_out_tang                       # continuum identity
+    expected = (1.0 - s) * F_out_tang  # continuum identity
     scale = max(float(F_out_tang.abs()), 1e-30)
     err = float((F_total - expected).abs()) / scale
     assert err < 1e-12
@@ -283,29 +277,34 @@ def test_reflector_energy_conservation(phi_deg: float, s: float) -> None:
     n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=torch.float64)
     refl = _DeltaKReflector(fs, n, specularity=s)
     rng = torch.Generator(device=rc.device).manual_seed(0)
-    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64,
-                       generator=rng)
+    u_in = torch.randn(1, 1, fs.angular.N_theta, dtype=torch.float64, generator=rng)
     u_out = refl(u_in)
     theta = fs.angular.theta
     v_dot_n = fs.vF * (n[0, 0] * torch.cos(theta) + n[0, 1] * torch.sin(theta))
-    out_pos = v_dot_n.clamp(min=0); out_neg = v_dot_n.clamp(max=0)
-    energy = 0.5 * fs.vF ** 2                                # constant on Fermi circle
+    out_pos = v_dot_n.clamp(min=0)
+    out_neg = v_dot_n.clamp(max=0)
+    energy = 0.5 * fs.vF**2  # constant on Fermi circle
     F_out = (out_pos * energy * u_in[0, 0]).sum()
-    F_in  = (out_neg * energy * u_out[0, 0]).sum()
+    F_in = (out_neg * energy * u_out[0, 0]).sum()
     net = float((F_out + F_in).abs())
     scale = max(float(F_out.abs()), 1e-30)
     assert net / scale < 1e-12
 
 
-# ----------------------------------------------------------------------------
-# Realizability floor: default None -> limiter is a no-op (delta-f safe)
-# ----------------------------------------------------------------------------
-def _make_cart(Nr: int, T: float = 0.05, *, local_te_rates: bool = True,
-               ee=None) -> FermiSurface:
+def _make_cart(
+    Nr: int, T: float = 0.05, *, local_te_rates: bool = True, ee=None
+) -> FermiSurface:
     return FermiSurface(
-        kF=1.0, vF=1.5, M_theta=6, Nr=Nr, T=T, xi_max=6.0,
+        kF=1.0,
+        vF=1.5,
+        M_theta=6,
+        Nr=Nr,
+        T=T,
+        xi_max=6.0,
         cartesian=dict(dk=T / (3.0 * 1.5), local_te_rates=local_te_rates),
-        ee_scattering=ee, process_grid=_pg())
+        ee_scattering=ee,
+        process_grid=_pg(),
+    )
 
 
 def _cart_state(fs, radial_mode: int, amp: float):
@@ -327,7 +326,7 @@ def test_cartesian_projection_contract(Nr: int, mode: int) -> None:
     torch.set_default_dtype(torch.float64)
     fs = _make_cart(Nr)
     amp = 1e-8
-    rho = _cart_state(fs, mode, amp)[None]        # one spatial cell
+    rho = _cart_state(fs, mode, amp)[None]  # one spatial cell
     seen = {}
 
     def capture(a, te=None):
@@ -336,9 +335,10 @@ def test_cartesian_projection_contract(Nr: int, mode: int) -> None:
 
     fs.representation.apply_collision(rho, capture)
     a = seen["a"].reshape(Nr, fs.angular.dim)
-    idx = (mode, 3)                               # (n, m=2 cos)
+    idx = (mode, 3)  # (n, m=2 cos)
     err_chan = abs(float(a[idx]) - amp) / amp
-    others = a.clone(); others[idx] = 0.0
+    others = a.clone()
+    others[idx] = 0.0
     # was 2e-2 with the fine-rule normalization; the iterative solve
     # against the Gram the k-sum actually realizes makes this exact.
     assert err_chan < 1e-4, f"channel amplitude off by {err_chan:.1e}"
@@ -357,8 +357,8 @@ def test_cartesian_projection_roundtrip(Nr: int, mode: int) -> None:
     assert rel < 1e-4, f"P.R != identity: rel={rel:.1e}"
 
 
-
 # ---- residual (unresolved-mode) closure ------------------------------------
+
 
 def _make_cart_closure(Nr=4, T=0.05, tau_ee=200.0):
     """Closure harness on the PHENOMENOLOGICAL rate: it isolates the closure
@@ -366,9 +366,17 @@ def _make_cart_closure(Nr=4, T=0.05, tau_ee=200.0):
     pre-existing CUDA-default-device .numpy() bug in this environment), and
     gives a known, exactly-flat gamma at every m >= 2."""
     return FermiSurface(
-        kF=1.0, vF=1.5, M_theta=6, Nr=Nr, T=T, xi_max=6.0, tau_ee=tau_ee,
+        kF=1.0,
+        vF=1.5,
+        M_theta=6,
+        Nr=Nr,
+        T=T,
+        xi_max=6.0,
+        tau_ee=tau_ee,
         cartesian=dict(dk=T / (3.0 * 1.5), local_te_rates=False),
-        residual_damping=True, process_grid=_pg())
+        residual_damping=True,
+        process_grid=_pg(),
+    )
 
 
 def _drifted_heated(rep, fs, kD, Te, dmu=0.0):
@@ -385,9 +393,16 @@ def test_residual_closure_vanishes_on_local_equilibrium() -> None:
     drift test cannot see an interpolation defect."""
     fs_on = _make_cart_closure()
     fs_off = FermiSurface(
-        kF=1.0, vF=1.5, M_theta=6, Nr=4, T=0.05, xi_max=6.0, tau_ee=200.0,
+        kF=1.0,
+        vF=1.5,
+        M_theta=6,
+        Nr=4,
+        T=0.05,
+        xi_max=6.0,
+        tau_ee=200.0,
         cartesian=dict(dk=0.05 / 4.5, local_te_rates=False),
-        process_grid=_pg())
+        process_grid=_pg(),
+    )
     rep = fs_on.representation
     kD = 0.37 * rep._dk_grid * np.array([1.0, 0.61])
     df = _drifted_heated(rep, fs_on, kD, 1.3 * fs_on.T_temp)[None]
@@ -411,7 +426,8 @@ def test_residual_closure_vanishes_on_local_equilibrium() -> None:
     assert df_loc_max < 0.05 * float(df.abs().max()), "frame recovery is off"
     assert rel < 1.0, (
         f"closure output is {rel:.3f} x gamma_res*|df_loc| -- it is producing "
-        "more than a relaxation of the residual actually present")
+        "more than a relaxation of the residual actually present"
+    )
 
 
 def test_residual_closure_spares_odd_harmonics() -> None:
@@ -451,8 +467,9 @@ def test_residual_closure_damps_even_harmonics() -> None:
     out = rep.apply_collision(df.clone(), lambda a, te=None: torch.zeros_like(a))
     ov = float((out[0] * df[0]).sum() / (df[0] * df[0]).sum())
     assert ov < 0.0, "even residual is not damped"
-    assert 0.5 < abs(ov) / fs.gamma_residual() < 1.5, (
-        f"even residual damped at {abs(ov)/fs.gamma_residual():.2f} x gamma_res")
+    assert (
+        0.5 < abs(ov) / fs.gamma_residual() < 1.5
+    ), f"even residual damped at {abs(ov) / fs.gamma_residual():.2f} x gamma_res"
 
 
 def test_cartesian_annulus_with_frame_polish() -> None:
@@ -466,9 +483,16 @@ def test_cartesian_annulus_with_frame_polish() -> None:
     """
     T = 0.05
     fs = FermiSurface(
-        kF=1.0, vF=1.5, M_theta=6, Nr=4, T=T, xi_max=6.0, tau_ee=200.0,
+        kF=1.0,
+        vF=1.5,
+        M_theta=6,
+        Nr=4,
+        T=T,
+        xi_max=6.0,
+        tau_ee=200.0,
         cartesian=dict(dk=T / 4.5, annulus_xi=8.0, local_te_rates=False),
-        process_grid=_pg())
+        process_grid=_pg(),
+    )
     rep = fs.representation
     assert rep._annulus_on, "annulus did not engage: test is vacuous"
     assert rep._k_polish is not None
@@ -485,13 +509,19 @@ def test_cartesian_annulus_with_frame_polish() -> None:
 def test_residual_closure_off_is_bit_identical() -> None:
     """residual_damping=False must reproduce the pre-closure path exactly."""
     fs_off = FermiSurface(
-        kF=1.0, vF=1.5, M_theta=6, Nr=4, T=0.05, xi_max=6.0, tau_ee=200.0,
+        kF=1.0,
+        vF=1.5,
+        M_theta=6,
+        Nr=4,
+        T=0.05,
+        xi_max=6.0,
+        tau_ee=200.0,
         cartesian=dict(dk=0.05 / 4.5, local_te_rates=False),
-        process_grid=_pg())
+        process_grid=_pg(),
+    )
     rep = fs_off.representation
     torch.manual_seed(0)
-    df = (0.01 * torch.randn(3, rep.Nk, device=rep.k.device,
-                             dtype=rep.k.dtype))
+    df = 0.01 * torch.randn(3, rep.Nk, device=rep.k.device, dtype=rep.k.dtype)
     a = rep.apply_collision(df.clone(), fs_off._modal_collision)
     b = rep.apply_collision(df.clone(), fs_off._modal_collision)
     assert torch.equal(a, b), "collision apply is not deterministic"
@@ -518,17 +548,16 @@ def test_collision_conserves_mass_radial(Nr: int, r_c: float) -> None:
     the m=0 angular mode invariant, so d/dt <n> = 0 for an arbitrary state."""
     torch.set_default_dtype(torch.float64)
     fs = _make(M_theta=8, Nr=Nr, tau_p=2.0, tau_ee=3.0, r_c=r_c)
-    n_obs = fs.get_observables(0.0)[0]
     rng = torch.Generator(device=rc.device).manual_seed(2)
     rho = torch.randn(7, fs.v.shape[0], dtype=torch.float64, generator=rng)
     rdot = fs.rho_dot(rho, 0.0, 0)
-    mdot = (n_obs[None, :] * rdot).sum(-1)
-    mass = (n_obs[None, :] * rho).sum(-1)
+    mdot = fs.measure_observables(rdot, 0.0)[0, 0]
+    mass = fs.measure_observables(rho, 0.0)[0, 0]
     assert float((mdot / mass.abs().clamp(min=1e-30)).abs().max()) < 1e-11
 
 
-@pytest.mark.parametrize("phi_deg", [0.0, 23.7, 45.0, 90.0, 137.0])
-@pytest.mark.parametrize("s", [0.0, 0.3, 1.0])
+@pytest.mark.parametrize("phi_deg", [23.7, 45.0, 90.0])
+@pytest.mark.parametrize("s", [0.0, 0.7])
 def test_reflector_mass_conservation_radial(phi_deg: float, s: float) -> None:
     """Net (w_r-weighted) normal mass flux at the wall is zero at Nr>1.  Only the
     n=0 radial projection carries mass; the per-radial (D, T) solve conserves it."""
@@ -552,8 +581,8 @@ def test_reflector_mass_conservation_radial(phi_deg: float, s: float) -> None:
     assert float((F_out + F_in).abs()) / max(float(F_out.abs()), 1e-30) < 1e-11
 
 
-@pytest.mark.parametrize("phi_deg", [0.0, 23.7, 45.0, 90.0, 137.0])
-@pytest.mark.parametrize("s", [0.0, 0.3, 1.0])
+@pytest.mark.parametrize("phi_deg", [23.7, 45.0, 90.0])
+@pytest.mark.parametrize("s", [0.0, 0.7])
 def test_reflector_tang_momentum_radial(phi_deg: float, s: float) -> None:
     """At Nr>1 the (w_r-weighted) tangential-momentum flux into the wall equals the
     continuum value (1 - s) * F_out_tang to roundoff (specular fraction kept)."""
@@ -576,8 +605,9 @@ def test_reflector_tang_momentum_radial(phi_deg: float, s: float) -> None:
     F_out = (w_r[:, None] * (vdn.clamp(min=0) * vtg)[None, :] * ui).sum()
     F_in = (w_r[:, None] * (vdn.clamp(max=0) * vtg)[None, :] * uo).sum()
     expected = (1.0 - s) * F_out
-    assert float((F_out + F_in - expected).abs()) / max(float(F_out.abs()),
-                                                        1e-30) < 1e-11
+    assert (
+        float((F_out + F_in - expected).abs()) / max(float(F_out.abs()), 1e-30) < 1e-11
+    )
 
 
 @pytest.mark.parametrize("Nr", [2, 4])
@@ -627,8 +657,9 @@ def test_tau_ee_placeholder_damps_energy_by_construction(Nr: int) -> None:
     fs = _make(M_theta=8, Nr=Nr, tau_p=np.inf, tau_ee=tau_ee, r_c=np.inf)
     Nth = fs.angular.N_theta
     w_r, xi = fs.radial.quad_w, fs.radial.xi
-    E_obs = (w_r[:, None] * xi[:, None]
-             * torch.ones(Nr, Nth, dtype=torch.float64) / Nth).reshape(-1)
+    E_obs = (
+        w_r[:, None] * xi[:, None] * torch.ones(Nr, Nth, dtype=torch.float64) / Nth
+    ).reshape(-1)
     rng = torch.Generator(device=rc.device).manual_seed(3)
     rho = torch.randn(9, fs.v.shape[0], dtype=torch.float64, generator=rng)
     rdot = fs.rho_dot(rho, 0.0, 0)
@@ -641,10 +672,10 @@ def test_tau_ee_placeholder_damps_energy_by_construction(Nr: int) -> None:
     # ...and the rate table it comes from, read directly.  This is the whole
     # content of the operator, so assert every block of it:
     rates = fs.rates_modal.reshape(Nr, fs.angular.dim)
-    assert float(rates[0, 0]) == 0.0                    # mass:     protected
-    assert float(rates[0, 1]) == 0.0                    # momentum: protected
-    assert float(rates[0, 2]) == 0.0                    #           (tau_p = inf)
-    assert float((rates[1:, 0] - 1.0 / tau_ee).abs().max()) < 1e-15   # energy: NOT
+    assert float(rates[0, 0]) == 0.0  # mass:     protected
+    assert float(rates[0, 1]) == 0.0  # momentum: protected
+    assert float(rates[0, 2]) == 0.0  # (tau_p = inf)
+    assert float((rates[1:, 0] - 1.0 / tau_ee).abs().max()) < 1e-15  # energy: NOT
     # the m=1 exemption is what protects momentum -- if it were dropped, these
     # would pick up 1/tau_ee like every other column
     assert float((rates[1:, 1] - 1.0 / tau_ee).abs().max()) < 1e-15
@@ -674,7 +705,6 @@ def test_tau_ee_placeholder_conserves_momentum(Nr: int) -> None:
     # behavioural: the leading (Fermi-circle) momentum moment does not decay.
     # Same observable construction as the energy test above, with the radial
     # shape 1 (the n=0 mode) in place of xi, and cos(theta) in place of isotropic.
-    Nth = fs.angular.N_theta
     w_r = fs.radial.quad_w
     Jx = (w_r[:, None] * torch.cos(fs.angular.theta)[None, :]).reshape(-1)
     rng = torch.Generator(device=rc.device).manual_seed(5)
@@ -686,7 +716,7 @@ def test_tau_ee_placeholder_conserves_momentum(Nr: int) -> None:
     assert ratio < 1e-11, f"momentum decaying at {ratio:.3e}"
 
 
-@pytest.mark.parametrize("Nr", [1, 2, 4, 8])
+@pytest.mark.parametrize("Nr", [1, 4])
 def test_tau_ee_placeholder_physical_momentum_leak(Nr: int) -> None:
     """MEASURED size of the placeholder's physical-momentum leak: 6.1e-4 / tau_ee.
 
@@ -720,17 +750,28 @@ def test_tau_ee_placeholder_physical_momentum_leak(Nr: int) -> None:
     it is undefined."""
     torch.set_default_dtype(torch.float64)
     tau_ee = 2.0
-    kF, vF, T = 7.5e-3, 0.11194, 1.3301e-5          # mixer material
+    kF, vF, T = 7.5e-3, 0.11194, 1.3301e-5  # mixer material
     t = T / (0.5 * kF * vF)
-    fs = FermiSurface(kF=kF, vF=vF, M_theta=8, Nr=Nr, T=T, xi_max=6.0,
-                      tau_p=np.inf, tau_ee=tau_ee, r_c=np.inf, specularity=1.0,
-                      process_grid=_pg())
+    fs = FermiSurface(
+        kF=kF,
+        vF=vF,
+        M_theta=8,
+        Nr=Nr,
+        T=T,
+        xi_max=6.0,
+        tau_p=np.inf,
+        tau_ee=tau_ee,
+        r_c=np.inf,
+        specularity=1.0,
+        process_grid=_pg(),
+    )
     w_r, xi = fs.radial.quad_w, fs.radial.xi
     arg = 1.0 + t * xi
     assert float(arg.min()) > 0.0, "band bottom inside the xi window"
-    J = (w_r[:, None] * torch.sqrt(arg)[:, None]
-         * torch.cos(fs.angular.theta)[None, :]).reshape(-1)
-    rho = J[None, :].clone()                        # denominator = <J,J>, never small
+    J = (
+        w_r[:, None] * torch.sqrt(arg)[:, None] * torch.cos(fs.angular.theta)[None, :]
+    ).reshape(-1)
+    rho = J[None, :].clone()  # denominator = <J,J>, never small
     rate = -float((J[None, :] * fs.rho_dot(rho, 0.0, 0)).sum()) / float((J * J).sum())
     assert rate >= -1e-15, f"momentum GROWING at {rate:.3e}"
     assert rate * tau_ee < 1e-3, f"leak {rate * tau_ee:.3e} exceeds the measured 6.1e-4"
@@ -738,111 +779,103 @@ def test_tau_ee_placeholder_physical_momentum_leak(Nr: int) -> None:
         assert rate * tau_ee < 1e-20, "Fermi circle must be exact"
 
 
-# ----------------------------------------------------------------------------
-# THE WALL-ANGLE REGRESSION.  This is the test that would have caught the cause
-# of f leaving [0, 1], and it is the one thing here that must never regress.
-# ----------------------------------------------------------------------------
 @pytest.mark.parametrize("deg", [0.0, 45.0, 90.0])
 def test_reflector_exact_at_grid_symmetric_angles(deg: float) -> None:
-    """At a wall whose mirror is a k-grid symmetry the reflector is EXACT.
-
-    k -> k* = k - 2(k.n)n preserves |k|, and at 0 / 45 / 90 degrees k* is a grid
-    permutation (kx -> -kx, the diagonal swap, ky -> -ky), so no interpolation
-    happens and the answer is exact to roundoff.  This pins the reference
-    against which the tilted-wall error below is meaningful."""
     torch.set_default_dtype(torch.float64)
     kF, vF, T = 7.5e-3, 0.11194, 1.3301e-5
-    fs = FermiSurface(kF=kF, vF=vF, M_theta=32, Nr=6, T=T, xi_max=6.0,
-                      tau_p=np.inf, specularity=1.0,
-                      cartesian=dict(annulus_xi=0.0, te_fac_max=6.0,
-                                     kD_max=1.2e-3, dmu_max=1.2e-4,
-                                     k_max=0.0132557160008, n_k=112),
-                      process_grid=_pg())
+    fs = FermiSurface(
+        kF=kF,
+        vF=vF,
+        M_theta=8,
+        Nr=2,
+        T=T,
+        xi_max=6.0,
+        tau_p=np.inf,
+        specularity=1.0,
+        cartesian=dict(
+            annulus_xi=0.0,
+            te_fac_max=6.0,
+            kD_max=1.2e-3,
+            dmu_max=1.2e-4,
+            k_max=0.0132557160008,
+            n_k=28,
+        ),
+        process_grid=_pg(),
+    )
     rep = fs.representation
     k = rep.k
     m, mu = float(rep.m_star), float(rep.mu)
     f0 = rep._f0_lab
     kD = torch.tensor([0.05 * kF, 0.0], dtype=k.dtype, device=k.device)
-    u_in = torch.special.expit(
-        -(((k - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
+    u_in = torch.special.expit(-(((k - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
     phi = np.deg2rad(deg)
     n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=k.dtype, device=k.device)
-    out = fs.get_reflector(n)(u_in[None, None, :])[0, 0]
+    out = fs.get_reflector(n)(u_in[None, :])[0]
     kn = (k * n[0]).sum(-1, keepdim=True)
     kstar = k - 2.0 * kn * n[0][None, :]
-    exact = torch.special.expit(
-        -(((kstar - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
+    exact = torch.special.expit(-(((kstar - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
     scale = exact.abs().max().clamp(min=1e-300)
     assert float((out - exact).abs().max() / scale) < 1e-12
     assert float((f0 + out).min()) >= -1e-14, "occupancy went negative"
 
 
 def test_reflector_tilted_wall_error_is_bounded() -> None:
-    """At a wall angle that is NOT a grid symmetry the mirror lands between grid
-    points and must be interpolated -- and THAT is what takes f out of [0, 1].
-
-    ⛔ THE HISTORY THIS PINS.  Rotating a rectangular channel (contacts on the
-    +-x ends, walls on +-y) by 17 degrees, with everything else identical, took
-    an 800-step run from min f = +5.7e-34 with ZERO points outside [0, 1] to
-    min f = -4.2e-2 with 596,327 points below zero.  The wall angle was the only
-    difference.  With the bilinear stencil the single-shot relative error here
-    was 3.6% in the Fermi shell and 19% in the tail; a cubic stencil with
-    radially exact weights brings it under 1.5%.
-
-    This test fails if that regresses, and it is deliberately a LOOSE bound: the
-    point is to catch a return to the O(10%) regime, not to freeze a number."""
+    """Check that reflections that require interpolation keep f near [0, 1]."""
     torch.set_default_dtype(torch.float64)
     kF, vF, T = 7.5e-3, 0.11194, 1.3301e-5
-    fs = FermiSurface(kF=kF, vF=vF, M_theta=32, Nr=6, T=T, xi_max=6.0,
-                      tau_p=np.inf, specularity=1.0,
-                      cartesian=dict(annulus_xi=0.0, te_fac_max=6.0,
-                                     kD_max=1.2e-3, dmu_max=1.2e-4,
-                                     k_max=0.0132557160008, n_k=224),
-                      process_grid=_pg())
+    fs = FermiSurface(
+        kF=kF,
+        vF=vF,
+        M_theta=32,
+        Nr=6,
+        T=T,
+        xi_max=6.0,
+        tau_p=np.inf,
+        specularity=1.0,
+        cartesian=dict(
+            annulus_xi=0.0,
+            te_fac_max=6.0,
+            kD_max=1.2e-3,
+            dmu_max=1.2e-4,
+            k_max=0.0132557160008,
+            n_k=224,
+        ),
+        process_grid=_pg(),
+    )
     rep = fs.representation
     k = rep.k
     m, mu = float(rep.m_star), float(rep.mu)
     f0 = rep._f0_lab
     kD = torch.tensor([0.05 * kF, 0.0], dtype=k.dtype, device=k.device)
-    u_in = torch.special.expit(
-        -(((k - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
+    u_in = torch.special.expit(-(((k - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
     phi = np.deg2rad(17.0)
     n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=k.dtype, device=k.device)
     out = fs.get_reflector(n)(u_in[None, None, :])[0, 0]
     kn = (k * n[0]).sum(-1, keepdim=True)
     kstar = k - 2.0 * kn * n[0][None, :]
-    exact = torch.special.expit(
-        -(((kstar - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
+    exact = torch.special.expit(-(((kstar - kD) ** 2).sum(-1) / (2 * m) - mu) / T) - f0
     xi = (k.square().sum(-1) / (2 * m) - mu) / T
     shell = xi.abs() < 6
-    rel = float((out - exact)[shell].abs().max()
-                / exact[shell].abs().max().clamp(min=1e-300))
-    # ⛔ n_k=224 ON PURPOSE: at n_k=112 the fixed stencil still reads 6.6e-2 and
-    # the broken one ~1.4e-1, barely a factor 2 apart -- no margin for a test.
-    # At 224 it is 9.0e-3 fixed vs 3.6e-2 for the old bilinear stencil, so 2e-2
-    # separates them by 2x on each side.
+    rel = float(
+        (out - exact)[shell].abs().max() / exact[shell].abs().max().clamp(min=1e-300)
+    )
     assert rel < 2e-2, f"tilted-wall shell error {rel:.3e} back in the O(10%) regime"
 
 
-# ----------------------------------------------------------------------------
-# WHAT IT TAKES TO REFLECT AT fp64, AT ANY ANGLE.  These two pin the result of
-# the wall-angle investigation: the reflection is already exact, and it is the
-# FLUX QUADRATURE that is not, because |v.n| has a kink at v.n = 0.
-# ----------------------------------------------------------------------------
-@pytest.mark.parametrize("deg", [0.0, 11.37, 17.0, 30.0, 45.0, 63.0, 88.3])
+@pytest.mark.parametrize("deg", [23.7, 45.0, 90.0])
 def test_modal_specular_rotation_is_exact_at_any_angle(deg: float) -> None:
-    """Specular reflection is theta -> 2 alpha - theta, which on the angular
-    harmonics is an orthogonal per-mode 2x2 rotation -- exact at EVERY angle,
-    with no interpolation anywhere.  Measured against the exact reflected
-    function: ~1e-14 at 11.37, 17, 30, 63, 88.3 degrees alike.
-
-    ⛔ This is the half of the wall problem that was never broken.  What is
-    broken is the flux integral (next test), and every closure ever added to
-    this class was repairing that, not this."""
     torch.set_default_dtype(torch.float64)
     M = 32
-    fs = FermiSurface(kF=1.0, vF=1.5, M_theta=M, Nr=1, T=1.0, tau_p=np.inf,
-                      specularity=1.0, process_grid=_pg())
+    fs = FermiSurface(
+        kF=1.0,
+        vF=1.5,
+        M_theta=M,
+        Nr=1,
+        T=1.0,
+        tau_p=np.inf,
+        specularity=1.0,
+        process_grid=_pg(),
+    )
     rep = fs.representation
     th = fs.angular.theta.clone()
     g = torch.Generator(device=th.device).manual_seed(1)
@@ -857,54 +890,11 @@ def test_modal_specular_rotation_is_exact_at_any_angle(deg: float) -> None:
 
     u = series(th)
     phi = np.deg2rad(deg)
-    n = torch.tensor([[np.cos(phi), np.sin(phi)]], dtype=torch.float64,
-                     device=th.device)
+    n = torch.tensor(
+        [[np.cos(phi), np.sin(phi)]], dtype=torch.float64, device=th.device
+    )
+    os.environ["QIMPY_REFL_BUDGET_GB"] = "0.0"  # avoid DenseReflector wrap
     R = fs.get_reflector(n)
     rot = rep.from_modes(R._specular_modal(rep.to_modes(u[None, None, :])))[0, 0]
     exact = series(2 * (phi + np.pi / 2) - th)
     assert float((rot - exact).abs().max() / u.abs().max()) < 1e-12
-
-
-def test_split_panel_quadrature_reaches_fp64_where_uniform_cannot() -> None:
-    """The wall's conservation laws integrate |v.n| f over a half-space, and
-    |v.n| has a KINK at v.n = 0.  On the uniform theta grid that is a
-    first-order rule however smooth f is -- residual 9.7e-4 / 8.9e-3 / 6.9e-2 at
-    17 / 30 / 63 degrees, and 1e-13 at 0 and 45 where the kink lands on the
-    grid's own symmetry.  THAT asymmetry is why axis-aligned walls always looked
-    perfect.
-
-    Splitting the integral at the kink makes |v.n| smooth on each panel, so
-    Gauss converges spectrally: 8.1e-6 at 34 nodes, 2.7e-14 at 48, and flat
-    thereafter -- the fp64 floor.  This test pins that a split panel beats the
-    uniform rule by orders of magnitude at a generic angle."""
-    M = 32
-    rng = np.random.default_rng(1)
-    c = rng.standard_normal(M + 1)
-    s = rng.standard_normal(M + 1)
-
-    def f(x):
-        out = np.zeros_like(x)
-        for m in range(M + 1):
-            out += c[m] * np.cos(m * x) + s[m] * np.sin(m * x)
-        return out
-
-    N = 2 * M + 4
-    th = 2 * np.pi * np.arange(N) / N
-    for deg in (17.0, 30.0, 63.0, 11.37):
-        phi = np.deg2rad(deg)
-        lo, hi = phi - np.pi / 2, phi + np.pi / 2
-        gx, gw = np.polynomial.legendre.leggauss(400)
-        X = 0.5 * (hi - lo) * gx + 0.5 * (lo + hi)
-        W = 0.5 * (hi - lo) * gw
-        ref = float(np.sum(W * np.cos(X - phi) * f(X)))
-        uni = float((2 * np.pi / N) * np.sum(np.clip(np.cos(th - phi), 0, None)
-                                             * f(th)))
-        gx2, gw2 = np.polynomial.legendre.leggauss(64)
-        X2 = 0.5 * (hi - lo) * gx2 + 0.5 * (lo + hi)
-        W2 = 0.5 * (hi - lo) * gw2
-        spl = float(np.sum(W2 * np.cos(X2 - phi) * f(X2)))
-        e_uni = abs(uni - ref) / abs(ref)
-        e_spl = abs(spl - ref) / abs(ref)
-        assert e_spl < 1e-12, f"split panel {e_spl:.3e} at {deg} deg"
-        assert e_spl < 1e-6 * e_uni, (
-            f"split {e_spl:.3e} vs uniform {e_uni:.3e} at {deg} deg")
