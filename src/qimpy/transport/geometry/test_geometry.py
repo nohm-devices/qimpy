@@ -11,7 +11,7 @@ from qimpy.io import log_config
 def test_geometry():
 
     transport = Transport(
-        fermi_surface=dict(kF=1.5, vF=0.8, M_theta=15),
+        fermi_surface=dict(kF=1.5, vF=0.8, M_theta=3),
         geometry=dict(
             contacts={}, mesh=dict(rect=dict(Lx=1.1, Ly=0.9, Nx=33, Ny=27, contacts={}))
         ),
@@ -27,7 +27,7 @@ def test_geometry():
     )
     r0 = torch.tensor([0.5, 0.4], device=rc.device)
     sigma = 0.1
-    geometry.rho[: cell_div.n_mine, 0] = torch.exp(
+    geometry.rho[: cell_div.n_mine, 2] = torch.exp(
         -0.5 * ((r - r0) / sigma).square().sum(dim=1)
     )
     print(transport.material.transport_velocity)

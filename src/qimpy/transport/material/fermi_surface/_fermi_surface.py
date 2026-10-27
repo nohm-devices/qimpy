@@ -27,7 +27,6 @@ import numpy as np
 import torch
 
 from qimpy import log, rc, TreeNode
-from qimpy.math import ceildiv
 from qimpy.mpi import ProcessGrid, TaskDivision
 from qimpy.profiler import stopwatch
 from qimpy.io import CheckpointPath, CheckpointContext, InvalidInputException
@@ -48,39 +47,24 @@ class AngularBasis:
     ``theta->-theta`` and (even Nq) ``theta->pi-theta`` -- the wall reflections.
     """
 
-    def __init__(
-        self,
-        M: int,
-        n_quad: int | None = None,
-        dtype: torch.dtype = torch.float64,
-        device: torch.device | None = None,
-    ) -> None:
-        Nq = (2 * M + 1) if n_quad is None else n_quad
-        if Nq < 2 * M + 1:
-            raise ValueError(f"AngularBasis n_quad={Nq} < 2M+1={2 * M + 1}")
+    def __init__(self, M: int) -> None:
         self.M = M
-        self.dim = 2 * M + 1
-        self.N_theta = Nq
-        theta = 2.0 * np.pi * (np.arange(Nq) + 0.5) / Nq
-        Tfm = np.zeros((Nq, self.dim))
-        Tfm[:, 0] = 1.0
-        for m in range(1, M + 1):
-            Tfm[:, 2 * m - 1] = np.cos(m * theta)
-            Tfm[:, 2 * m] = np.sin(m * theta)
-        Ttm = np.zeros((self.dim, Nq))
-        Ttm[0, :] = 1.0 / Nq
-        for m in range(1, M + 1):
-            Ttm[2 * m - 1, :] = (2.0 / Nq) * np.cos(m * theta)
-            Ttm[2 * m, :] = (2.0 / Nq) * np.sin(m * theta)
+        self.dim = 2 * M
+        theta = (np.arange(self.dim)) * (2 * np.pi / self.dim)
+        m_theta = np.outer(theta, np.arange(M + 1))
+        transform = np.hstack((np.cos(m_theta), np.sin(m_theta[:, 1:M])))
+        inv_transform = transform.T * (2 / self.dim)  # cos, sin normalized
+        inv_transform[0] *= 0.5  # correct zero frequency normalization
+        inv_transform[M] *= 0.5  # correct Nyquist frequency normalization
+        # Derivative operator:
         G = np.zeros((self.dim, self.dim))
-        for m in range(1, M + 1):
-            G[2 * m - 1, 2 * m] = -m
-            G[2 * m, 2 * m - 1] = +m
-        dev = device or rc.device
-        self.theta = torch.as_tensor(theta, dtype=dtype, device=dev)
-        self.T_from_modes = torch.as_tensor(Tfm, dtype=dtype, device=dev)
-        self.T_to_modes = torch.as_tensor(Ttm, dtype=dtype, device=dev)
-        self.G = torch.as_tensor(G, dtype=dtype, device=dev)
+        for m in range(1, M):
+            G[m, m + M] = -m
+            G[m + M, m] = +m
+        self.theta = rc.from_np(theta)
+        self.T_from_modes = rc.from_np(transform)
+        self.T_to_modes = rc.from_np(inv_transform)
+        self.G = rc.from_np(G)
 
 
 # ----------------------------------------------------------------------------
@@ -218,8 +202,7 @@ class FermiSurface(Material):
 
         # modal bases (shared by both representations and the e-e operator)
         dtype = torch.get_default_dtype()
-        N_theta = ceildiv(2 * M_theta + 1, 4) * 4  # even, multiple of 4, >= 2M+1
-        self.angular = AngularBasis(M_theta, n_quad=N_theta, dtype=dtype)
+        self.angular = AngularBasis(M_theta)
         self.radial = RadialBasis(Nr, T_temp=T, xi_max=xi_max, dtype=dtype)
 
         # k-representation (builds the grid; delta-k is the default first option)
@@ -255,10 +238,8 @@ class FermiSurface(Material):
 
         # phenomenological per-mode collision rates in flattened (n_r, m) ordering
         ang = np.zeros(self.angular.dim)
-        for m in range(1, M_theta + 1):
-            ang[2 * m - 1] = ang[2 * m] = (
-                self.tau_inv_p if m == 1 else (self.tau_inv_p + self.tau_inv_ee)
-            )
+        ang[1:] = self.tau_inv_p + self.tau_inv_ee  # all non-zero modes
+        ang[1] = ang[self.M_theta + 1] = self.tau_inv_p  # net momentum modes (m = 1)
         rad = np.zeros(Nr)
         rad[1:] = self.tau_inv_ee
         rates = ang[None, :] + rad[:, None]

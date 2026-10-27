@@ -80,7 +80,7 @@ class DeltaK(KRepresentation):
         super().__init__()
         fs = fermi_surface
         self.fs = fs
-        Ntheta = fs.angular.N_theta
+        Ntheta = fs.angular.dim
         self.Nk = fs.Nr * Ntheta
         self.wk = self._density_weight()
         # per-collocation velocity: |v| = vF for every radial point (shell linearization)
@@ -109,12 +109,12 @@ class DeltaK(KRepresentation):
         """Nodal (..., Nr*N_theta) -> modal (..., Nr*(2M+1))."""
         fs = self.fs
         Nr = fs.Nr
-        Ntheta = fs.angular.N_theta
+        Ntheta = fs.angular.dim
         s = f.shape
         f4 = f.reshape(*s[:-1], Nr, Ntheta)
         a_t = torch.einsum("cq,...rq->...rc", fs.angular.T_to_modes, f4)
         a = torch.einsum("nr,...rc->...nc", fs.radial.T_to_modes, a_t)
-        return a.reshape(*s[:-1], Nr * fs.angular.dim)
+        return a.reshape(*s[:-1], Nr * Ntheta)
 
     def from_modes(self, a: torch.Tensor) -> torch.Tensor:
         """Modal (..., Nr*(2M+1)) -> nodal (..., Nr*N_theta)."""
@@ -125,7 +125,7 @@ class DeltaK(KRepresentation):
         a4 = a.reshape(*s[:-1], Nr, dim_t)
         f_r = torch.einsum("rn,...nc->...rc", fs.radial.T_from_modes, a4)
         f = torch.einsum("qc,...rc->...rq", fs.angular.T_from_modes, f_r)
-        return f.reshape(*s[:-1], Nr * fs.angular.N_theta)
+        return f.reshape(*s[:-1], Nr * dim_t)
 
     def apply_collision(self, rho: torch.Tensor, modal_op: Callable) -> torch.Tensor:
         return self.from_modes(modal_op(self.to_modes(rho)))
@@ -135,8 +135,8 @@ class DeltaK(KRepresentation):
         fs = self.fs
         w_r = fs.radial.quad_w / torch.sqrt(fs.radial.quad_w.sum())  # (Nr,)
         one_q = torch.full(
-            (fs.angular.N_theta,),
-            1.0 / fs.angular.N_theta,
+            (fs.angular.dim,),
+            1.0 / fs.angular.dim,
             dtype=w_r.dtype,
             device=w_r.device,
         )
@@ -144,7 +144,7 @@ class DeltaK(KRepresentation):
 
     def _eps_node(self) -> torch.Tensor:
         fs = self.fs  # per-node energy
-        return (fs.mu + fs.radial.xi * fs.T_temp).repeat_interleave(fs.angular.N_theta)
+        return (fs.mu + fs.radial.xi * fs.T_temp).repeat_interleave(fs.angular.dim)
 
     def get_observable_names(self) -> list[str]:
         return ["n", "vx", "vy", "e"]
@@ -212,7 +212,7 @@ class _DeltaKContactor:
             s_b = s[:, None, :]  # (Nsel, 1, N_theta)
             dfe = torch.special.expit(s_b - xi_b) - torch.special.expit(-xi_b)
             Phi = 2.0 * fs.T_temp * (1.0 + torch.cosh(xi_b)) * dfe
-            Phi = Phi.reshape(Nsel, fs.Nr * fs.angular.N_theta)
+            Phi = Phi.reshape(Nsel, fs.Nr * fs.angular.dim)
             self.rho_contact = rep.from_modes(rep.to_modes(Phi))  # band-limit once
 
     def __call__(self, t: float) -> torch.Tensor:
@@ -229,8 +229,7 @@ class _DeltaKReflector:
         self.s = float(specularity)
         self.M_theta = fs.M_theta
         self.Nr = fs.Nr
-        self.dim_theta = fs.angular.dim
-        self.N_theta = fs.angular.N_theta
+        self.N_theta = fs.angular.dim
         self.phi = torch.atan2(n[:, 1], n[:, 0])
         self.angle = 2.0 * self.phi + np.pi
         theta = fs.angular.theta
@@ -248,20 +247,19 @@ class _DeltaKReflector:
         # Per-harmonic block rotation, vectorized over all m at once (a Python
         # loop over m is launch-bound and dominates the per-step cost at large
         # M_theta): out_c + i*out_s = e^{i m angle} (a_c - i a_s) for m = 1..M.
-        s = a_modal.shape
-        a4 = a_modal.reshape(*s[:-1], self.Nr, self.dim_theta)
-        out = a4.clone()
-        m = torch.arange(
-            1, self.M_theta + 1, device=a_modal.device, dtype=a_modal.dtype
-        )
+        a = a_modal.unflatten(-1, (self.Nr, self.N_theta))
+        out = a.clone()
+        M = self.M_theta
+        m = torch.arange(1, M, device=a_modal.device, dtype=a_modal.dtype)
         ang = self.angle[:, None] * m  # (Nsel, M)
         c = torch.cos(ang).unsqueeze(-2)  # (Nsel, 1, M) -> bcast Nr
-        sn = torch.sin(ang).unsqueeze(-2)
-        a_c = a4[..., 1::2]  # (..., Nsel, Nr, M) cos coeffs
-        a_s = -a4[..., 2::2]  # (..., Nsel, Nr, M) -sin coeffs
-        out[..., 1::2] = c * a_c - sn * a_s
-        out[..., 2::2] = sn * a_c + c * a_s
-        return out.reshape(s)
+        s = torch.sin(ang).unsqueeze(-2)
+        a_c = a[..., 1:M]  # (..., Nsel, Nr, M-1) cos coeffs
+        a_s = -a[..., (M + 1) :]  # (..., Nsel, Nr, M-1) -sin coeffs
+        out[..., 1:M] = c * a_c - s * a_s
+        out[..., (M + 1) :] = s * a_c + c * a_s
+        out[..., M] *= torch.cos(self.angle * M)[:, None]
+        return out.reshape(a_modal.shape)
 
     def __call__(self, uM_dk: torch.Tensor) -> torch.Tensor:
         fs = self.fs
