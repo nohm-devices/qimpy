@@ -1,12 +1,11 @@
 from __future__ import annotations
-from functools import cache
 
 import numpy as np
 import torch
 import pytest
 
 from qimpy import rc
-from qimpy.mpi import ProcessGrid
+from qimpy.mpi import get_process_grid
 from qimpy.transport.material import FermiSurface
 from qimpy.transport.material.fermi_surface import Cartesian
 from qimpy.transport.material.fermi_surface._cartesian_fft import _CartesianFFTReflector
@@ -16,11 +15,6 @@ TE_MAX, KD_MAX, XI_MAX = 5.69, 0.15 * KF, 12.0
 
 
 pytestmark = pytest.mark.mpi_skip  # All tests in this module are serial
-
-
-@cache
-def _pg() -> ProcessGrid:
-    return ProcessGrid("rk", (1, 1))
 
 
 def _make(cells: float = 3.0) -> FermiSurface:
@@ -55,7 +49,7 @@ def _make(cells: float = 3.0) -> FermiSurface:
             k_max=k_max,
             n_k=n_k,
         ),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
 
 
@@ -141,7 +135,7 @@ def test_fft_reflector_needs_odd_grid() -> None:
             k_max=0.0132557160008,
             n_k=112,
         ),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     n = torch.tensor([[1.0, 0.0]], dtype=torch.float64, device=rc.device)
     with pytest.raises(Exception):

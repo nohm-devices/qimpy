@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from qimpy import rc
-from qimpy.mpi import ProcessGrid
+from qimpy.mpi import get_process_grid
 
 pytestmark = pytest.mark.mpi_skip  # All tests in this module are serial
 
@@ -27,7 +27,7 @@ def _fs(**kw):
         Nr=1,
         T=T0,
         tau_p=float("inf"),
-        process_grid=ProcessGrid("rk", (1, 1)),
+        process_grid=get_process_grid("rk", (1, 1)),
         **kw,
     )
 

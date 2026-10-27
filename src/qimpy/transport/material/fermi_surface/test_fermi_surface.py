@@ -1,5 +1,4 @@
 from __future__ import annotations
-from functools import cache
 import os
 
 import numpy as np
@@ -7,17 +6,12 @@ import torch
 import pytest
 
 from qimpy import rc
-from qimpy.mpi import ProcessGrid
+from qimpy.mpi import get_process_grid
 from qimpy.transport.material import FermiSurface
 from ._fermi_surface import AngularBasis, RadialBasis
 from ._representation import _DeltaKReflector
 
 pytestmark = pytest.mark.mpi_skip  # All tests in this module are serial
-
-
-@cache
-def _pg() -> ProcessGrid:
-    return ProcessGrid("rk", (1, 1))
 
 
 def _make(
@@ -40,7 +34,7 @@ def _make(
         tau_ee=tau_ee,
         r_c=r_c,
         specularity=specularity,
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
 
 
@@ -291,7 +285,7 @@ def _make_cart(
         xi_max=6.0,
         cartesian=dict(dk=T / (3.0 * 1.5), local_te_rates=local_te_rates),
         ee_scattering=ee,
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
 
 
@@ -361,7 +355,7 @@ def _make_cart_closure(Nr=4, T=0.05, tau_ee=200.0):
         tau_ee=tau_ee,
         cartesian=dict(dk=T / (3.0 * 1.5), local_te_rates=False),
         residual_damping=True,
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
 
 
@@ -387,7 +381,7 @@ def test_residual_closure_vanishes_on_local_equilibrium() -> None:
         xi_max=6.0,
         tau_ee=200.0,
         cartesian=dict(dk=0.05 / 4.5, local_te_rates=False),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs_on.representation
     kD = 0.37 * rep._dk_grid * np.array([1.0, 0.61])
@@ -477,7 +471,7 @@ def test_cartesian_annulus_with_frame_polish() -> None:
         xi_max=6.0,
         tau_ee=200.0,
         cartesian=dict(dk=T / 4.5, annulus_xi=8.0, local_te_rates=False),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs.representation
     assert rep._annulus_on, "annulus did not engage: test is vacuous"
@@ -503,7 +497,7 @@ def test_residual_closure_off_is_bit_identical() -> None:
         xi_max=6.0,
         tau_ee=200.0,
         cartesian=dict(dk=0.05 / 4.5, local_te_rates=False),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs_off.representation
     torch.manual_seed(0)
@@ -743,7 +737,7 @@ def test_tau_ee_placeholder_physical_momentum_leak(Nr: int) -> None:
         tau_ee=tau_ee,
         r_c=np.inf,
         specularity=1.0,
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     w_r, xi = fs.radial.quad_w, fs.radial.xi
     arg = 1.0 + t * xi
@@ -779,7 +773,7 @@ def test_reflector_exact_at_grid_symmetric_angles(deg: float) -> None:
             k_max=0.0132557160008,
             n_k=28,
         ),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs.representation
     k = rep.k
@@ -818,7 +812,7 @@ def test_reflector_tilted_wall_error_is_bounded() -> None:
             k_max=0.0132557160008,
             n_k=224,
         ),
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs.representation
     k = rep.k
@@ -851,7 +845,7 @@ def test_modal_specular_rotation_is_exact_at_any_angle(deg: float) -> None:
         T=1.0,
         tau_p=np.inf,
         specularity=1.0,
-        process_grid=_pg(),
+        process_grid=get_process_grid("rk", (1, 1)),
     )
     rep = fs.representation
     th = fs.angular.theta.clone()
@@ -878,7 +872,7 @@ def test_modal_specular_rotation_is_exact_at_any_angle(deg: float) -> None:
 
 
 def test_cartesian_wall_preserves_occupancy_bounds() -> None:
-    pg = _pg()
+    pg = get_process_grid("rk", (1, 1))
     material = FermiSurface(
         process_grid=pg,
         kF=7.5e-3,
