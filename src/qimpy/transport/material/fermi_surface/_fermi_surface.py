@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from qimpy import log, rc, TreeNode
+from qimpy.math import ceildiv
 from qimpy.mpi import ProcessGrid, TaskDivision
 from qimpy.profiler import stopwatch
 from qimpy.io import CheckpointPath, CheckpointContext, InvalidInputException
@@ -217,7 +218,7 @@ class FermiSurface(Material):
 
         # modal bases (shared by both representations and the e-e operator)
         dtype = torch.get_default_dtype()
-        N_theta = -(-(2 * M_theta + 1) // 4) * 4  # even, multiple of 4, >= 2M+1
+        N_theta = ceildiv(2 * M_theta + 1, 4) * 4  # even, multiple of 4, >= 2M+1
         self.angular = AngularBasis(M_theta, n_quad=N_theta, dtype=dtype)
         self.radial = RadialBasis(Nr, T_temp=T, xi_max=xi_max, dtype=dtype)
 
