@@ -60,8 +60,8 @@ def make_fs(M_theta=8, Nr=1, ee=None, **kwargs):
     return FermiSurface(
         kF=KF,
         vF=KF / M_STAR,
-        M_theta=M_theta,
-        Nr=Nr,
+        n_theta=M_theta,
+        n_r=Nr,
         T=T0,
         process_grid=process_grid,
         ee_scattering=ee,
@@ -265,9 +265,9 @@ def test_cubic_vertex_energy_structured_vs_reference():
     from qimpy.transport.material.fermi_surface import RadialBasis
 
     M, Nr = 6, 2
-    rb = RadialBasis(Nr, T_temp=T0, xi_max=6.0)
+    rb = RadialBasis(Nr, T=T0, xi_max=6.0)
     xi_c = rb.xi.to(torch.float64).cpu()
-    Tfm = rb.T_from_modes.to(torch.float64).cpu()
+    Tfm = rb.from_modes.to(torch.float64).cpu()
     _fc = [torch.ones_like(xi_c), xi_c]
     _pe, _po = 2, 1
     while len(_fc) < Nr:
@@ -370,9 +370,9 @@ def test_quadratic_vertex_vs_reference():
     from qimpy.transport.material.fermi_surface import RadialBasis
 
     M, Nr = 4, 2
-    rb = RadialBasis(Nr, T_temp=T0, xi_max=6.0)
+    rb = RadialBasis(Nr, T=T0, xi_max=6.0)
     xi_c = rb.xi.to(torch.float64).cpu()
-    Tfm = rb.T_from_modes.to(torch.float64).cpu()
+    Tfm = rb.from_modes.to(torch.float64).cpu()
     _fc = [torch.ones_like(xi_c), xi_c]
     _pe, _po = 2, 1
     while len(_fc) < Nr:
@@ -499,7 +499,7 @@ def test_nonlinear_conservation():
             ),
         )
         dim = fs.angular.dim
-        Ttm = fs.radial.T_to_modes.to(torch.float64).cpu()
+        Ttm = fs.radial.to_modes.to(torch.float64).cpu()
         ones_c = Ttm @ torch.ones(Nr, dtype=torch.float64)
         t_ratio = T0 / E_F
         k_c = Ttm @ torch.sqrt(1.0 + t_ratio * fs.radial.xi.to(torch.float64).cpu())
@@ -551,14 +551,14 @@ def test_even_m_selection():
     def cubic_only(a):  # cubic term of a_dot, isolated by amplitude parity
         def nl(s):
             aa = s * a
-            a4 = aa.reshape(*aa.shape[:-1], fs.Nr, dim)
+            a4 = aa.reshape(*aa.shape[:-1], fs.n_r, dim)
             lin = -torch.einsum("cij,...jc->...ic", fs.ee_scattering.L_coeff, a4)
             return fs.ee_scattering.a_dot(aa) - lin.reshape(aa.shape)
 
         o1 = 0.5 * (nl(1.0) - nl(-1.0))
         o2 = 0.5 * (nl(2.0) - nl(-2.0))  # odd-parity stencil -> cubic
         cub = (o2 - 2.0 * o1) / 6.0
-        return cub.reshape(*a.shape[:-1], fs.Nr, dim)[..., 0, :]
+        return cub.reshape(*a.shape[:-1], fs.n_r, dim)[..., 0, :]
 
     # pure even field cos(2 phi) -> purely even cubic output (m=2 self, m=6
     # pumped); odd output channels are EXACTLY zero by the natural selection:
@@ -633,7 +633,7 @@ def test_exact_rates_radial_tower():
         assert torch.allclose(L[c], L[c].T, atol=1e-18)
         assert torch.linalg.eigvalsh(L[c]).min() > -1e-18
     # exact nulls in the code's discrete radial measure:
-    Ttm = fs.radial.T_to_modes.to(torch.float64).cpu()
+    Ttm = fs.radial.to_modes.to(torch.float64).cpu()
     ones_c = Ttm @ torch.ones(3, dtype=torch.float64)
     x_c = Ttm @ fs.radial.xi.to(torch.float64).cpu()
     t_ratio = T0 / E_F
@@ -851,7 +851,7 @@ def test_full_Cf_QUADRATIC_vs_unreduced_definition() -> None:
     )
     ee = fs.ee_scattering
     dim = fs.angular.dim
-    Nr = fs.Nr
+    Nr = fs.n_r
     psi_coeff = ee._radial_galerkin(T0)[0].cpu()
     w_occ = lambda x: 0.25 / torch.cosh(x / 2) ** 2
 
@@ -1231,7 +1231,7 @@ def test_matrix_free_vs_kernel_reference():
         """Dense nonlinear a_dot from the validated vertex kernels + the
         operator's Galerkin/null projection (the old dense apply, inline)."""
         fs = ee.fermi_surface
-        M = fs.M_theta
+        M = fs.n_theta
         psi_coeff, x_fine, P, Ginv, _ = ee._radial_galerkin(T0)
         psi_coeff, x_fine = psi_coeff.cpu(), x_fine.cpu()
         P, Ginv = P.cpu(), Ginv.cpu()
@@ -1256,7 +1256,7 @@ def test_matrix_free_vs_kernel_reference():
         qd = torch.einsum("lcxayb,...xa,...yb->...lc", V_quad, a4, a4)
         # kernels output the "-Phi_dot" convention; production folds +conv so
         # nl = +Phi_dot_NL -- negate here to mirror it:
-        return -(cub + qd).reshape(*a4.shape[:-2], fs.Nr * fs.angular.dim)
+        return -(cub + qd).reshape(*a4.shape[:-2], fs.n_r * fs.angular.dim)
 
     for M, Nr in ((3, 1), (3, 2), (4, 2)):
         dim = 2 * M + 1
@@ -1328,7 +1328,7 @@ def test_matrix_free_conservation():
             ),
         )
         dim = fs.angular.dim
-        Ttm = fs.radial.T_to_modes.to(torch.float64).cpu()
+        Ttm = fs.radial.to_modes.to(torch.float64).cpu()
         ones_c = Ttm @ torch.ones(Nr, dtype=torch.float64)
         t_ratio = T0 / E_F
         k_c = Ttm @ torch.sqrt(1.0 + t_ratio * fs.radial.xi.to(torch.float64).cpu())
@@ -1501,8 +1501,8 @@ def test_cartesian_local_te_rates():
         return FermiSurface(
             kF=1.0,
             vF=1.5,
-            M_theta=6,
-            Nr=1,
+            n_theta=6,
+            n_r=1,
             T=T,
             xi_max=6.0,
             cartesian=dict(dk=T / (3.0 * 1.5), local_te_rates=local),
@@ -1553,8 +1553,8 @@ def test_local_te_ensemble_exact():
         return FermiSurface(
             kF=1.0,
             vF=1.5,
-            M_theta=4,
-            Nr=1,
+            n_theta=4,
+            n_r=1,
             T=Tm,
             xi_max=6.0,
             ee_scattering=eed,
@@ -1918,7 +1918,7 @@ def _gamma_even(fs, slowest=True):
     """
     L = fs.ee_scattering.L_coeff.to(torch.float64).cpu()
     out = {}
-    for m in range(2, fs.M_theta + 1, 2):
+    for m in range(2, fs.n_theta + 1, 2):
         blk = L[2 * m - 1]
         sym = 0.5 * (blk + blk.T)
         ev = torch.linalg.eigvalsh(sym)
@@ -2029,8 +2029,8 @@ def test_te_rescale_fallback_is_a_leading_form_not_an_identity() -> None:
     ref = FermiSurface(
         kF=KF,
         vF=KF / M_STAR,
-        M_theta=4,
-        Nr=2,
+        n_theta=4,
+        n_r=2,
         T=T0 * te_fac,
         process_grid=_cached_pg("rk", (-1, 1)),
         ee_scattering=dict(**common),

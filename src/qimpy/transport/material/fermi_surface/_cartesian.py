@@ -28,7 +28,7 @@ class Cartesian(KRepresentation):
     vF: float
     m_star: float
     mu: float
-    T_temp: float
+    T: float
     xi_max: float
 
     @staticmethod
@@ -91,14 +91,14 @@ class Cartesian(KRepresentation):
         fs = fermi_surface
         self.fs = fs
         self.constraint_factors = None
-        if fs.tau_inv_p != 0.0 or fs.k_speed != 0.0:
+        if fs.tau_inv_p != 0.0 or fs.omega_c != 0.0:
             raise InvalidInputException(
                 "The Cartesian representation is drift-centred; the lab-frame "
                 "tau_p and cyclotron terms are unsupported.  Use tau_p=inf, r_c=inf "
                 "(microscopic ee only) or the delta-k representation."
             )
         self.kF, self.vF, self.m_star = fs.kF, fs.vF, fs.m_star
-        self.mu, self.T_temp, self.xi_max = fs.mu, fs.T_temp, fs.xi_max
+        self.mu, self.T, self.xi_max = fs.mu, fs.T, fs.xi_max
         self.local_te_rates = bool(local_te_rates)
         self.projection_iters = int(projection_iters)
         self.projection_tol = float(projection_tol)
@@ -111,7 +111,7 @@ class Cartesian(KRepresentation):
             k_max, n_k = self.recommended_grid(
                 fs.kF,
                 fs.vF,
-                fs.T_temp,
+                fs.T,
                 xi_max=fs.xi_max,
                 dmu_max=dmu_max,
                 kD_max=kD_max,
@@ -161,9 +161,7 @@ class Cartesian(KRepresentation):
                 r_in = float(
                     np.sqrt(
                         max(
-                            2
-                            * m_star
-                            * (self.mu - abs(dmu_max) - annulus_xi * self.T_temp),
+                            2 * m_star * (self.mu - abs(dmu_max) - annulus_xi * self.T),
                             0.0,
                         )
                     )
@@ -182,7 +180,7 @@ class Cartesian(KRepresentation):
                 act = act & ~frozen
                 wk0 = float(spin) * dk * dk / (2.0 * np.pi) ** 2
                 eps_full = k.square().sum(-1) / (2 * m_star)
-                f0_full = torch.special.expit(-(eps_full - self.mu) / self.T_temp)
+                f0_full = torch.special.expit(-(eps_full - self.mu) / self.T)
                 self._n_frozen = float(wk0 * f0_full[frozen].sum())
                 self._p_frozen = wk0 * (f0_full[frozen, None] * k[frozen]).sum(0).to(
                     dtype
@@ -274,12 +272,12 @@ class Cartesian(KRepresentation):
             except Exception:
                 self._fourier_fn, self._psi_fn = self._fourier, self._psi
         self._psi_coeff = self._radial_poly_coeffs(dtype)
-        self._ang_norm = torch.tensor(
-            [1.0 / (2 * np.pi)] + [1.0 / np.pi] * (2 * fs.M_theta),
-            dtype=dtype,
-            device=rc.device,
-        )
-        self._f0_lab = torch.special.expit(-(self.eps_k - self.mu) / self.T_temp)
+        self._ang_norm = torch.full_like(fs.angular.theta, 1 / np.pi)
+        self._ang_norm[0] *= 0.5  # correct zero frequency normalization
+        self._ang_norm[
+            fs.angular.m_max
+        ] *= 0.5  # correct Nyquist frequency normalization
+        self._f0_lab = torch.special.expit(-(self.eps_k - self.mu) / self.T)
         # Radial Gram.  The raw projection returns (G @ c) / T rather than the
         # operator contract's coefficients c of Phi = delta_f/(f0(1-f0)/T), so
         # apply_collision left-applies T * G^-1 and the reconstruction divides
@@ -330,17 +328,13 @@ class Cartesian(KRepresentation):
         # Angular layout: index 0 is m = 0, then (cos, sin) pairs at 2m-1, 2m,
         # so the harmonic of angular index c is m = (c + 1) // 2.  Used by the
         # residual closure, which may only touch even harmonics.
-        dim_t = self.fs.angular.dim
-        m_of_c = (np.arange(dim_t) + 1) // 2
-        self._even_m_flat = torch.as_tensor(
-            np.tile((m_of_c % 2 == 0).astype(float), self.fs.Nr),
-            dtype=dtype,
-            device=rc.device,
-        )
+        m_max = self.fs.angular.m_max
+        m = np.arange(self.fs.n_theta) % (m_max + 1)
+        self._even_m_flat = rc.from_np(np.tile((m % 2 == 0).astype(float), self.fs.n_r))
 
     # ---- radial polynomial evaluation at arbitrary xi (reuse the model's psi_n) ----
     def _radial_poly_coeffs(self, dtype) -> torch.Tensor:
-        Nr = self.fs.Nr
+        Nr = self.fs.n_r
         if Nr == 1:
             return torch.ones((1, 1), dtype=dtype, device=rc.device)
         xi_c = self.fs.radial.xi.cpu().numpy()
@@ -354,11 +348,11 @@ class Cartesian(KRepresentation):
                 cols.append(v**po)
                 po += 2
         F = np.stack(cols[:Nr], axis=-1)  # hybrid features [1, x, v^2, v, ...]
-        Tfm = self.fs.radial.T_from_modes.cpu().numpy()
+        Tfm = self.fs.radial.from_modes.cpu().numpy()
         return torch.as_tensor(np.linalg.solve(F, Tfm), dtype=dtype, device=rc.device)
 
     def _psi(self, xi: torch.Tensor) -> torch.Tensor:
-        Nr = self.fs.Nr
+        Nr = self.fs.n_r
         if Nr == 1:
             return torch.ones((*xi.shape, 1), dtype=xi.dtype, device=xi.device)
         v = torch.tanh(0.5 * xi)
@@ -372,16 +366,8 @@ class Cartesian(KRepresentation):
                 po += 2
         return torch.stack(cols[:Nr], dim=-1) @ self._psi_coeff
 
-    def _fourier(self, th: torch.Tensor) -> torch.Tensor:
-        """Real harmonics [1, cos t, sin t, cos 2t, sin 2t, ...] at each angle."""
-        M = self.fs.M_theta
-        m = torch.arange(1, M + 1, device=th.device, dtype=th.dtype)
-        mth = th.unsqueeze(-1) * m
-        cols = torch.empty((*th.shape, 2 * M + 1), dtype=th.dtype, device=th.device)
-        cols[..., 0] = 1.0
-        cols[..., 1::2] = torch.cos(mth)
-        cols[..., 2::2] = torch.sin(mth)
-        return cols
+    def _fourier(self, theta: torch.Tensor) -> torch.Tensor:
+        return self.fs.angular.get_transform(theta)
 
     # ---- local drifted-heated frame recovery from moments ----
     def _recover_frame(self, f: torch.Tensor):
@@ -391,7 +377,7 @@ class Cartesian(KRepresentation):
         E = torch.einsum("ck,k->c", f, self.eps_k) * w + self._E_frozen
         kD = p / n[:, None]
         E_rest = E - (kD.square().sum(-1) / (2 * self.m_star)) * n
-        Te = torch.full_like(n, self.T_temp)
+        Te = torch.full_like(n, self.T)
         mu = torch.full_like(n, self.mu)
         Te, mu = self._newton_TeMu(
             Te,
@@ -461,7 +447,7 @@ class Cartesian(KRepresentation):
             J = J + 1e-13 * float(J.diagonal(dim1=-2, dim2=-1).abs().mean()) * eye
             d = torch.linalg.solve(J, (tgt - cur).unsqueeze(-1))[..., 0]
             kD = kD + d[:, :2]
-            Te = (Te + d[:, 2]).clamp_min(0.05 * self.T_temp)
+            Te = (Te + d[:, 2]).clamp_min(0.05 * self.T)
             mu = mu + d[:, 3]
         return kD, Te, mu
 
@@ -484,7 +470,7 @@ class Cartesian(KRepresentation):
             r1 = n - nn
             r2 = E_rest - EE
             mu = mu + (J22 * r1 - J12 * r2) / det
-            Te = (Te + (-J21 * r1 + J11 * r2) / det).clamp_min(0.05 * self.T_temp)
+            Te = (Te + (-J21 * r1 + J11 * r2) / det).clamp_min(0.05 * self.T)
         return Te, mu
 
     # ---- collision: drift-centred projection -> model's modal_op -> reconstruct ----
@@ -494,15 +480,15 @@ class Cartesian(KRepresentation):
         df_lab = rho.reshape(-1, shape_in[-1])  # (C, Nk) delta-f about f0_lab
         C = df_lab.shape[0]
         out = torch.empty_like(df_lab)
-        dim = self.fs.angular.dim
-        Nr = self.fs.Nr
+        n_theta = self.fs.n_theta
+        n_r = self.fs.n_r
         Nk = df_lab.shape[-1]
         k = self.k
         f0_lab = self._f0_lab
         # +10 rows when the residual closure is on: the parity reflection builds
         # (c,Nk,2) grid coordinates plus per-corner index/weight temporaries.
         closure_rows = 14 if self.fs.gamma_residual() is not None else 0
-        bytes_per_row = Nk * (2 * dim + 3 * Nr + 12 + closure_rows) * 8
+        bytes_per_row = Nk * (2 * n_theta + 3 * n_r + 12 + closure_rows) * 8
         chunk = max(
             1, min(self.cell_chunk, int(self.mem_budget_gb * (2**30) / bytes_per_row))
         )
@@ -570,12 +556,12 @@ class Cartesian(KRepresentation):
                     )
 
                 def rec(am):  # (c,Nr,dim) -> (c,Nk)
-                    return (weq / self.T_temp) * (
+                    return (weq / self.T) * (
                         psi * torch.bmm(fou, am.transpose(1, 2))
                     ).sum(-1)
 
                 def prec(r):
-                    return self.T_temp * torch.einsum("nm,cmd->cnd", self._Ginv_band, r)
+                    return self.T * torch.einsum("nm,cmd->cnd", self._Ginv_band, r)
 
                 # MEASURED with the frame PINNED (so _recover_frame cannot
                 # contaminate the number): ||Pi - I|| tracks the solver
@@ -617,8 +603,8 @@ class Cartesian(KRepresentation):
                     self._proj_it = it
                     self._proj_resid = float(r.abs().amax() / scale)
             else:
-                a = self.T_temp * torch.einsum("nm,cmd->cnd", self._Ginv_band, a)
-            a = a.reshape(hi - lo, Nr * dim)
+                a = self.T * torch.einsum("nm,cmd->cnd", self._Ginv_band, a)
+            a = a.reshape(hi - lo, n_r * n_theta)
             # Local-T_e rates: hand the per-cell recovered T_e to the modal
             # operator -- evaluated EXACTLY there when the model has a local_te
             # ensemble (analytic T_e^2 T^(1-d) prefactors x tabulated shape),
@@ -683,10 +669,10 @@ class Cartesian(KRepresentation):
                     r = r + wt * torch.gather(df_loc, -1, idx)
                 dfl_even = 0.5 * (df_loc + r)
                 a_dot = a_dot + g_col * (a * self._even_m_flat)
-            ad = a_dot.reshape(hi - lo, Nr, dim)
+            ad = a_dot.reshape(hi - lo, n_r, n_theta)
             B = torch.bmm(fou, ad.transpose(1, 2))
             # w_eq_RB = f0(1-f0)/T -- the /T completes the contract (audit bug 2):
-            ddf = (weq / self.T_temp) * (psi * B).sum(-1)
+            ddf = (weq / self.T) * (psi * B).sum(-1)
             if g_res is not None:
                 ddf = ddf - g_col * dfl_even
             out[lo:hi] = self._project_conserved(ddf, kp, eps_p, weq)
@@ -841,12 +827,12 @@ class _CartesianContactor:
             kD = -(rep.m_star * vD) * n  # inward drift
             kp = rep.k[None] - kD[:, None]
             eps_p = kp.square().sum(-1) / (2 * rep.m_star)
-            f_res = torch.special.expit(-(eps_p - (rep.mu + dmu)) / rep.T_temp)
+            f_res = torch.special.expit(-(eps_p - (rep.mu + dmu)) / rep.T)
             self.df_contact = f_res - f0[None, :]
         else:
             k_dot_n = rep.k @ n.t()  # (Nk, Nsel)
             self.df_contact = (
-                (dmu - vD * k_dot_n.t()) * (f0 * (1.0 - f0))[None, :] / rep.T_temp
+                (dmu - vD * k_dot_n.t()) * (f0 * (1.0 - f0))[None, :] / rep.T
             )
 
     def __call__(self, t: float) -> torch.Tensor:
@@ -1057,12 +1043,12 @@ class _CartesianReflector:
             ) + float(rep._k_min)
             GX, GY = torch.meshgrid(gx, gx, indexing="ij")
             eps_g = (GX.square() + GY.square()).reshape(-1) / (2 * rep.m_star)
-            f0g = torch.special.expit(-(eps_g - rep.mu) / rep.T_temp)
+            f0g = torch.special.expit(-(eps_g - rep.mu) / rep.T)
             k_out_mag = k.norm(dim=-1)  # |k| of the OUTPUT
             eps_o = k_out_mag.square() / (2 * rep.m_star)
-            f0_target = torch.special.expit(-(eps_o - rep.mu) / rep.T_temp)[
-                None
-            ].expand(self.Ns, -1)
+            f0_target = torch.special.expit(-(eps_o - rep.mu) / rep.T)[None].expand(
+                self.Ns, -1
+            )
             W = torch.stack(wts, 0)  # (S, Ns, Nk)
             F = torch.stack([f0g[i] for i in idx_full], 0)  # f0 at the corners
             one = torch.ones_like(W)
@@ -1146,9 +1132,7 @@ class _CartesianReflector:
             self._f0i = rep._f0_lab
         else:
             tref = 1.0 if mode == "lab" else float(mode[1:])
-            xi_r = (k.square().sum(-1) / (2 * rep.m_star) - rep.mu) / (
-                rep.T_temp * tref
-            )
+            xi_r = (k.square().sum(-1) / (2 * rep.m_star) - rep.mu) / (rep.T * tref)
             fr = torch.special.expit(-xi_r)
             self._W = (fr * (1.0 - fr)).clamp(min=1e-300)
 
@@ -1168,7 +1152,7 @@ class _CartesianReflector:
         self._w_out = vn.abs() * (vn > 0)
         eps = k.square().sum(-1) / (2 * rep.m_star)
         self._vna = vn.abs() / vmax  # |v.n|, scaled
-        self._eps = ((eps - rep.mu) / (rep.xi_max * rep.T_temp))[None].expand_as(
+        self._eps = ((eps - rep.mu) / (rep.xi_max * rep.T))[None].expand_as(
             self._vt
         )  # CENTRED: eps ~ mu on
         #   the shell, so the raw energy row is nearly parallel to the constant
@@ -1205,7 +1189,7 @@ class _CartesianReflector:
         # T_w = T is the largest width that works, and it also conditions
         # BETTER than the flat basis (cond G4 91.8 vs 1696), contrary to the
         # worry that a one-cell-wide shell would make eps degenerate with 1.
-        fw = torch.special.expit(-(eps - rep.mu) / rep.T_temp)
+        fw = torch.special.expit(-(eps - rep.mu) / rep.T)
         env = (fw * (1.0 - fw))[None].expand_as(self._vt)
         env = env / env.max().clamp(min=1e-300)
         infl = (vn < 0).to(v.dtype) * env

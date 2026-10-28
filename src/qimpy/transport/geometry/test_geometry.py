@@ -11,7 +11,7 @@ from qimpy.io import log_config
 def test_geometry():
 
     transport = Transport(
-        fermi_surface=dict(kF=1.5, vF=0.8, M_theta=3),
+        fermi_surface=dict(kF=1.5, vF=0.8, n_theta=6),
         geometry=dict(
             contacts={}, mesh=dict(rect=dict(Lx=1.1, Ly=0.9, Nx=33, Ny=27, contacts={}))
         ),

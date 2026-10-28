@@ -1,23 +1,3 @@
-"""FermiSurface: the physical model (a degenerate 2DEG Fermi liquid with e-e
-collisions), independent of its numerical k-representation.
-
-The model owns the physics -- kF, vF, m*, E_F, the angular/radial modal bases,
-the microscopic e-e operator (EEScattering), the phenomenological relaxation
-rates and the cyclotron generator.  The k-space discretization is a swappable
-child `representation` (add_child_one_of):
-
-    representation: {delta_k: {}}        # Fermi-circle / small-drift (default)
-    representation: {cartesian: {...}}   # fixed 2D k-grid, large-drift full-f
-
-The collision is applied representation-agnostically:
-    a = rep.to_modes(rho);  a_dot = -rates*a + ee.a_dot(a) + k_speed*G(a);
-    rho_dot = rep.from_modes(a_dot)
-wrapped as `rep.apply_collision(rho, self._modal_collision)`.  This works for
-both backends because `EEScattering.a_dot` is a pure modal operator, agnostic to
-whether the coefficients came from the lab-centred tensor transform (delta-k) or
-the drift-centred per-cell projection (cartesian).
-"""
-
 from __future__ import annotations
 from typing import Callable, Optional, Union
 from dataclasses import dataclass
@@ -36,145 +16,37 @@ from ._representation import DeltaK, KRepresentation
 from ._cartesian import Cartesian
 
 
-# ----------------------------------------------------------------------------
-# Angular basis: real Fourier on [0, 2*pi), nodal storage at midpoint nodes
-# ----------------------------------------------------------------------------
-class AngularBasis:
-    """Real Fourier transforms with nodal (delta-k) storage.
+class FermiSurface(Material):
+    """Model isotropic 2D electron-gas material.
 
-    Mode ordering ``(a_0, a_1, b_1, ..., a_M, b_M)`` for ``2M+1`` modes; nodes are
-    the midpoint grid ``theta_q = 2*pi*(q+1/2)/Nq``, symmetric under
-    ``theta->-theta`` and (even Nq) ``theta->pi-theta`` -- the wall reflections.
+    Supports Brillouin zone sampling in cylindrical coordinates in the vicinity of
+    the Fermi circle (`delta_k`, default), or Cartesian (`cartesian`) for large drift.
     """
 
-    def __init__(self, M: int) -> None:
-        self.M = M
-        self.dim = 2 * M
-        theta = (np.arange(self.dim)) * (2 * np.pi / self.dim)
-        m_theta = np.outer(theta, np.arange(M + 1))
-        transform = np.hstack((np.cos(m_theta), np.sin(m_theta[:, 1:M])))
-        inv_transform = transform.T * (2 / self.dim)  # cos, sin normalized
-        inv_transform[0] *= 0.5  # correct zero frequency normalization
-        inv_transform[M] *= 0.5  # correct Nyquist frequency normalization
-        # Derivative operator:
-        G = np.zeros((self.dim, self.dim))
-        for m in range(1, M):
-            G[m, m + M] = -m
-            G[m + M, m] = +m
-        self.theta = rc.from_np(theta)
-        self.T_from_modes = rc.from_np(transform)
-        self.T_to_modes = rc.from_np(inv_transform)
-        self.G = rc.from_np(G)
-
-
-# ----------------------------------------------------------------------------
-# Radial basis: polynomials in xi orthonormal under  w(xi) = (1/4T) sech^2(xi/2)
-# ----------------------------------------------------------------------------
-class RadialBasis:
-    """Hybrid radial basis orthonormal under ``w(xi) = (1/4T) sech^2(xi/2)``:
-    span {1, xi} (mass and energy shapes EXACT) completed by tanh-powers
-    ``v^p``, ``v = tanh(xi/2)``, in parity-interleaved order
-    ``[1, xi, v^2, v, v^4, v^3, ...]`` so ``psi_n(-xi) = (-1)^n psi_n(xi)``.
-    Orthonormalized against a fine bare-xi Gauss rule (continuum == discrete
-    orthonormality; ``T_to_modes = inv(T_from_modes)``), collocated at
-    Gauss-Legendre nodes in ``u = v/tanh(xi_max/2)``.
-    ``Nr == 1`` collapses to the identity at ``xi = 0`` (pure Fermi circle)."""
-
-    def __init__(
-        self,
-        Nr: int,
-        T_temp: float = 1.0,
-        xi_max: float = 6.0,
-        dtype: torch.dtype = torch.float64,
-        device: torch.device | None = None,
-    ) -> None:
-        self.Nr = Nr
-        self.T_temp = T_temp
-        self.xi_max = xi_max
-        dev = device or rc.device
-        if Nr == 1:
-            self.xi = torch.zeros(1, dtype=dtype, device=dev)
-            self.quad_w = torch.ones(1, dtype=dtype, device=dev)
-            self.T_from_modes = torch.ones((1, 1), dtype=dtype, device=dev)
-            self.T_to_modes = torch.ones((1, 1), dtype=dtype, device=dev)
-            return
-        # Collocation: Gauss-Legendre in u = tanh(xi/2)/u_lim (tanh-clustered
-        # nodes; measure w_eq dxi = (u_lim/2T) du is exactly constant in u).
-        x_std, w_std = np.polynomial.legendre.leggauss(Nr)
-        u_lim = np.tanh(0.5 * xi_max)
-        xi = 2.0 * np.arctanh(u_lim * x_std)
-        w_q = (u_lim / (2.0 * T_temp)) * w_std
-
-        def feats(x):
-            # normalized hybrid features [1, x/xi_max, u^2, u, u^4, u^3, ...]
-            u = np.tanh(0.5 * x) / u_lim
-            cols = [np.ones_like(x), x / xi_max]
-            pe, po = 2, 1
-            while len(cols) < Nr:
-                cols.append(u**pe)
-                pe += 2
-                if len(cols) < Nr:
-                    cols.append(u**po)
-                    po += 2
-            return np.stack(cols[:Nr], axis=-1)
-
-        # Orthonormalize against a FINE bare-xi Gauss rule (node-QR does not
-        # transfer to continuum orthonormality for the hybrid span).
-        xf, wf = np.polynomial.legendre.leggauss(128)
-        xf = xi_max * xf
-        wf = (xi_max * wf) * ((1.0 / (4.0 * T_temp)) / np.cosh(0.5 * xf) ** 2)
-        A = feats(xf) * np.sqrt(wf)[:, None]
-        _Q, R = np.linalg.qr(A)
-        sgn = np.sign(np.diag(R))
-        sgn[sgn == 0] = 1.0
-        R = sgn[:, None] * R
-        C = np.linalg.solve(R, np.eye(Nr))  # psi = feats(.) @ C
-        Tfm = feats(xi) @ C  # psi at the nodes
-        Ttm = np.linalg.inv(Tfm)  # exact round trip
-        G_cont = (A @ C).T @ (A @ C)  # continuum Gram (fine rule)
-        err = max(
-            float(np.max(np.abs(Ttm @ Tfm - np.eye(Nr)))),
-            float(np.max(np.abs(G_cont - np.eye(Nr)))),
-        )
-        if err > 1e-8:
-            raise RuntimeError(f"RadialBasis orthonormality failed (err={err:.2e})")
-        self.xi = torch.as_tensor(xi, dtype=dtype, device=dev)
-        self.quad_w = torch.as_tensor(w_q, dtype=dtype, device=dev)
-        self.T_from_modes = torch.as_tensor(Tfm, dtype=dtype, device=dev)
-        self.T_to_modes = torch.as_tensor(Ttm, dtype=dtype, device=dev)
-
-
-# ----------------------------------------------------------------------------
-# FermiSurface model
-# ----------------------------------------------------------------------------
-class FermiSurface(Material):
-    """Degenerate-2DEG Fermi-liquid transport model; the k-representation is a
-    swappable child (`delta_k` default, or `cartesian` for large drift)."""
-
-    kF: float
-    vF: float
-    m_star: float
-    mu: float
-    M_theta: int
-    Nr: int
-    T_temp: float
-    xi_max: float
-    tau_inv_p: float
-    tau_inv_ee: float
-    r_c: float
-    specularity: float
-    k_speed: float
-    angular: AngularBasis
-    radial: RadialBasis
-    representation: KRepresentation
+    kF: float  #: Fermi wave-vector
+    vF: float  #: Fermi velocity
+    m_star: float  #: Effective mass
+    mu: float  #: Chemical potential
+    n_theta: int  #: Number of azimuthal k-points and angular modes
+    n_r: int  #: Number of radial k-points and modes
+    T: float  #: Temperature
+    xi_max: float  #: Maximum (E - Ef)/T sampled radially
+    tau_inv_p: float  #: Inverse momentum-relaxation time
+    tau_inv_ee: float  #: Inverse momentum-conserving e-e scattering time
+    r_c: float  #: Cyclotron radius, finite if magentic field present
+    specularity: float  #: Surface specularity
+    omega_c: float  #: Fermi circle rotation frequnecy due to magnetic field
+    angular: AngularBasis  #: angular basis set by `n_theta`
+    radial: RadialBasis  #: radial basis set by `n_r` and `xi_max`.
+    representation: KRepresentation  #: underlying Brillouin-zone sampling method
 
     def __init__(
         self,
         *,
         kF: float,
         vF: float,
-        M_theta: int,
-        Nr: int = 1,
+        n_theta: int,
+        n_r: int = 1,
         T: float = 1.0,
         xi_max: float = 6.0,
         tau_p: float = np.inf,
@@ -189,21 +61,25 @@ class FermiSurface(Material):
         checkpoint_in: CheckpointPath = CheckpointPath(),
     ) -> None:
         super().__init__()
-        self.kF, self.vF = kF, vF
+        self.kF = kF
+        self.vF = vF
         self.m_star = kF / vF
         self.mu = 0.5 * kF * vF  # E_F (degenerate)
-        self.M_theta, self.Nr = M_theta, Nr
-        self.T_temp, self.xi_max = T, xi_max
+        if n_theta % 2:
+            raise InvalidInputException(f"{n_theta=} is not even")
+        self.n_theta = n_theta
+        self.n_r = n_r
+        self.T = T
+        self.xi_max = xi_max
         self.r_c = r_c
         self.tau_inv_p = 1.0 / tau_p
         self.tau_inv_ee = 1.0 / tau_ee
         self.specularity = specularity
-        self.k_speed = (vF / r_c) if np.isfinite(r_c) else 0.0
+        self.omega_c = (vF / r_c) if np.isfinite(r_c) else 0.0
 
         # modal bases (shared by both representations and the e-e operator)
-        dtype = torch.get_default_dtype()
-        self.angular = AngularBasis(M_theta)
-        self.radial = RadialBasis(Nr, T_temp=T, xi_max=xi_max, dtype=dtype)
+        self.angular = AngularBasis(n_theta)
+        self.radial = RadialBasis(n_r, T=T, xi_max=xi_max)
 
         # k-representation (builds the grid; delta-k is the default first option)
         self.add_child_one_of(
@@ -236,17 +112,16 @@ class FermiSurface(Material):
             )
         self.v = rep.v  # transport velocity
 
-        # phenomenological per-mode collision rates in flattened (n_r, m) ordering
-        ang = np.zeros(self.angular.dim)
-        ang[1:] = self.tau_inv_p + self.tau_inv_ee  # all non-zero modes
-        ang[1] = ang[self.M_theta + 1] = self.tau_inv_p  # net momentum modes (m = 1)
-        rad = np.zeros(Nr)
-        rad[1:] = self.tau_inv_ee
-        rates = ang[None, :] + rad[:, None]
+        # Phenomenological per-mode collision rates in flattened (n_r, m) ordering
+        angular = np.zeros(self.n_theta)
+        m_max = self.angular.m_max
+        angular[1:] = self.tau_inv_p + self.tau_inv_ee  # all non-zero modes
+        angular[1] = angular[m_max + 1] = self.tau_inv_p  # net momentum modes (m = 1)
+        radial = np.zeros(n_r)
+        radial[1:] = self.tau_inv_ee
+        rates = angular[None, :] + radial[:, None]
         rates[0, 0] = 0.0  # particle conservation
-        self.rates_modal = torch.as_tensor(
-            rates.reshape(-1), dtype=self.v.dtype, device=rc.device
-        )
+        self.rates_modal = rc.from_np(rates.flatten())
 
         # microscopic e-e collisions (replaces the tau_ee placeholder)
         local_te = None
@@ -291,9 +166,7 @@ class FermiSurface(Material):
             self._ee_bary_w = torch.as_tensor(wj, dtype=torch.float64, device=rc.device)
             self._ee_fac_lim = (fmin, fmax)
             self._ee_ensemble = [
-                EEScattering(
-                    fermi_surface=self, T_build=self.T_temp * f, **ee_scattering
-                )
+                EEScattering(fermi_surface=self, T_build=self.T * f, **ee_scattering)
                 for f in fac
             ]
 
@@ -346,19 +219,19 @@ class FermiSurface(Material):
         every other e-e rate) and the phenomenological part (constant, matching
         how tau_p/tau_ee are handled in :meth:`_modal_collision`).
         """
-        M = self.M_theta
+        m_max = self.angular.m_max
         # The rate must be read at an EVEN harmonic.  Odd harmonics are gated to
         # zero at leading order (K_m = 0 for odd m, _kernels.K_table) and are
         # only weakly relaxed by the exact operator, so an odd M_theta would
         # read gamma ~ 0 and silently disable the closure.
-        m_top = M - (M % 2)
+        m_top = m_max - (m_max % 2)
         if m_top < 2:
             raise InvalidInputException(
                 "residual_damping requires M_theta >= 2 (the closure rate is "
                 "read at the top EVEN harmonic; odd harmonics do not relax at "
                 "leading order)"
             )
-        if self.Nr < 2:
+        if self.n_r < 2:
             raise InvalidInputException(
                 "residual_damping requires Nr >= 2: at Nr = 1 the radial span "
                 "is {1}, so the ENERGY shape xi itself falls in the residual "
@@ -372,9 +245,9 @@ class FermiSurface(Material):
                 "representation; the delta-k representation stores the state "
                 "modally, where truncation genuinely removes the modes."
             )
-        c_top = 2 * m_top - 1  # cos block of m_top
+        c_top = m_top  # cosine index corresponding to m_top
         # Phenomenological: diagonal, take the slowest radial channel at m_top.
-        rates = self.rates_modal.reshape(self.Nr, self.angular.dim)
+        rates = self.rates_modal.reshape(self.n_r, self.n_theta)
         self._gamma_res_phen = float(rates[:, c_top].min())
         # Microscopic: L_coeff is block-diagonal in the harmonic and a dense
         # (Nr, Nr) matrix over radial modes, in decay form (a_dot = -L @ a).
@@ -394,7 +267,7 @@ class FermiSurface(Material):
                     "be very weak.  Check M_theta / Nr."
                 )
         log.info(
-            f"Residual closure at m > {M}: gamma_res = "
+            f"Residual closure at m > {m_max}: gamma_res = "
             f"{self._gamma_res_ee + self._gamma_res_phen:.4g} "
             f"(e-e {self._gamma_res_ee:.4g} + phenomenological "
             f"{self._gamma_res_phen:.4g}), read at m={m_top}"
@@ -418,7 +291,7 @@ class FermiSurface(Material):
             return None
         if te is None:
             return self._gamma_res_ee + self._gamma_res_phen
-        s2 = (te / self.T_temp) ** 2
+        s2 = (te / self.T) ** 2
         return self._gamma_res_ee * s2 + self._gamma_res_phen
 
     def __getattr__(self, name):
@@ -457,7 +330,7 @@ class FermiSurface(Material):
         (Per-node null projectors use their own sqrt(1+t_i xi) momentum
         covector; the O(t) covector mismatch of the mixture is absorbed by the
         representation's exact conservation projection downstream.)"""
-        T = self.T_temp
+        T = self.T
         x = (te.to(torch.float64) / T).clamp(*self._ee_fac_lim)  # (cells,)
         d = x[:, None] - self._ee_fac[None, :]  # (cells, N)
         exact = d.abs() < 1e-12
@@ -465,8 +338,7 @@ class FermiSurface(Material):
         w = self._ee_bary_w[None, :] / d
         w = torch.where(exact.any(-1, keepdim=True), exact.to(w.dtype), w)
         w = w / w.sum(-1, keepdim=True)  # (cells, N)
-        Nr, dim = self.Nr, self.angular.dim
-        a4 = a.reshape(*a.shape[:-1], Nr, dim)
+        a4 = a.reshape(*a.shape[:-1], self.n_r, self.n_theta)
         out = torch.zeros_like(a)
         for i, ee in enumerate(self._ee_ensemble):
             Ti = float(self._ee_fac[i]) * T
@@ -498,14 +370,13 @@ class FermiSurface(Material):
             else:
                 ee_term = self.ee_scattering.a_dot(a)
                 if te is not None:
-                    s2 = (te.to(ee_term.dtype) / self.T_temp).unsqueeze(-1) ** 2
+                    s2 = (te.to(ee_term.dtype) / self.T).unsqueeze(-1) ** 2
                     ee_term = ee_term * s2
                 a_dot = a_dot + ee_term
-        if self.k_speed:
-            Nr, dim_t = self.Nr, self.angular.dim
-            a4 = a.reshape(*a.shape[:-1], Nr, dim_t)
-            Ga4 = torch.einsum("dc,...nc->...nd", self.angular.G, a4)
-            a_dot = a_dot + self.k_speed * Ga4.reshape(*a.shape)
+        if self.omega_c:
+            a4 = a.reshape(*a.shape[:-1], self.n_r, self.n_theta)
+            Ga4 = torch.einsum("dc,...nc->...nd", self.angular.derivative, a4)
+            a_dot = a_dot + self.omega_c * Ga4.reshape(*a.shape)
         return a_dot
 
     def gamma_max(self) -> float:
@@ -534,7 +405,7 @@ class FermiSurface(Material):
     def rho_dot(self, rho: torch.Tensor, t: float, patch_id: int) -> torch.Tensor:
         if (
             self.rates_modal.abs().sum() == 0
-            and self.k_speed == 0.0
+            and self.omega_c == 0.0
             and self.ee_scattering is None
         ):
             return torch.zeros_like(rho)  # ballistic, no field
@@ -575,13 +446,126 @@ class FermiSurface(Material):
     ) -> list[str]:
         a = cp_path.attrs
         a["kF"], a["vF"] = self.kF, self.vF
-        a["M_theta"], a["Nr"] = self.M_theta, self.Nr
-        a["T"], a["xi_max"] = self.T_temp, self.xi_max
+        a["M_theta"], a["Nr"] = self.n_theta, self.n_r
+        a["T"], a["xi_max"] = self.T, self.xi_max
         a["tau_p"] = (1.0 / self.tau_inv_p) if self.tau_inv_p else np.inf
         a["tau_ee"] = (1.0 / self.tau_inv_ee) if self.tau_inv_ee else np.inf
         a["r_c"], a["specularity"] = self.r_c, self.specularity
         a["residual_damping"] = bool(self._gamma_res_ee or self._gamma_res_phen)
         return list(a.keys())
+
+
+class AngularBasis:
+    """Real Fourier basis for azimuthal angle.
+    Modes are cosine for m = 0, 1, ..., m_max, followed by sine for 1, ..., m_max - 1,
+    where m_max = n_theta / 2 is the magnitude of m of the Nyquist component.
+    """
+
+    n_theta: int  #: Number of angular nodes and modes (must be even)
+    theta: torch.Tensor  #: Evenly spaced quadrature nodes on [0, 2 pi)
+    from_modes: torch.Tensor  #: Transform to modes (modes in columns)
+    to_modes: torch.Tensor  #: Transform to modes (modes in rows)
+    derivative: torch.Tensor  #: Derivative operator in modal basis.
+
+    def __init__(self, n_theta: int) -> None:
+        assert n_theta % 2 == 0
+        self.n_theta = n_theta
+        self.theta = torch.arange(n_theta) * (2 * np.pi / n_theta)
+        self.from_modes = self.get_transform(self.theta)
+
+        # Inverse transform:
+        m_max = self.m_max
+        self.to_modes = self.from_modes.T * (1 / m_max)  # cos, sin normalized
+        self.to_modes[0] *= 0.5  # correct zero frequency normalization
+        self.to_modes[m_max] *= 0.5  # correct Nyquist frequency normalization
+
+        # Initialize derivative operator:
+        self.derivative = torch.zeros_like(self.from_modes)
+        m = torch.arange(m_max, dtype=self.derivative.dtype, device=rc.device)
+        self.derivative.diagonal(m_max)[:] = -m
+        self.derivative.diagonal(-m_max)[:] = m
+
+    @property
+    def m_max(self) -> int:
+        return self.n_theta // 2
+
+    def get_transform(self, theta: torch.Tensor) -> torch.Tensor:
+        m_max = self.m_max
+        m_theta = theta[..., None] * torch.arange(m_max + 1, device=rc.device)
+        return torch.cat((m_theta.cos(), m_theta[..., 1:m_max].sin()), dim=-1)
+
+
+class RadialBasis:
+    """Radial basis orthonormal with Fermi-function-derivative weights.
+    Modes are sorted as 1, xi, v^2, v, v^4, v^3, ..., interleaved in parity,
+    where xi = (E - Ef)/T is the dimensionless radial coordinate, and orthonormalized
+    with a Gauss-Legendre quadrature. Note that n_r = 1 samples just the Fermi circle.
+    """
+
+    n_r: int  #: Number of radial nodes and modes
+    xi: torch.Tensor  #: Radial quadrature nodes on (E - Ef)/T space
+    w_xi: torch.Tensor  #: Radial integration weights
+    from_modes: torch.Tensor  #: Transform to modes (modes in columns)
+    to_modes: torch.Tensor  #: Transform to modes (modes in rows)
+
+    def __init__(
+        self,
+        n_r: int,
+        T: float = 1.0,
+        xi_max: float = 6.0,
+    ) -> None:
+        self.n_r = n_r
+        self.T = T
+        self.xi_max = xi_max
+        if n_r == 1:
+            self.xi = torch.zeros(1, device=rc.device)
+            self.w_xi = torch.ones(1, device=rc.device)
+            self.from_modes = torch.ones((1, 1), device=rc.device)
+            self.to_modes = torch.ones((1, 1), device=rc.device)
+            return
+
+        # Collocation: Gauss-Legendre in u = tanh(xi/2)/u_max
+        x_std, w_std = np.polynomial.legendre.leggauss(n_r)
+        u_max = np.tanh(0.5 * xi_max)
+        xi = 2.0 * np.arctanh(u_max * x_std)
+        w_xi = (u_max / (2.0 * T)) * w_std
+
+        def get_basis(xi: np.ndarray) -> np.ndarray:
+            """Un-normalized basis functions: [1, x/xi_max, u^2, u, u^4, u^3, ...]"""
+            u = np.tanh(0.5 * xi) / u_max
+            cols = [np.ones_like(xi), xi / xi_max]
+            pe, po = 2, 1
+            while len(cols) < n_r:
+                cols.append(u**pe)
+                pe += 2
+                if len(cols) < n_r:
+                    cols.append(u**po)
+                    po += 2
+            return np.stack(cols[:n_r], axis=-1)
+
+        # Orthonormalize against a fine bare-xi Gauss quadrature:
+        xf, wf = np.polynomial.legendre.leggauss(128)
+        xf = xi_max * xf
+        wf = (xi_max * wf) * ((1.0 / (4.0 * T)) / np.cosh(0.5 * xf) ** 2)
+        A = get_basis(xf) * np.sqrt(wf)[:, None]
+        _Q, R = np.linalg.qr(A)
+        sign = np.sign(np.diag(R))
+        sign[sign == 0] = 1.0
+        R = sign[:, None] * R
+        C = np.linalg.solve(R, np.eye(n_r))  # psi = feats(.) @ C
+        transform = get_basis(xi) @ C  # psi at the nodes
+        inv_transform = np.linalg.inv(transform)
+        metric = (A @ C).T @ (A @ C)
+        err = max(
+            float(np.max(np.abs(inv_transform @ transform - np.eye(n_r)))),
+            float(np.max(np.abs(metric - np.eye(n_r)))),
+        )
+        if err > 1e-8:
+            raise RuntimeError(f"RadialBasis orthonormality failed (err={err:.2e})")
+        self.xi = rc.from_np(xi)
+        self.w_xi = rc.from_np(w_xi)
+        self.from_modes = rc.from_np(transform)
+        self.to_modes = rc.from_np(inv_transform)
 
 
 def wrap_dense_reflector(

@@ -1,8 +1,8 @@
 fermi_surface:
   kF: 1.0
   vF: 1.0
-  M_theta: 16
-  Nr: 1
+  n_theta: 32
+  n_r: 1
   tau_p: .inf
   tau_ee: .inf
   r_c: .inf

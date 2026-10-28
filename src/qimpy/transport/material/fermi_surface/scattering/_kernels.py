@@ -22,6 +22,7 @@ non-integrable at alpha = pi); odd harmonics do not relax at leading
 order and their entries are gated to zero here.  All inputs/outputs in
 Hartree atomic units (hbar = kB = 1).
 """
+
 from __future__ import annotations
 from typing import Callable, Optional, Sequence
 
@@ -222,9 +223,7 @@ def exact_collision_reference(
             * wphi[None, None, None, :]
         ) * (T**2)
 
-        acc = torch.zeros(
-            (X1.shape[0], len(x2), len(x3), len(beta)), **dd
-        )
+        acc = torch.zeros((X1.shape[0], len(x2), len(x3), len(beta)), **dd)
         for sgn in (+1.0, -1.0):
             phi2 = phiP + sgn * dlt
             k4x = Px + k2 * torch.cos(phi2)
@@ -252,12 +251,8 @@ def exact_collision_reference(
             else:
                 f1, f2 = f1_0 + d1, f2_0 + d2
                 f3, f4 = f3_0 + d3, f4_0 + d4
-                bmf = f3 * f4 * (1 - f1) * (1 - f2) - f1 * f2 * (1 - f3) * (
-                    1 - f4
-                )
-            acc = acc + torch.where(
-                root_ok, Msq * jac * bmf, torch.zeros_like(jac)
-            )
+                bmf = f3 * f4 * (1 - f1) * (1 - f2) - f1 * f2 * (1 - f3) * (1 - f4)
+            acc = acc + torch.where(root_ok, Msq * jac * bmf, torch.zeros_like(jac))
         out[sl] = pref * (wt * acc).sum(dim=(1, 2, 3))
     return out
 
@@ -356,8 +351,7 @@ def unreduced_collision_reference(
         # sigma = 0.3, X = 18 the peak is 0.183 rad wide and n_phi = 448
         # (13.0 nodes across it) is converged to 0.2 %, 224 (6.5) is 3.5 % low
         # and 112 (3.3) is 18 % low.
-        n_phi = 2 * int(np.ceil(
-            np.pi / (0.07 * np.sqrt(2 * sigma / (xi_cut - lo)))))
+        n_phi = 2 * int(np.ceil(np.pi / (0.07 * np.sqrt(2 * sigma / (xi_cut - lo)))))
 
     # x2: uniform (trapezoid) to resolve the Gaussian-shell peak; x3: Gauss-
     # Legendre; phi2, phi3: uniform periodic (spectral for the smooth angles):
@@ -418,9 +412,7 @@ def unreduced_collision_reference(
                 sigma * np.sqrt(2 * np.pi)
             )
             band = (1.0 + t * x4) > 0.05
-            q = torch.sqrt(
-                (k1x - k3x) ** 2 + (k1y - k3y) ** 2
-            ).expand_as(k4)
+            q = torch.sqrt((k1x - k3x) ** 2 + (k1y - k3y) ** 2).expand_as(k4)
             Msq = matrix_element_sq(
                 q, epsilon_bg=epsilon_bg, kappa=kappa, well_width=well_width
             )
@@ -435,20 +427,16 @@ def unreduced_collision_reference(
                 # can underflow to exactly 0 at coarse resolution.
                 def _phi(d, f0):
                     return d / (f0 * (1 - f0)).clamp_min(1e-300)
+
                 W = f10 * f20 * (1 - f30) * (1 - f40)
                 bmf = W * (
-                    _phi(d3, f30) + _phi(d4, f40)
-                    - _phi(d1, f10) - _phi(d2, f20)
+                    _phi(d3, f30) + _phi(d4, f40) - _phi(d1, f10) - _phi(d2, f20)
                 )
             else:
                 F1, F2 = f10 + d1, f20 + d2
                 F3, F4 = f30 + d3, f40 + d4
-                bmf = F3 * F4 * (1 - F1) * (1 - F2) - F1 * F2 * (1 - F3) * (
-                    1 - F4
-                )
-            integrand = torch.where(
-                band, Msq * delta * bmf, torch.zeros_like(k4)
-            )
+                bmf = F3 * F4 * (1 - F1) * (1 - F2) - F1 * F2 * (1 - F3) * (1 - F4)
+            integrand = torch.where(band, Msq * delta * bmf, torch.zeros_like(k4))
             acc = acc + (integrand * WX2 * W3 * wphi * wphi).sum()
         out[i] = pref * acc
     return out
@@ -518,9 +506,11 @@ def L_blocks(
         cols = [torch.ones_like(x), x]
         pe, po = 2, 1
         while len(cols) < n_basis:
-            cols.append(v ** pe); pe += 2
+            cols.append(v**pe)
+            pe += 2
             if len(cols) < n_basis:
-                cols.append(v ** po); po += 2
+                cols.append(v**po)
+                po += 2
         return torch.stack(cols[:n_basis], dim=-1) @ psi_coeff
 
     pref = g_s * m_star**3 / (2 * np.pi) ** 3
@@ -596,7 +586,7 @@ def L_blocks(
 # ----------------------------------------------------------------------------
 # Real <-> complex angular-harmonic transforms (cos/sin basis <-> e^{i m phi})
 # ----------------------------------------------------------------------------
-def _real_to_complex(M: int) -> torch.Tensor:
+def _real_to_complex(m_max: int) -> torch.Tensor:
     """Map real angular coefficients to complex harmonics.
 
     ``U[M + m, c]`` such that ``ghat[m] = sum_c U[m, c] a_c`` for the real
@@ -606,18 +596,19 @@ def _real_to_complex(M: int) -> torch.Tensor:
     ``ghat[-m] = (a_m + i b_m)/2`` for ``m > 0``.  Shape ``(2M+1, 2M+1)``,
     rows indexed by harmonic ``m = -M .. M`` (offset ``M``).
     """
-    nh = 2 * M + 1
-    U = torch.zeros(nh, nh, dtype=torch.complex128)
-    U[M, 0] = 1.0
-    for m in range(1, M + 1):
-        U[M + m, 2 * m - 1] = 0.5
-        U[M + m, 2 * m] = -0.5j
-        U[M - m, 2 * m - 1] = 0.5
-        U[M - m, 2 * m] = 0.5j
+    n_theta = 2 * m_max
+    U = torch.zeros(n_theta, n_theta, dtype=torch.complex128)
+    U[m_max, 0] = 1.0
+    for m in range(1, m_max):
+        U[m_max + m, m] = 0.5
+        U[m_max + m, m + m_max] = -0.5j
+        U[m_max - m, m] = 0.5
+        U[m_max - m, m + m_max] = 0.5j
+    U[0, m_max] = 1.0  # cosine term only at Nyquist frequency
     return U
 
 
-def _complex_to_real(M: int) -> torch.Tensor:
+def _complex_to_real(m_max: int) -> torch.Tensor:
     """Map complex output harmonics to real cos/sin coefficients.
 
     ``R[co, M + mo]`` such that ``out_co = sum_mo R[co, mo] Fhat[mo]`` for a
@@ -627,14 +618,15 @@ def _complex_to_real(M: int) -> torch.Tensor:
     ``(2M+1, 2M+1)``, columns indexed by harmonic ``mo = -M .. M``
     (offset ``M``).
     """
-    nh = 2 * M + 1
-    R = torch.zeros(nh, nh, dtype=torch.complex128)
-    R[0, M] = 1.0
-    for m in range(1, M + 1):
-        R[2 * m - 1, M + m] = 1.0
-        R[2 * m - 1, M - m] = 1.0
-        R[2 * m, M + m] = 1.0j
-        R[2 * m, M - m] = -1.0j
+    n_theta = 2 * m_max
+    R = torch.zeros(n_theta, n_theta, dtype=torch.complex128)
+    R[0, m_max] = 1.0
+    for m in range(1, m_max):
+        R[m, m_max + m] = 1.0
+        R[m, m_max - m] = 1.0
+        R[m_max + m, m_max + m] = 1.0j
+        R[m_max + m, m_max - m] = -1.0j
+    R[m_max, 0] = 1.0
     return R
 
 
@@ -691,8 +683,8 @@ def _beta_grid(n_phi: int, t: float = 0.0):
     n_e = max(4, n_phi // 8)
     n_b = max(4, (n_phi - 2 * n_e) // 2)
     counts = [n_e, n_b, n_b, n_e]
-    counts[1] += n_phi - sum(counts)          # absorb the remainder in a bulk panel
-    if counts[1] < 4:                          # tiny n_phi: fall back to one panel
+    counts[1] += n_phi - sum(counts)  # absorb the remainder in a bulk panel
+    if counts[1] < 4:  # tiny n_phi: fall back to one panel
         pg, pw = np.polynomial.legendre.leggauss(n_phi)
         s_ = np.pi * (pg + 1.0)
         u = (s_ - np.pi) / np.pi
@@ -701,19 +693,24 @@ def _beta_grid(n_phi: int, t: float = 0.0):
         return torch.tensor(beta, **dd), torch.tensor(wbeta, **dd)
     half = np.pi - beta_c
     bs, ws = [], []
-    for n, (span, anchor, sgn) in zip(counts, (
-            (beta_c, 0.0, +1.0),     # (0, bc):        beta = 0  + bc v^2
-            (half, np.pi, -1.0),     # (bc, pi):       beta = pi - half v^2
-            (half, np.pi, +1.0),     # (pi, 2pi-bc):   beta = pi + half v^2
-            (beta_c, 2 * np.pi, -1.0))):  # (2pi-bc,2pi): beta = 2pi - bc v^2
+    for n, (span, anchor, sgn) in zip(
+        counts,
+        (
+            (beta_c, 0.0, +1.0),  # (0, bc):        beta = 0  + bc v^2
+            (half, np.pi, -1.0),  # (bc, pi):       beta = pi - half v^2
+            (half, np.pi, +1.0),  # (pi, 2pi-bc):   beta = pi + half v^2
+            (beta_c, 2 * np.pi, -1.0),
+        ),
+    ):  # (2pi-bc,2pi): beta = 2pi - bc v^2
         vg, vw = np.polynomial.legendre.leggauss(n)
         v = 0.5 * (vg + 1.0)
         bs.append(anchor + sgn * span * v * v)
-        ws.append(0.5 * vw * 2.0 * span * v)   # |dbeta/dv| = 2 span v
+        ws.append(0.5 * vw * 2.0 * span * v)  # |dbeta/dv| = 2 span v
     order = np.argsort(np.concatenate(bs))
     beta = np.concatenate(bs)[order]
     wbeta = np.concatenate(ws)[order]
     return torch.tensor(beta, **dd), torch.tensor(wbeta, **dd)
+
 
 def _shell_quadrature(T: float, E_F: float, n_xi: int, xi_cut: float, n_phi: int):
     """Energy (x2) Gauss-Legendre and azimuth (beta = phi3 - phi1) grids.
@@ -735,8 +732,27 @@ def _shell_quadrature(T: float, E_F: float, n_xi: int, xi_cut: float, n_phi: int
 
 
 def _shell_geometry(
-    *, x1v, X2, k1, k2, x3v, w2, w3v, beta, wbeta, cosB, sinB, T, t, kF,
-    m_star, epsilon_bg, kappa, well_width, n_xi, n_phi,
+    *,
+    x1v,
+    X2,
+    k1,
+    k2,
+    x3v,
+    w2,
+    w3v,
+    beta,
+    wbeta,
+    cosB,
+    sinB,
+    T,
+    t,
+    kF,
+    m_star,
+    epsilon_bg,
+    kappa,
+    well_width,
+    n_xi,
+    n_phi,
     g_s: float = 2.0,
 ):
     """Resolve the thermal-shell kinematics at one ``(x1, x3, sgn-pair)``.
@@ -842,15 +858,12 @@ def _cubic_complex(
     """
     E_F = 0.5 * kF**2 / m_star
     t = T / E_F
-    dd = dict(dtype=torch.float64)
     Nx1 = len(x_nodes)
     nharm = 2 * M + 1
     Nr = psi_coeff.shape[1]
     ps = torch.arange(-M, M + 1)
 
-    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(
-        T, E_F, n_xi, xi_cut, n_phi
-    )
+    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(T, E_F, n_xi, xi_cut, n_phi)
 
     def weq(x: torch.Tensor) -> torch.Tensor:
         return 0.25 / torch.cosh(x / 2) ** 2 / T
@@ -860,9 +873,11 @@ def _cubic_complex(
         cols = [torch.ones_like(x), x]
         pe, po = 2, 1
         while len(cols) < Nr:
-            cols.append(v ** pe); pe += 2
+            cols.append(v**pe)
+            pe += 2
             if len(cols) < Nr:
-                cols.append(v ** po); po += 2
+                cols.append(v**po)
+                po += 2
         return torch.stack(cols[:Nr], dim=-1) @ psi_coeff
 
     def leg_factor(x: torch.Tensor) -> torch.Tensor:  # w_eq psi_l: (..., Nr)
@@ -875,10 +890,8 @@ def _cubic_complex(
     ng = n_xi * n_phi
     # (2,3,4)- triple at full rank-3 angular; leg-1 triples with leg-1 harmonic
     # elided (constant phase at phi1 = 0):
-    Tc_full = torch.zeros(Nx1, nrh, nrh, nrh, dtype=work_dtype,
-                          device=work_device)
-    Tc_leg1 = torch.zeros(Nx1, Nr, nrh, nrh, dtype=work_dtype,
-                          device=work_device)
+    Tc_full = torch.zeros(Nx1, nrh, nrh, nrh, dtype=work_dtype, device=work_device)
+    Tc_leg1 = torch.zeros(Nx1, Nr, nrh, nrh, dtype=work_dtype, device=work_device)
     x1t = x_nodes.to(torch.float64)
 
     for ix1 in range(Nx1):  # phi1 = 0 canonical (isotropy); stream over x1
@@ -892,10 +905,28 @@ def _cubic_complex(
             x3v = x2[i3]
             w3v = w2[i3]
             weight_phase, X4 = _shell_geometry(
-                x1v=x1v, X2=X2, k1=k1, k2=k2, x3v=x3v, w2=w2, w3v=w3v,
-                beta=beta, wbeta=wbeta, cosB=cosB, sinB=sinB, T=T, t=t, kF=kF,
-                m_star=m_star, epsilon_bg=epsilon_bg, kappa=kappa,
-                well_width=well_width, n_xi=n_xi, n_phi=n_phi, g_s=g_s)
+                x1v=x1v,
+                X2=X2,
+                k1=k1,
+                k2=k2,
+                x3v=x3v,
+                w2=w2,
+                w3v=w3v,
+                beta=beta,
+                wbeta=wbeta,
+                cosB=cosB,
+                sinB=sinB,
+                T=T,
+                t=t,
+                kF=kF,
+                m_star=m_star,
+                epsilon_bg=epsilon_bg,
+                kappa=kappa,
+                well_width=well_width,
+                n_xi=n_xi,
+                n_phi=n_phi,
+                g_s=g_s,
+            )
             lf2 = leg_factor(X2.reshape(n_xi))  # (n_xi, Nr)
             lf3 = leg_factor(x3v.reshape(1))[0]  # (Nr,)
             lf4 = leg_factor(X4.reshape(n_xi))  # (n_xi, Nr)
@@ -908,22 +939,33 @@ def _cubic_complex(
                 # for the GEMM (the bottleneck) -- fp32/GPU speed without losing
                 # kinematic accuracy:
                 _w = dict(dtype=work_dtype, device=work_device)
-                p2 = (lf2[:, None, :, None]
-                      * ph2[..., None, :]).reshape(ng, nrh).to(**_w)
+                p2 = (
+                    (lf2[:, None, :, None] * ph2[..., None, :])
+                    .reshape(ng, nrh)
+                    .to(**_w)
+                )
                 p3 = (
-                    lf3[None, None, :, None]
-                    * ph3.expand(n_xi, n_phi, nharm)[..., None, :]
-                ).reshape(ng, nrh).to(**_w)
-                p4 = (lf4[:, None, :, None]
-                      * ph4[..., None, :]).reshape(ng, nrh).to(**_w)
+                    (
+                        lf3[None, None, :, None]
+                        * ph3.expand(n_xi, n_phi, nharm)[..., None, :]
+                    )
+                    .reshape(ng, nrh)
+                    .to(**_w)
+                )
+                p4 = (
+                    (lf4[:, None, :, None] * ph4[..., None, :])
+                    .reshape(ng, nrh)
+                    .to(**_w)
+                )
                 Wkf = Wk.reshape(ng).to(**_w)
                 # (2,3,4)- triple, full rank-3 angular.  Contract the quadrature
                 # axis g as a GEMM via a g*nrh^2 intermediate (never the g*nrh^3
                 # tensor torch.einsum("ga,gb,gc->abc") would materialize):
                 wa = p2 * (-Wkf)[:, None]
                 gab = torch.einsum("ga,gb->gab", wa, p3)  # (ng, nrh, nrh)
-                Tc_full[ix1] += torch.matmul(
-                    gab.reshape(ng, -1).mT, p4).reshape(nrh, nrh, nrh)
+                Tc_full[ix1] += torch.matmul(gab.reshape(ng, -1).mT, p4).reshape(
+                    nrh, nrh, nrh
+                )
                 # leg-1 triples (1,2,3)+,(1,2,4)+,(1,3,4)-: leg 1 contributes
                 # only its radial factor lf1[la] (phase == 1), accumulated over
                 # the radial index; the two partner legs keep full (radial,
@@ -936,8 +978,9 @@ def _cubic_complex(
                 ):
                     wla = lf1g * (Wkf * s3)[:, None]  # (ng, Nr)
                     glp = torch.einsum("gl,gp->glp", wla, pp)  # (ng, Nr, nrh)
-                    Tc_leg1[ix1] += torch.matmul(
-                        glp.reshape(ng, -1).mT, pq).reshape(Nr, nrh, nrh)
+                    Tc_leg1[ix1] += torch.matmul(glp.reshape(ng, -1).mT, pq).reshape(
+                        Nr, nrh, nrh
+                    )
 
     Tc_full = Tc_full.reshape(Nx1, Nr, nharm, Nr, nharm, Nr, nharm)
     Tc_leg1 = Tc_leg1.reshape(Nx1, Nr, Nr, nharm, Nr, nharm)
@@ -1014,14 +1057,11 @@ def cubic_packed_node(
     """
     E_F = 0.5 * kF**2 / m_star
     t = T / E_F
-    dd = dict(dtype=torch.float64)
     nharm = 2 * M + 1
     Nr = psi_coeff.shape[1]
     nrh = Nr * nharm
     ps = torch.arange(-M, M + 1)
-    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(
-        T, E_F, n_xi, xi_cut, n_phi
-    )
+    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(T, E_F, n_xi, xi_cut, n_phi)
 
     def weq(x: torch.Tensor) -> torch.Tensor:
         return 0.25 / torch.cosh(x / 2) ** 2 / T
@@ -1031,9 +1071,11 @@ def cubic_packed_node(
         cols = [torch.ones_like(x), x]
         pe, po = 2, 1
         while len(cols) < Nr:
-            cols.append(v ** pe); pe += 2
+            cols.append(v**pe)
+            pe += 2
             if len(cols) < Nr:
-                cols.append(v ** po); po += 2
+                cols.append(v**po)
+                po += 2
         return torch.stack(cols[:Nr], dim=-1) @ psi_coeff
 
     def leg_factor(x: torch.Tensor) -> torch.Tensor:
@@ -1068,10 +1110,28 @@ def cubic_packed_node(
         x3v = x2[i3]
         w3v = w2[i3]
         weight_phase, X4 = _shell_geometry(
-            x1v=x1v, X2=X2, k1=k1, k2=k2, x3v=x3v, w2=w2, w3v=w3v,
-            beta=beta, wbeta=wbeta, cosB=cosB, sinB=sinB, T=T, t=t, kF=kF,
-            m_star=m_star, epsilon_bg=epsilon_bg, kappa=kappa,
-            well_width=well_width, n_xi=n_xi, n_phi=n_phi, g_s=g_s)
+            x1v=x1v,
+            X2=X2,
+            k1=k1,
+            k2=k2,
+            x3v=x3v,
+            w2=w2,
+            w3v=w3v,
+            beta=beta,
+            wbeta=wbeta,
+            cosB=cosB,
+            sinB=sinB,
+            T=T,
+            t=t,
+            kF=kF,
+            m_star=m_star,
+            epsilon_bg=epsilon_bg,
+            kappa=kappa,
+            well_width=well_width,
+            n_xi=n_xi,
+            n_phi=n_phi,
+            g_s=g_s,
+        )
         lf2 = leg_factor(X2.reshape(n_xi))  # (n_xi, Nr)
         lf3 = leg_factor(x3v.reshape(1))[0]  # (Nr,)
         lf4 = leg_factor(X4.reshape(n_xi))  # (n_xi, Nr)
@@ -1079,22 +1139,25 @@ def cubic_packed_node(
             Wk, phi2, phi4 = weight_phase(sgn)
             ph2 = phase(phi2)
             ph4 = phase(phi4)
-            p2 = (lf2[:, None, :, None]
-                  * ph2[..., None, :]).reshape(ng, nrh).to(**_w)
-            p3 = (lf3[None, None, :, None]
-                  * ph3.expand(n_xi, n_phi, nharm)[..., None, :]
-                  ).reshape(ng, nrh).to(**_w)
-            p4 = (lf4[:, None, :, None]
-                  * ph4[..., None, :]).reshape(ng, nrh).to(**_w)
+            p2 = (lf2[:, None, :, None] * ph2[..., None, :]).reshape(ng, nrh).to(**_w)
+            p3 = (
+                (
+                    lf3[None, None, :, None]
+                    * ph3.expand(n_xi, n_phi, nharm)[..., None, :]
+                )
+                .reshape(ng, nrh)
+                .to(**_w)
+            )
+            p4 = (lf4[:, None, :, None] * ph4[..., None, :]).reshape(ng, nrh).to(**_w)
             Wkf = Wk.reshape(ng).to(**_w)
             wa = p2 * (-Wkf)[:, None]  # (ng, nrh)
             # (2,3,4) triple, slab by slab over the first leg index a:
             for a0 in range(0, nrh, slab):
                 a1 = min(a0 + slab, nrh)
                 gab = torch.einsum("ga,gb->gab", wa[:, a0:a1], p3)
-                tsl = torch.matmul(
-                    gab.reshape(ng, -1).mT, p4
-                ).reshape(a1 - a0, nrh, nrh)  # Tc_full[a0:a1, :, :]
+                tsl = torch.matmul(gab.reshape(ng, -1).mT, p4).reshape(
+                    a1 - a0, nrh, nrh
+                )  # Tc_full[a0:a1, :, :]
                 for first, o1, o2 in groups:
                     m = (first >= a0) & (first < a1)
                     if bool(m.any()):
@@ -1112,15 +1175,17 @@ def cubic_packed_node(
             ):
                 wla = lf1g * (Wkf * s3)[:, None]
                 glp = torch.einsum("gl,gp->glp", wla, pp)
-                T_leg1 += torch.matmul(
-                    glp.reshape(ng, -1).mT, pq).reshape(Nr, nrh, nrh)
+                T_leg1 += torch.matmul(glp.reshape(ng, -1).mT, pq).reshape(Nr, nrh, nrh)
 
     # leg-1 gather: leg 1 (radial index a // nharm) sits in each of the 3 slots:
     la_i, la_j, la_k = ti // nharm, tj // nharm, tk // nharm
     s0_leg1 = (
-        T_leg1[la_i, tj, tk] + T_leg1[la_i, tk, tj]
-        + T_leg1[la_j, ti, tk] + T_leg1[la_j, tk, ti]
-        + T_leg1[la_k, ti, tj] + T_leg1[la_k, tj, ti]
+        T_leg1[la_i, tj, tk]
+        + T_leg1[la_i, tk, tj]
+        + T_leg1[la_j, ti, tk]
+        + T_leg1[la_j, tk, ti]
+        + T_leg1[la_k, ti, tj]
+        + T_leg1[la_k, tj, ti]
     )
     return (s0_full + s0_leg1) / 6.0
 
@@ -1206,15 +1271,24 @@ def cubic_vertex(
     storage / work, bit-for-bit identical).
     """
     nharm = 2 * M + 1
-    Nr = psi_coeff.shape[1]
     ps = torch.arange(-M, M + 1)
     # Compact complex accumulation (leg-1 reduction), then reconstruct the full
     # complex vertex Tc[i, la,A, lb,B, lc,C] = Tc_full + Tc_leg1 (broadcast over
     # leg-1's harmonic axis A, whose phase is constant at phi1 = 0):
     Tc_full, Tc_leg1, conv = _cubic_complex(
-        x_nodes=x_nodes, psi_coeff=psi_coeff, M=M, kF=kF, m_star=m_star, T=T,
-        epsilon_bg=epsilon_bg, kappa=kappa, well_width=well_width, n_xi=n_xi,
-        xi_cut=xi_cut, n_phi=n_phi, g_s=g_s,
+        x_nodes=x_nodes,
+        psi_coeff=psi_coeff,
+        M=M,
+        kF=kF,
+        m_star=m_star,
+        T=T,
+        epsilon_bg=epsilon_bg,
+        kappa=kappa,
+        well_width=well_width,
+        n_xi=n_xi,
+        xi_cut=xi_cut,
+        n_phi=n_phi,
+        g_s=g_s,
     )
     Tc = Tc_full + Tc_leg1[:, :, None, :, :, :, :]
 
@@ -1235,9 +1309,7 @@ def cubic_vertex(
     # with U (real->complex) and the output binning Rfull (complex->real).  The
     # leg radial axes (la, lb, lc) pass through untouched.  Result indexed
     # (ix1, co, la, a, lb, b, lc, c):
-    V = torch.einsum(
-        "ZXAYBWC,oABC,Ai,Bj,Ck->ZoXiYjWk", Tc, Rfull, U, U, U
-    ).real
+    V = torch.einsum("ZXAYBWC,oABC,Ai,Bj,Ck->ZoXiYjWk", Tc, Rfull, U, U, U).real
     return -V * conv[:, None, None, None, None, None, None, None]
 
 
@@ -1280,15 +1352,12 @@ def _quadratic_complex(
     """
     E_F = 0.5 * kF**2 / m_star
     t = T / E_F
-    dd = dict(dtype=torch.float64)
     Nx1 = len(x_nodes)
     nharm = 2 * M + 1
     Nr = psi_coeff.shape[1]
     ps = torch.arange(-M, M + 1)
 
-    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(
-        T, E_F, n_xi, xi_cut, n_phi
-    )
+    x2, w2, beta, wbeta, cosB, sinB = _shell_quadrature(T, E_F, n_xi, xi_cut, n_phi)
 
     def weq(x: torch.Tensor) -> torch.Tensor:
         return 0.25 / torch.cosh(x / 2) ** 2 / T
@@ -1301,9 +1370,11 @@ def _quadratic_complex(
         cols = [torch.ones_like(x), x]
         pe, po = 2, 1
         while len(cols) < Nr:
-            cols.append(v ** pe); pe += 2
+            cols.append(v**pe)
+            pe += 2
             if len(cols) < Nr:
-                cols.append(v ** po); po += 2
+                cols.append(v**po)
+                po += 2
         return torch.stack(cols[:Nr], dim=-1) @ psi_coeff
 
     def phase(dphi: torch.Tensor) -> torch.Tensor:
@@ -1329,10 +1400,28 @@ def _quadratic_complex(
             x3v = x2[i3]
             w3v = w2[i3]
             weight_phase, X4 = _shell_geometry(
-                x1v=x1v, X2=X2, k1=k1, k2=k2, x3v=x3v, w2=w2, w3v=w3v,
-                beta=beta, wbeta=wbeta, cosB=cosB, sinB=sinB, T=T, t=t, kF=kF,
-                m_star=m_star, epsilon_bg=epsilon_bg, kappa=kappa,
-                well_width=well_width, n_xi=n_xi, n_phi=n_phi, g_s=g_s)
+                x1v=x1v,
+                X2=X2,
+                k1=k1,
+                k2=k2,
+                x3v=x3v,
+                w2=w2,
+                w3v=w3v,
+                beta=beta,
+                wbeta=wbeta,
+                cosB=cosB,
+                sinB=sinB,
+                T=T,
+                t=t,
+                kF=kF,
+                m_star=m_star,
+                epsilon_bg=epsilon_bg,
+                kappa=kappa,
+                well_width=well_width,
+                n_xi=n_xi,
+                n_phi=n_phi,
+                g_s=g_s,
+            )
             f2 = f0(X2).expand(n_xi, n_phi)
             f3 = f0(x3v)
             f4 = f0(X4).expand(n_xi, n_phi)
@@ -1363,8 +1452,9 @@ def _quadratic_complex(
                     wgt = (Wk * cf).reshape(ng)
                     # leg-1 radial weighted by the term weight (cast real legs
                     # to complex to match the complex phase factor):
-                    LA = (A1r[None, :].expand(ng, Nr)
-                          * wgt[:, None]).to(torch.complex128)  # (ng, Nr)
+                    LA = (A1r[None, :].expand(ng, Nr) * wgt[:, None]).to(
+                        torch.complex128
+                    )  # (ng, Nr)
                     LB = AB.reshape(ng, Nr).to(torch.complex128)
                     PB = phB.reshape(ng, nharm)
                     Qc_leg1[ix1] += torch.einsum("gl,gp,gb->lpb", LA, LB, PB)
@@ -1383,8 +1473,9 @@ def _quadratic_complex(
                     # leg index (no g*nrh^2 einsum intermediate):
                     gxa = (LA[:, :, None] * PA[:, None, :]).reshape(ng, -1)
                     gyb = (LB[:, :, None] * PB[:, None, :]).reshape(ng, -1)
-                    Qc_full[ix1] += torch.matmul(
-                        gxa.mT, gyb).reshape(Nr, nharm, Nr, nharm)
+                    Qc_full[ix1] += torch.matmul(gxa.mT, gyb).reshape(
+                        Nr, nharm, Nr, nharm
+                    )
 
     # Physical-weight legs (w_eq psi) -> raw integral is f_dot; convert to the
     # solver field rate Phi_code_dot = f_dot / w_eq = 4 T cosh^2(x1/2) * f_dot
@@ -1392,8 +1483,11 @@ def _quadratic_complex(
     conv = 4 * T * torch.cosh(x1t / 2) ** 2
     # quadratic is the subdominant (P^2) vertex: build in fp64 then cast the
     # output to the work precision/device (cubic does the heavy lifting):
-    return (Qc_full.to(dtype=work_dtype, device=work_device),
-            Qc_leg1.to(dtype=work_dtype, device=work_device), conv)
+    return (
+        Qc_full.to(dtype=work_dtype, device=work_device),
+        Qc_leg1.to(dtype=work_dtype, device=work_device),
+        conv,
+    )
 
 
 def quadratic_vertex(
@@ -1446,9 +1540,19 @@ def quadratic_vertex(
     # complex Qc[i, la, lb, ma, mb] = Qc_full + Qc_leg1 (broadcast over leg-1's
     # harmonic ma, whose phase is constant at phi1 = 0):
     Qc_full, Qc_leg1, conv = _quadratic_complex(
-        x_nodes=x_nodes, psi_coeff=psi_coeff, M=M, kF=kF, m_star=m_star, T=T,
-        epsilon_bg=epsilon_bg, kappa=kappa, well_width=well_width, n_xi=n_xi,
-        xi_cut=xi_cut, n_phi=n_phi, g_s=g_s,
+        x_nodes=x_nodes,
+        psi_coeff=psi_coeff,
+        M=M,
+        kF=kF,
+        m_star=m_star,
+        T=T,
+        epsilon_bg=epsilon_bg,
+        kappa=kappa,
+        well_width=well_width,
+        n_xi=n_xi,
+        xi_cut=xi_cut,
+        n_phi=n_phi,
+        g_s=g_s,
     )
     # Qc_full[f, la, A, lb, B] -> Qc[f, la, lb, A, B]; add leg-1 (ma broadcast):
     Qc = Qc_full.permute(0, 1, 3, 2, 4).contiguous()

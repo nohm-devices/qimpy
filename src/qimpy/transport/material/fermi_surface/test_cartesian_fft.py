@@ -35,8 +35,8 @@ def _make(cells: float = 3.0) -> FermiSurface:
     return FermiSurface(
         kF=KF,
         vF=VF,
-        M_theta=8,
-        Nr=2,
+        n_theta=8,
+        n_r=2,
         T=T,
         xi_max=XI_MAX,
         tau_p=np.inf,
@@ -121,8 +121,8 @@ def test_fft_reflector_needs_odd_grid() -> None:
     fs = FermiSurface(
         kF=KF,
         vF=VF,
-        M_theta=8,
-        Nr=2,
+        n_theta=8,
+        n_r=2,
         T=T,
         xi_max=6.0,
         tau_p=np.inf,

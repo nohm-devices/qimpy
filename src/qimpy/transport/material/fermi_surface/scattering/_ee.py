@@ -219,7 +219,7 @@ class EEScattering(TreeNode):
         # tabulate the operator at Chebyshev nodes T_i around the material T;
         # 0 = use the material temperature).  All internal quadratures,
         # vertices and null structures below are built at this temperature.
-        T = float(T_build) if T_build else fs.T_temp
+        T = float(T_build) if T_build else fs.T
         self.T_build = T
         t_ratio = T / self.E_F
         log.info("\n--- Initializing e-e collisions (2D Fermi liquid) ---")
@@ -233,9 +233,9 @@ class EEScattering(TreeNode):
                 " regime (need 0 < T/E_F < 0.3); set the material T"
             )
 
-        M = fs.M_theta
-        dim = fs.angular.dim
-        Nr = fs.Nr
+        m_max = fs.angular.m_max
+        n_theta = fs.n_theta
+        n_r = fs.n_r
         dtype = fs.v.dtype
         device = rc.device
 
@@ -247,9 +247,9 @@ class EEScattering(TreeNode):
         # must dealias the cubic's 3M harmonics AND resolve the collinear edge
         # of angular width ~T/E_F, so it is the only physics-tied knob.
         s = max(1.0, 1.0 + float(np.log10(1e-3 / max(tol, 1e-12))))
-        self.n_xi = n_xi if n_xi else int(np.ceil(max(16, 4 * Nr) * s))
+        self.n_xi = n_xi if n_xi else int(np.ceil(max(16, 4 * n_r) * s))
         # >= 96 so ALL hybrid Gram entries are machine-converged (memo):
-        self.n_xi_proj = max(n_xi_proj, 96, Nr + 6)
+        self.n_xi_proj = max(n_xi_proj, 96, n_r + 6)
         # Edge resolution: the collinear/van-Hove feature has angular width
         # ~t_ratio, so this term puts `edge_pts` quadrature nodes across it.
         # MEASURED (M=4 and M=32, GaAs 2DEG, T/E_F = 0.0317): 8 points is
@@ -261,7 +261,7 @@ class EEScattering(TreeNode):
         # needs 32, not 8.  This is a build-time cost only (the apply is
         # unaffected) and the vertices are disk-cached, so it is paid once.
         edge_pts = 32.0 if nonlinear else 8.0
-        nphi_auto = max(6 * M + 2, int(np.ceil(edge_pts * s / max(t_ratio, 1e-3))))
+        nphi_auto = max(6 * m_max + 2, int(np.ceil(edge_pts * s / max(t_ratio, 1e-3))))
         self._n_phi_auto = not n_phi  # was it the library's choice?
         self.n_phi = n_phi if n_phi else nphi_auto + (nphi_auto % 2)
         self.xi_cut = xi_cut if xi_cut else 10.0
@@ -274,7 +274,7 @@ class EEScattering(TreeNode):
 
         # Angular kernels (up to 2M for the cubic vertex):
         self.K = _kernels.K_table(
-            2 * M,
+            2 * m_max,
             kF=fs.kF,
             epsilon_bg=epsilon_bg,
             kappa=self.kappa,
@@ -292,20 +292,20 @@ class EEScattering(TreeNode):
 
         # ---- Linear rates: closed-form surface (on_shell) or exact shell ----
         if on_shell:
-            if Nr != 1:
+            if n_r != 1:
                 raise InvalidInputException(
                     "on_shell=True (closed-form surface rate) supports Nr = 1"
                     " only; use on_shell=False (exact) for the radial tower"
                 )
-            L = torch.zeros(dim, 1, 1, dtype=torch.float64)
-            for m in range(1, M + 1):
+            L = torch.zeros(n_theta, 1, 1, dtype=torch.float64)
+            for m in range(1, m_max + 1):
                 L[2 * m - 1, 0, 0] = L[2 * m, 0, 0] = gamma_cf[m]
         else:
             L = self._exact_L_blocks(T)
         self.L_coeff = L.to(dtype=dtype, device=device)
         if check_convergence and not on_shell:
             self._check_quadrature_convergence(T)
-        gam2 = float(self.L_coeff[3, 0, 0]) if M >= 2 else 0.0
+        gam2 = float(self.L_coeff[3, 0, 0]) if m_max >= 2 else 0.0
         if gam2 > 0.0:
             # Characteristic transport scales from the m=2 shear rate gamma_2.
             # qimpy works in atomic units; convert to SI transport units:
@@ -363,10 +363,10 @@ class EEScattering(TreeNode):
             # memory-feasible and fast (the dense apply is then orders of
             # magnitude cheaper per cell).  Larger sizes remain available on
             # demand via backend='dense' (feasible now, just a slower build).
-            Pf = Nr * dim
+            Pf = n_r * n_theta
             N_tri = max(1, Pf**3 // 16)
             citem = 8 if dtype == torch.float32 else 16  # complex build itemsize
-            kernel_bytes = Nr * N_tri * citem  # build accumulator peak
+            kernel_bytes = n_r * N_tri * citem  # build accumulator peak
             nq = 2 * self.n_xi**2 * self.n_phi
             build_flops = self.n_xi_proj * Pf**3 * nq  # slab-matmul work
             mem_cap = 512 * 1024**2  # ~0.5 GiB packed-kernel build cap
@@ -420,10 +420,10 @@ class EEScattering(TreeNode):
         ``l = 0`` radial basis function (the surface mode).
         """
         fs = self.fermi_surface
-        Nr = fs.Nr
+        Nr = fs.n_r
         t_ratio = T / self.E_F
         xi_c = fs.radial.xi.to(torch.float64).cpu()  # collocation nodes
-        Tfm = fs.radial.T_from_modes.to(torch.float64).cpu()  # psi_l(xi_c)
+        Tfm = fs.radial.from_modes.to(torch.float64).cpu()  # psi_l(xi_c)
 
         def _feats(x):
             # hybrid features [1, x, v^2, v, v^4, v^3, ...], v = tanh(x/2)
@@ -496,10 +496,10 @@ class EEScattering(TreeNode):
         """Conservation null covectors per angular harmonic, in the code's
         discrete radial measure (number/energy at m=0, momentum at m=1)."""
         fs = self.fermi_surface
-        Nr = fs.Nr
+        Nr = fs.n_r
         t_ratio = T / self.E_F
         xi_c = fs.radial.xi.to(torch.float64).cpu()
-        Ttm_r = fs.radial.T_to_modes.to(torch.float64).cpu()
+        Ttm_r = fs.radial.to_modes.to(torch.float64).cpu()
         nulls: dict[int, list[torch.Tensor]] = {0: [], 1: []}
         nulls[0].append(Ttm_r @ torch.ones(Nr, dtype=torch.float64))  # number
         if Nr > 1:
@@ -525,7 +525,7 @@ class EEScattering(TreeNode):
         output node (the build itself sweeps ``n_xi_proj ~ 96``), so the check
         costs ~2 % of the build rather than 2.25x it."""
         fs = self.fermi_surface
-        M = fs.M_theta
+        M = fs.n_theta
         if M < 2:
             return  # only m=0,1 (conserved nulls); nothing rate-bearing to check
         m_chk = [m for m in (2, 4) if m <= M]
@@ -612,17 +612,18 @@ class EEScattering(TreeNode):
     def _exact_L_blocks(self, T: float) -> torch.Tensor:
         """Exact-kinematics linear blocks, Galerkin in the code's radial basis."""
         fs = self.fermi_surface
-        M, Nr = fs.M_theta, fs.Nr
+        m_max = fs.angular.m_max
+        n_r = fs.n_r
         psi_coeff, x_fine, P, Ginv, _ = self._radial_galerkin(T)
 
         log.info(
-            f"Computing exact e-e rates: m = 0..{M}, quadrature"
+            f"Computing exact e-e rates: m = 0..{m_max}, quadrature"
             f" {self.n_xi}^2 x {self.n_phi} x {self.n_xi_proj}"
         )
         R = _kernels.L_blocks(
             x_nodes=x_fine,
             psi_coeff=psi_coeff,
-            m_list=range(M + 1),
+            m_list=range(m_max + 1),
             kF=fs.kF,
             m_star=self.m_star,
             T=T,
@@ -640,25 +641,18 @@ class EEScattering(TreeNode):
         # Exact conservation: null-space projection per harmonic, in the
         # code's discrete radial measure; then symmetrize and clip to PSD.
         nulls = self._null_covectors(T)
-        for m in range(M + 1):
+        for m in range(m_max + 1):
             Lm = 0.5 * (L_m[m] + L_m[m].T)
             if m in nulls:
                 Vn = torch.stack(nulls[m], dim=1)  # (Nr, n_null)
                 Q, _ = torch.linalg.qr(Vn)
-                Proj = torch.eye(Nr, dtype=torch.float64) - Q @ Q.T
+                Proj = torch.eye(n_r, dtype=torch.float64) - Q @ Q.T
                 Lm = Proj @ Lm @ Proj
             evals, evecs = torch.linalg.eigh(Lm)
             evals = evals.clamp(min=0.0)
             L_m[m] = (evecs * evals) @ evecs.T
         # Scatter per-harmonic blocks onto coefficient ordering
-        # (a_0; a_1, b_1; ...; a_M, b_M):
-        dim = fs.angular.dim
-        L = torch.zeros(dim, Nr, Nr, dtype=torch.float64)
-        L[0] = L_m[0]
-        for m in range(1, M + 1):
-            L[2 * m - 1] = L_m[m]
-            L[2 * m] = L_m[m]
-        return L
+        return torch.cat((L_m, L_m[1:m_max]), dim=0)
 
     def _radial_null_projectors(self, T: float) -> torch.Tensor:
         """Per-angular-mode radial null projectors ``Proj[co]`` (shape
@@ -666,19 +660,20 @@ class EEScattering(TreeNode):
         output radial axis: number/energy at ``m = 0`` (``co = 0``), momentum
         at ``m = 1`` (``co = 1, 2``); identity for all other output modes."""
         fs = self.fermi_surface
-        M, Nr = fs.M_theta, fs.Nr
-        dim = fs.angular.dim
+        m_max = fs.angular.m_max
+        n_r = fs.n_r
+        n_theta = fs.n_theta
         nulls = self._null_covectors(T)
-        eye = torch.eye(Nr, dtype=torch.float64)
+        eye = torch.eye(n_r, dtype=torch.float64)
         proj_by_harm: dict[int, torch.Tensor] = {}
         for m, vecs in nulls.items():
             if vecs:
                 Vn = torch.stack(vecs, dim=1)  # (Nr, n_null)
                 Q, _ = torch.linalg.qr(Vn)
                 proj_by_harm[m] = eye - Q @ Q.T
-        Proj = torch.zeros(dim, Nr, Nr, dtype=torch.float64)
+        Proj = torch.zeros(n_theta, n_r, n_r, dtype=torch.float64)
         Proj[0] = proj_by_harm.get(0, eye)  # m = 0 output mode
-        for m in range(1, M + 1):
+        for m in range(1, m_max + 1):
             Pm = proj_by_harm.get(m, eye)
             Proj[2 * m - 1] = Pm
             Proj[2 * m] = Pm
@@ -696,7 +691,7 @@ class EEScattering(TreeNode):
         and ``Proj`` is harmonic-diagonal (co = 0 <-> m = 0; co = 1, 2 <-> m = 1).
         """
         fs = self.fermi_surface
-        Nr = fs.Nr
+        Nr = fs.n_r
         nulls = self._null_covectors(T)
         proj: dict[int, torch.Tensor] = {}
         for m, vecs in nulls.items():
@@ -716,12 +711,12 @@ class EEScattering(TreeNode):
         O(nh^4) (~70 GB at M=128) and is never touched by ``_apply_matrix_free``.
         """
         fs = self.fermi_surface
-        M = fs.M_theta
-        nh = 2 * M + 1
+        m_max = fs.angular.m_max
+        n_theta = fs.n_theta
         dtype, device = fs.v.dtype, rc.device
         cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
-        U = _kernels._real_to_complex(M)  # (nh, nh) ahat[m] = sum_c U[m,c] a[c]
-        R = _kernels._complex_to_real(M)  # (nh, nh) out[co] = R[co,M+mo] Fhat[mo]
+        U = _kernels._real_to_complex(m_max)  # (nh, nh) ahat[m] = sum_c U[m,c] a[c]
+        R = _kernels._complex_to_real(m_max)  # (nh, nh) out[co] = R[co,M+mo] Fhat[mo]
         self._U = U.to(dtype=cdtype, device=device)
         self._R = R.to(dtype=cdtype, device=device)
         # Per-harmonic null radial projectors (mo in {0, +-1}); identity else.
@@ -729,8 +724,8 @@ class EEScattering(TreeNode):
         self._null_proj = {
             mo: Pm.to(dtype=cdtype, device=device) for mo, Pm in proj.items()
         }
-        self._nh = nh
-        self._ps = torch.arange(-M, M + 1).to(device)
+        self._nh = n_theta
+        self._ps = torch.arange(-m_max, m_max).to(device)
 
     # tensors produced by _build_dense_vertices; the whole cached payload
     _DENSE_TENSORS = (
@@ -775,8 +770,8 @@ class EEScattering(TreeNode):
                     float(fs.vF),
                     float(self.m_star),
                     float(T),
-                    int(fs.M_theta),
-                    int(fs.Nr),
+                    int(fs.n_theta),
+                    int(fs.n_r),
                     float(fs.xi_max),
                     float(self.epsilon_bg),
                     float(self.kappa),
@@ -870,10 +865,10 @@ class EEScattering(TreeNode):
         fs = self.fermi_surface
         device = rc.device
         self._build_harmonic_tables()  # _U, _R, _null_proj
-        M = fs.M_theta
-        nh = 2 * M + 1
-        Nr = fs.Nr
-        Pflat = Nr * nh  # flat leg index p = l*nh + (m + M)
+        m_max = fs.angular.m_max
+        n_theta = fs.n_theta
+        Nr = fs.n_r
+        Pflat = Nr * n_theta  # flat leg index p = l*nh + (m + M)
         psi_coeff, x_fine, P, Ginv, _ = self._radial_galerkin(T)
         # Run the build GEMM/accumulator in the working precision and on
         # rc.device: complex64 -> ~2x faster, half-memory fp32 build (q-sum error
@@ -881,7 +876,7 @@ class EEScattering(TreeNode):
         # on the GPU (kinematics stay fp64 on host for accuracy).
         wdt = torch.complex64 if fs.v.dtype == torch.float32 else torch.complex128
         kin = dict(
-            M=M,
+            M=m_max,
             kF=fs.kF,
             m_star=self.m_star,
             T=T,
@@ -894,7 +889,9 @@ class EEScattering(TreeNode):
             work_dtype=wdt,
             work_device=device,
         )
-        pm = (torch.arange(Pflat, device=device) % nh) - M  # m of each leg index
+        pm = (
+            torch.arange(Pflat, device=device) % n_theta
+        ) - m_max  # m of each leg index
 
         # Enumerate the kept UNORDERED triples / pairs once (output-node
         # independent): selection + output truncation + reality (0 <= sum m <= M)
@@ -903,7 +900,7 @@ class EEScattering(TreeNode):
             torch.arange(Pflat, device=device), r=3, with_replacement=True
         )
         sm = pm[tri[:, 0]] + pm[tri[:, 1]] + pm[tri[:, 2]]
-        keep = (sm >= 0) & (sm <= M)
+        keep = (sm >= 0) & (sm <= m_max)
         tri, sm = tri[keep], sm[keep]
         p1, p2, p3 = tri[:, 0], tri[:, 1], tri[:, 2]
         e1, e2 = (p1 == p2), (p2 == p3)
@@ -912,7 +909,7 @@ class EEScattering(TreeNode):
             torch.arange(Pflat, device=device), r=2, with_replacement=True
         )
         smq = pm[pr[:, 0]] + pm[pr[:, 1]]
-        keepq = (smq >= 0) & (smq <= M)
+        keepq = (smq >= 0) & (smq <= m_max)
         pr, smq = pr[keepq], smq[keepq]
         q1, q2 = pr[:, 0], pr[:, 1]
         multq = torch.where(q1 == q2, 1, 2)
@@ -969,7 +966,7 @@ class EEScattering(TreeNode):
         self._sq_S = (Sq * multq[None, :]).real.to(dtype=fs.v.dtype, device=device)
         self._sq_q1, self._sq_q2 = q1, q2
         self._sq_mo = smq
-        self._dc_M, self._dc_nh = M, nh
+        self._dc_M, self._dc_nh = m_max, n_theta
 
     def _apply_dense(self, a4: torch.Tensor) -> torch.Tensor:
         """Cell-chunked wrapper over :meth:`_apply_dense_core`.
@@ -1043,9 +1040,8 @@ class EEScattering(TreeNode):
         FermiSurface flattened (radial, angular) ordering.
         """
         fs = self.fermi_surface
-        Nr, dim = fs.Nr, fs.angular.dim
         shape_in = a.shape
-        a4 = a.reshape(*shape_in[:-1], Nr, dim)
+        a4 = a.unflatten(-1, (fs.n_r, fs.n_theta))
         # Linear: block-diagonal in harmonic, matrix over radial modes:
         out = -torch.einsum("cij,...jc->...ic", self.L_coeff, a4)
         if self.nonlinear:
@@ -1078,9 +1074,8 @@ class EEScattering(TreeNode):
         ``a_dot(a)`` to round-off.
         """
         fs = self.fermi_surface
-        Nr, dim = fs.Nr, fs.angular.dim
         shape_in = a.shape
-        a4 = a.reshape(*shape_in[:-1], Nr, dim)
+        a4 = a.unflatten(-1, (fs.n_r, fs.n_theta))
         lin = -torch.einsum("cij,...jc->...ic", self.L_coeff, a4)
         if self.nonlinear:
             if self.backend == "dense":
@@ -1101,9 +1096,9 @@ class EEScattering(TreeNode):
     def _finalize_nonlinear(self, Fhat: torch.Tensor) -> torch.Tensor:
         """Apply the per-output-harmonic null projection on the binned complex
         output and convert to real coefficients ``[..., o, co]``."""
-        M = self.fermi_surface.M_theta
+        m_max = self.fermi_surface.angular.m_max
         for mo, Pm in self._null_proj.items():
-            idx = M + mo
+            idx = m_max + mo
             Fhat = Fhat.clone()
             Fhat[..., idx] = torch.einsum("Ll,...l->...L", Pm, Fhat[..., idx])
         return torch.einsum("cm,...om->...oc", self._R, Fhat).real
@@ -1144,8 +1139,8 @@ class EEScattering(TreeNode):
         GPc = (Ginv @ P) * conv[None, :]  # (Nr, n_fine); +conv: nl = +Phi_dot_NL
 
         log.info(
-            f"Building matrix-free e-e generator (M = {fs.M_theta},"
-            f" Nr = {fs.Nr}), quadrature {self.n_xi}^2 x 2 x {self.n_phi}"
+            f"Building matrix-free e-e generator (M = {fs.n_theta},"
+            f" Nr = {fs.n_r}), quadrature {self.n_xi}^2 x 2 x {self.n_phi}"
             f" at {len(x_fine)} output nodes"
         )
         x2, w2, beta, wbeta, cosB, sinB = _kernels._shell_quadrature(
@@ -1259,7 +1254,7 @@ class EEScattering(TreeNode):
         # Output-angle grid for resolving the output harmonics mo = sum of input
         # harmonics.  The cubic reaches harmonic 3M; a uniform grid of >= 6M+1
         # points integrates e^{-i mo phi1} exactly (we use 6M+2, even):
-        M = fs.M_theta
+        M = fs.n_theta
         Nout = 6 * M + 2
         phi1 = 2 * np.pi * torch.arange(Nout, dtype=torch.float64) / Nout
         ps = torch.arange(-M, M + 1, dtype=torch.float64)
@@ -1326,7 +1321,7 @@ class EEScattering(TreeNode):
         import time
 
         try:
-            M = self.fermi_surface.M_theta
+            M = self.fermi_surface.n_theta
             Nout, Nf, nq = self._mf_Nout, self._mf_nf, self._mf_nq
             cos_syn, sin_syn = self._mf_cos, self._mf_sin
             rdt, dev = cos_syn.dtype, cos_syn.device
@@ -1421,7 +1416,7 @@ class EEScattering(TreeNode):
         energy-parity selection in the dense path, it is therefore left out.
         """
         fs = self.fermi_surface
-        M = fs.M_theta
+        M = fs.n_theta
         cdt = self._U.dtype
         # complex harmonics of the modal field; only the m >= 0 half enters the
         # Hermitian (real) reconstruction:
@@ -1558,12 +1553,14 @@ class EEScattering(TreeNode):
             # Reshape the last axis to (Nr, dim) offline for the radial/angular
             # (l, m) contributions. dim = 2*M_theta+1 (m = -M..M).
             fs = self.fermi_surface
-            Nr_m = int(fs.Nr)
-            dim_m = int(fs.angular.dim)
-            n_modal = Nr_m * dim_m
+            n_r_m = int(fs.n_r)
+            n_theta_m = int(fs.n_theta)
+            n_modal = n_r_m * n_theta_m
             # (Nr, dim) as a dataset, NOT attrs -- attrs round-trip into
             # constructor kwargs on restart and these are not constructor args.
-            cp_path.write("terms_shape", torch.tensor([Nr_m, dim_m], dtype=torch.int64))
+            cp_path.write(
+                "terms_shape", torch.tensor([n_r_m, n_theta_m], dtype=torch.int64)
+            )
             cp_path.write_str("terms_channels", "a,lin,quad,cub")
             terms_own = torch.stack(self._stash_terms)  # (n_stash,4,K_own,n_modal)
             n_stash = len(terms_own)
