@@ -1,19 +1,20 @@
-from .. import Transport
-
+import pytest
 import torch
-import matplotlib.pyplot as plt
-from matplotlib.colors import SymLogNorm
 
 from qimpy import rc
 from qimpy.io import log_config
+from .. import Transport
 
 
+@pytest.mark.mpi_skip
 def test_geometry():
-
+    Lx = 1.1
+    Ly = 0.9
+    vF = 0.8
     transport = Transport(
-        fermi_surface=dict(kF=1.5, vF=0.8, n_theta=6),
+        fermi_surface=dict(kF=1.5, vF=vF, n_theta=8),
         geometry=dict(
-            contacts={}, mesh=dict(rect=dict(Lx=1.1, Ly=0.9, Nx=33, Ny=27, contacts={}))
+            contacts={}, mesh=dict(rect=dict(Lx=Lx, Ly=Ly, Nx=44, Ny=36, contacts={}))
         ),
         time_evolution=dict(t_max=2.0, dt_probe=0.1, dt_save=10.0),
     )
@@ -27,34 +28,45 @@ def test_geometry():
     )
     r0 = torch.tensor([0.5, 0.4], device=rc.device)
     sigma = 0.1
-    geometry.rho[: cell_div.n_mine, 2] = torch.exp(
-        -0.5 * ((r - r0) / sigma).square().sum(dim=1)
+    v = transport.material.transport_velocity
+    wk = (v @ torch.tensor([0.8, 0.6], device=rc.device)) / vF + 0.5  # charge + drift
+    geometry.rho[: cell_div.n_mine] = wk * torch.exp(
+        -0.5 * ((r - r0) / sigma).square().sum(dim=1, keepdim=True)
     )
-    print(transport.material.transport_velocity)
+    L = torch.tensor([Lx, Ly], device=rc.device)
+
+    # Pre-calculate nearest boundary reflections of r for rho prediction below:
+    x, y = r.T
+    x_reflected = torch.where(x < 0.5 * Lx, -x, 2 * Lx - x)
+    y_reflected = torch.where(y < 0.5 * Ly, -y, 2 * Ly - y)
+    r_reflected = torch.stack(
+        (
+            torch.stack((x, y), dim=-1),
+            torch.stack((x, y_reflected), dim=-1),
+            torch.stack((x_reflected, y), dim=-1),
+            torch.stack((x_reflected, y_reflected), dim=-1),
+        )
+    )
 
     def check_results(i_step: int, t: float) -> None:
         """Intercept Geometry.update_probes to check results"""
-        x, y = rc.to_np(r).T
-        norm = SymLogNorm(vmin=0, vmax=1, linthresh=0.1)
-        """
-        for ik, rho_k in enumerate(geometry.rho.T):
-            plt.figure()
-            plt.scatter(x, y, c=rc.to_np(rho_k), vmin=0, vmax=1, cmap="Blues")
-            plt.savefig(
-                f"/home/shankar/Downloads/tmp/{ik}-{i_step}.png", bbox_inches="tight"
-            )
-            plt.close()
-        """
-        plt.figure()
-        plt.scatter(x, y, c=rc.to_np(geometry.rho.sum(dim=-1)), norm=norm, cmap="Blues")
-        plt.savefig(
-            f"/home/shankar/Downloads/tmp/mean-{i_step}.png", bbox_inches="tight"
-        )
-        plt.close()
+        # Predict where the blob should be at each k:
+        frac = (r0 + v * t) / L
+        i_cell = frac.floor().to(torch.int)
+        frac -= i_cell
+        frac_reflected = torch.where(i_cell % 2 == 0, frac, 1 - frac)
+        r_t = (frac_reflected * L)[:, None, None]
+        # Compute corresponding density and error:
+        kernel = torch.exp(-0.5 * ((r_reflected - r_t) / sigma).square().sum(dim=-1))
+        n_pred = wk @ kernel.sum(dim=1)
+        n = geometry.rho.sum(dim=-1)
+        rel_err = ((n - n_pred).abs().sum() / n_pred.abs().sum()).item()
+        rel_err_rate = rel_err / (i_step + 1)
+        print(f"{rel_err_rate=:.2g}")
+        assert rel_err_rate < 2e-4
 
     transport.geometry.update_probes = check_results
     transport.run()
-    print(f"{transport.geometry.rho.shape}")
 
 
 def main():
