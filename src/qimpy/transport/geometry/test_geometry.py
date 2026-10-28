@@ -1,34 +1,65 @@
+import numpy as np
 import pytest
 import torch
 
-from qimpy import rc
+from qimpy import rc, log
 from qimpy.io import log_config
+from qimpy.mpi import globalreduce
 from .. import Transport
+from . import Mesh
 
 
-@pytest.mark.mpi_skip
-def test_geometry():
+@pytest.mark.parametrize(
+    "h, n_theta, rotation_deg, rel_err_rate_bound",
+    (
+        [
+            (0.025, 8, 0.0, 2.0e-2),  # baseline
+            (0.018, 8, 0.0, 1.0e-2),  # quadratic improvement with h
+            (0.025, 16, 0.0, 2.0e-2),  # no effect of n_theta when aligned
+            (0.025, 8, 17.9, 4.5e-1),  # reflections worsen when not aligned,
+            (0.025, 32, 17.9, 1.0e-1),  # but improve with n_theta
+        ]
+        if rc.n_procs == 1
+        else [(0.025, 8, 0.0, 2.0e-2)]
+    ),  # just the baseline with MPI
+)
+def test_gaussian_pong(
+    h: float, n_theta: int, rotation_deg: float, rel_err_rate_bound: float
+) -> None:
+    """Bounce a k-weighted gaussian blob with net charge and drift velocity
+    within a rectangular domain, with and without rotations, and compare the
+    full transient to an analytical (forward ray-trace) solution.
+    This test confirms quadratic error scaling with grid resolution, as well as
+    linear error scaling with angular resolution for the non-alignd (rotated) case."""
     Lx = 1.1
     Ly = 0.9
     vF = 0.8
+
+    # Construct mesh with vertex rotation:
+    Nx = int(np.round(Lx / h))
+    Ny = int(np.round(Ly / h))
+    mesh = Mesh(rect=dict(Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny, contacts={}))
+    cos = np.cos(np.deg2rad(rotation_deg))
+    sin = np.sin(np.deg2rad(rotation_deg))
+    rot = np.array([[cos, -sin], [sin, cos]])
+    vertices = np.copy(mesh.vertices)  # un-rotated copy
+    mesh.vertices[:] = vertices @ rot  # mesh has rotated version
+
     transport = Transport(
-        fermi_surface=dict(kF=1.5, vF=vF, n_theta=8),
-        geometry=dict(
-            contacts={}, mesh=dict(rect=dict(Lx=Lx, Ly=Ly, Nx=44, Ny=36, contacts={}))
-        ),
-        time_evolution=dict(t_max=2.0, dt_probe=0.1, dt_save=10.0),
+        fermi_surface=dict(kF=1.5, vF=vF, n_theta=n_theta),
+        geometry=dict(contacts={}, mesh=mesh),
+        time_evolution=dict(t_max=2.01, dt_probe=0.5, dt_save=10.0),
     )
 
-    # Create test distribution:
+    # Create test distribution in unrotated frame:
     geometry = transport.geometry
     mesh = geometry.mesh
     cell_div = mesh.cell_division
-    r = rc.from_np(
-        mesh.vertices[mesh.cells[cell_div.i_start : cell_div.i_stop, :-1]].mean(axis=1)
-    )
+    cells_mine = mesh.cells[cell_div.i_start : cell_div.i_stop, :-1]
+    r = rc.from_np(vertices[cells_mine].mean(axis=1))  # unrotated frame
     r0 = torch.tensor([0.5, 0.4], device=rc.device)
     sigma = 0.1
-    v = transport.material.transport_velocity
+    v = transport.material.transport_velocity @ rc.from_np(rot.T)  # unrotated frame
     wk = (v @ torch.tensor([0.8, 0.6], device=rc.device)) / vF + 0.5  # charge + drift
     geometry.rho[: cell_div.n_mine] = wk * torch.exp(
         -0.5 * ((r - r0) / sigma).square().sum(dim=1, keepdim=True)
@@ -50,6 +81,8 @@ def test_geometry():
 
     def check_results(i_step: int, t: float) -> None:
         """Intercept Geometry.update_probes to check results"""
+        if not i_step:
+            return  # don't test the initial distribution
         # Predict where the blob should be at each k:
         frac = (r0 + v * t) / L
         i_cell = frac.floor().to(torch.int)
@@ -60,10 +93,13 @@ def test_geometry():
         kernel = torch.exp(-0.5 * ((r_reflected - r_t) / sigma).square().sum(dim=-1))
         n_pred = wk @ kernel.sum(dim=1)
         n = geometry.rho.sum(dim=-1)
-        rel_err = ((n - n_pred).abs().sum() / n_pred.abs().sum()).item()
-        rel_err_rate = rel_err / (i_step + 1)
-        print(f"{rel_err_rate=:.2g}")
-        assert rel_err_rate < 2e-4
+        rel_err = (
+            globalreduce.sum((n - n_pred).abs(), group=geometry.group)
+            / globalreduce.sum(n_pred.abs(), group=geometry.group)
+        ).item()
+        rel_err_rate = rel_err / t
+        log.info(f"{rel_err_rate=:.2g}")
+        assert rel_err_rate < rel_err_rate_bound
 
     transport.geometry.update_probes = check_results
     transport.run()
@@ -71,8 +107,7 @@ def test_geometry():
 
 def main():
     log_config()
-    rc.init()
-    test_geometry()
+    pytest.main([__file__, "-vs"])
 
 
 if __name__ == "__main__":
