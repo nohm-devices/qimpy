@@ -268,7 +268,6 @@ class Geometry(TreeNode):
         return flux, rho_faces
 
     def rho_dot(self, rho: torch.Tensor, t: float) -> torch.Tensor:
-        self.material.constrain(rho)
         watch = StopWatch("Geometry.rho_dot")
         out = (self.minus_v_dot_del @ self.to_faces(rho, t).flatten()).view(rho.shape)
         watch.stop()
@@ -284,15 +283,6 @@ class Geometry(TreeNode):
         n_mine = self.mesh.cell_division.n_mine
         out[:n_mine] += self.material.rho_dot(rho[:n_mine], t, id(self))
         return out
-
-    @property
-    def rho(self) -> torch.Tensor:
-        return self._rho
-
-    @rho.setter
-    def rho(self, rho_new: torch.Tensor) -> None:
-        self._rho = rho_new
-        self.material.constrain(self._rho)
 
     @stopwatch
     def update_probes(self, i_step: int, t: float) -> None:

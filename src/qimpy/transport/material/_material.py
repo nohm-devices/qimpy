@@ -113,10 +113,6 @@ class Material(TreeNode):
         as particle number. Hence, specify indices to a subset of observables from
         `get_observables` to compute fluxes for."""
 
-    def constrain(self, rho: torch.Tensor) -> None:
-        """Override to apply any per-material constraints on `rho`
-        that may be violated during spatial transport or dynamics."""
-
     def measure_observables(self, rho: torch.Tensor, t: float) -> torch.Tensor:
         """Return expectation value of observables, (Nr x No).
         Optionally, override to add/replace observables that cannot be expressed

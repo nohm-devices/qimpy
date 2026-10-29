@@ -37,7 +37,6 @@ class KRepresentation(TreeNode):
     Nk: int
     wk: torch.Tensor  # (Nk,) Brillouin-zone/mode integration weights
     v: torch.Tensor  # (Nk, 2) transport velocity
-    constraint_factors: tuple[torch.Tensor, torch.Tensor] | None
 
     def apply_collision(self, rho: torch.Tensor, modal_op: Callable) -> torch.Tensor:
         raise NotImplementedError
@@ -88,20 +87,6 @@ class DeltaK(KRepresentation):
             [torch.cos(theta_q), torch.sin(theta_q)], dim=-1
         )
         self.v = v_per_theta.repeat(fs.n_r, 1)  # (Nr*N_theta, 2)
-
-        # Initialize constraint operator from mode transformations (if needed):
-        self.constraint_factors = None
-        eye = torch.eye(self.Nk, device=rc.device, dtype=self.v.dtype)
-        proj = self.from_modes(self.to_modes(eye))  # (Nk, Nk) projector
-        ghost = eye - proj  # onto unrepresented DOFs
-        if ghost.abs().max() > 1e-10:  # only if oversampled
-            U, S, Vh = torch.linalg.svd(ghost)
-            tol = float(S[0]) * torch.finfo(self.v.dtype).eps ** 0.5
-            r = int((S > tol).sum())
-            self.constraint_factors = (
-                (U[:, :r] * S[:r]).contiguous(),
-                Vh[:r].T.contiguous(),
-            )
 
     # ---- modal transforms (tensor product of angular and radial) ----
     def to_modes(self, f: torch.Tensor) -> torch.Tensor:

@@ -304,11 +304,6 @@ class FermiSurface(Material):
             f"{type(self).__name__!r} object has no attribute {name!r}"
         )
 
-    def constrain(self, rho: torch.Tensor) -> None:
-        if (cf := self.representation.constraint_factors) is not None:
-            A, B = cf
-            rho -= (rho @ A) @ B.T
-
     @property
     def transport_velocity(self) -> torch.Tensor:
         return self.v

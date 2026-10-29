@@ -90,7 +90,6 @@ class Cartesian(KRepresentation):
         super().__init__()
         fs = fermi_surface
         self.fs = fs
-        self.constraint_factors = None
         if fs.tau_inv_p != 0.0 or fs.omega_c != 0.0:
             raise InvalidInputException(
                 "The Cartesian representation is drift-centred; the lab-frame "

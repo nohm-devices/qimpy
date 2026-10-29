@@ -208,7 +208,7 @@ def test_gaussian_pong(
     within a rectangular domain, with and without rotations, and compare the
     full transient to an analytical (forward ray-trace) solution.
     This test confirms quadratic error scaling with grid resolution, as well as
-    linear error scaling with angular resolution for the non-alignd (rotated) case."""
+    linear error scaling with angular resolution for the non-aligned (rotated) case."""
     Lx = 1.1
     Ly = 0.9
     vF = 0.8
