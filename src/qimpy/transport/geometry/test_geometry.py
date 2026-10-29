@@ -189,7 +189,6 @@ def test_wire_equilibration(style: str) -> None:
         assert n_mae < dmu * 0.02
 
 
-@pytest.mark.skip
 @pytest.mark.parametrize(
     "h, n_theta, rotation_deg, rel_err_rate_bound",
     (
@@ -200,9 +199,7 @@ def test_wire_equilibration(style: str) -> None:
             (0.025, 8, 17.9, 4.5e-1),  # reflections worsen when not aligned,
             (0.025, 32, 17.9, 1.0e-1),  # but improve with n_theta
         ]
-        if rc.n_procs == 1
-        else [(0.025, 8, 0.0, 2.0e-2)]
-    ),  # just the baseline with MPI
+    ),
 )
 def test_gaussian_pong(
     h: float, n_theta: int, rotation_deg: float, rel_err_rate_bound: float
@@ -219,7 +216,9 @@ def test_gaussian_pong(
     # Construct mesh with vertex rotation:
     Nx = int(np.round(Lx / h))
     Ny = int(np.round(Ly / h))
-    mesh = Mesh(rect=dict(Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny, contacts={}))
+    mesh = Mesh(
+        rect=dict(Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny, contacts={}), group=dist.group.WORLD
+    )
     cos = np.cos(np.deg2rad(rotation_deg))
     sin = np.sin(np.deg2rad(rotation_deg))
     rot = np.array([[cos, -sin], [sin, cos]])
@@ -271,7 +270,7 @@ def test_gaussian_pong(
         # Compute corresponding density and error:
         kernel = torch.exp(-0.5 * ((r_reflected - r_t) / sigma).square().sum(dim=-1))
         n_pred = wk @ kernel.sum(dim=1)
-        n = geometry.rho.sum(dim=-1)
+        n = geometry.rho[: cell_div.n_mine].sum(dim=-1)
         rel_err = (
             globalreduce.sum((n - n_pred).abs(), group=geometry.group)
             / globalreduce.sum(n_pred.abs(), group=geometry.group)
