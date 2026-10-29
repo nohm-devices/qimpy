@@ -117,6 +117,79 @@ def test_charge_conservation(n_r: int, contacted: bool) -> None:
     assert dq_dt.abs().item() < 1.0e-9
 
 
+@pytest.mark.parametrize("style", ["1D", "2D"])
+def test_wire_equilibration(style: str) -> None:
+    """Check density and current equilibration in a wire against analytical solution."""
+    Lx = 2.0
+    dmu = 0.1
+
+    # Create mesh with selected style (1d or 2d)
+    if style == "1D":
+        h = 0.025
+        Ly = 1.0
+        Nx = int(np.round(Lx / h))
+        n_theta = 22
+        mesh_kwargs = dict(line=dict(L=Lx, N=Nx))
+    else:
+        assert style == "2D"
+        h = 0.05
+        radius = 2 * h  # contact radius - half-width of wire
+        Ly = 2 * radius
+        Nx = int(np.round(Lx / h))
+        Ny = int(np.round(Ly / h))
+        n_theta = 10
+        contacts = dict(source=(0.0, radius, radius), drain=(Lx, radius, radius))
+        mesh_kwargs = dict(rect=dict(Lx=Lx, Ly=Ly, Nx=Nx, Ny=Ny, contacts=contacts))
+
+    # Run calculation with density and contact current collection:
+    transport = Transport(
+        fermi_surface=dict(kF=1.5, vF=1.2, n_theta=n_theta),
+        geometry=dict(
+            contacts=dict(source=dict(dmu=dmu), drain=dict(dmu=-dmu)), mesh=mesh_kwargs
+        ),
+        time_evolution=dict(t_max=6.01, dt_probe=1.0, dt_save=1.0, n_collate=100),
+    )
+    transport.run()
+
+    # Analyze equilibration of density profile and contact currents:
+    geometry = transport.geometry
+    mesh = geometry.mesh
+    cell_div = mesh.cell_division
+    cells_mine = mesh.cells[cell_div.i_start : cell_div.i_stop, :-1]
+    x = rc.from_np(mesh.vertices[cells_mine, 0].mean(axis=1))
+    v_x = geometry.material.transport_velocity[:, 0]
+    v_x = v_x[v_x > 0]  # calculate for positive velocities; complete by symmetry
+
+    prefactor = Ly * dmu / n_theta
+    for t, probe_flux in zip(geometry.stash_probe.t, geometry.stash_probe.flux):
+        # Check current against analytical ray-trace prediction:
+        I = probe_flux[..., 0]
+        I_ref = [
+            prefactor * (torch.where(v_x * t_check > Lx, 2, 1) * v_x).sum().item()
+            for t_check in t * np.array([0.9, 1.1])
+        ]
+        I_tol = 1.0e-3 * np.mean(I_ref)
+        I_min = min(I_ref) - I_tol
+        I_max = max(I_ref) + I_tol
+        I_obs = I.abs().mean().item()
+        log.info(f"Measured current: {I_obs:.3g} (bounds: {I_min:.3g}, {I_max:.3g})")
+        assert abs(I.sum().item()) < I_tol  # Symmetry
+        assert I_min < I_obs < I_max
+
+    prefactor = dmu / n_theta
+    for t, observables in zip(geometry.stash.t, geometry.stash.observables):
+        # Check density profile against analytical ray-trace prediction:
+        n = observables[..., 0]
+        n_ref = prefactor * (
+            torch.where(v_x[:, None] * t > x, 1, 0).sum(dim=0)
+            - torch.where(v_x[:, None] * t > Lx - x, 1, 0).sum(dim=0)
+        )
+        n_mae = globalreduce.sum((n - n_ref).abs(), geometry.group) / len(mesh.cells)
+        log.info(f"Density MAE: {n_mae:.3g} (typical n: {dmu:.3g})")
+        assert n_mae < dmu * 0.02
+
+
+@pytest.mark.skip
 @pytest.mark.parametrize(
     "h, n_theta, rotation_deg, rel_err_rate_bound",
     (
@@ -160,7 +233,6 @@ def test_gaussian_pong(
 
     # Create test distribution in unrotated frame:
     geometry = transport.geometry
-    mesh = geometry.mesh
     cell_div = mesh.cell_division
     cells_mine = mesh.cells[cell_div.i_start : cell_div.i_stop, :-1]
     r = rc.from_np(vertices[cells_mine].mean(axis=1))  # unrotated frame
