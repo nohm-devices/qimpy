@@ -37,8 +37,5 @@ Homepage = "https://qimpy.org"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-v -m 'not validate'"
+addopts = "-v"
 testpaths = ["src"]
-markers = [
-    "validate: expensive tests run by `make test-validate` (deselected by default)",
-]
