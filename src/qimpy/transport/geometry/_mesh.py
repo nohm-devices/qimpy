@@ -4,6 +4,7 @@ from scipy.sparse import csr_array
 import numpy as np
 import torch
 import torch.distributed as dist
+import pymetis
 
 from qimpy import rc, TreeNode
 from qimpy.io import CheckpointPath, CheckpointContext
@@ -118,20 +119,9 @@ class Mesh(TreeNode):
         # (Partition must be stable across process grid, not just the "r" dimension.)
         partition = np.empty(len(self.cells), dtype=np.int32)
         if rc.is_head:
-            try:
-                import pymetis
-
-                adj = self.get_cell_adjacency_vertex()
-                csr_adj = pymetis.CSRAdjacency(adj.indptr, adj.indices)
-                partition = np.asarray(pymetis.part_graph(size, csr_adj)[1], np.int32)
-            except ImportError:
-                # Fallback: divide equally along longest axis:
-                centroids = self.vertices[self.cells[:, :-1]].mean(axis=1)
-                long_axis = np.ptp(centroids, axis=0).argmin()
-                order = np.argsort(centroids[:, long_axis], kind="stable")
-                partition[order] = np.minimum(
-                    (np.arange(len(order)) * size) // len(order), size - 1
-                )
+            adj = self.get_cell_adjacency_vertex()
+            csr_adj = pymetis.CSRAdjacency(adj.indptr, adj.indices)
+            partition = np.asarray(pymetis.part_graph(size, csr_adj)[1], np.int32)
 
         # Synchronize partition across all processes:
         partition_t = torch.from_numpy(partition).to(rc.device)
