@@ -24,10 +24,15 @@ dependencies = [
     "h5py",
     "psutil",
     "svg.path",
-    "triangle",
     "opt-einsum",
 ]
 dynamic = ["version"]
+
+[project.optional-dependencies]
+transport = [
+    "triangle",
+    "pymetis",
+]
 
 [project.urls]
 Homepage = "https://qimpy.org"
