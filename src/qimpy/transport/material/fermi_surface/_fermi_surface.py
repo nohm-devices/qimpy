@@ -63,7 +63,7 @@ class FermiSurface(Material):
         super().__init__()
         self.kF = kF
         self.vF = vF
-        self.m_star = kF / vF
+        self.m_star = kF / vF  # WARNING: this assumes quadratic dispersion!
         self.mu = 0.5 * kF * vF  # E_F (degenerate)
         if n_theta % 2:
             raise InvalidInputException(f"{n_theta=} is not even")
